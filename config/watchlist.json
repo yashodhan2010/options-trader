@@ -1,0 +1,41 @@
+{
+    "description": "Trading watchlist - Equity tokens for historical analysis, options traded on NFO",
+    "enabled": true,
+    "assets": [
+        {
+            "name": "AXISBANK",
+            "equity_token": 1510401,
+            "lot_size": 625,
+            "exchange": "NFO",
+            "enabled": true
+        },
+        {
+            "name": "HDFCBANK",
+            "equity_token": 341249,
+            "lot_size": 550,
+            "exchange": "NFO",
+            "enabled": true
+        },
+        {
+            "name": "IDFCFIRSTB",
+            "equity_token": 2863105,
+            "lot_size": 9275,
+            "exchange": "NFO",
+            "enabled": true
+        },
+        {
+            "name": "RELIANCE",
+            "equity_token": 738561,
+            "lot_size": 500,
+            "exchange": "NFO",
+            "enabled": true
+        },
+        {
+            "name": "SBIN",
+            "equity_token": 779521,
+            "lot_size": 750,
+            "exchange": "NFO",
+            "enabled": true
+        }
+    ]
+}

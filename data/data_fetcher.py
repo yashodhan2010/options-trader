@@ -1,0 +1,986 @@
+"""
+Data Fetcher - Fetch market data, options chain, and metrics from Kite
+Enhanced with Greeks and IV calculations using QuantLib.
+"""
+from datetime import datetime, timedelta, date
+from typing import Optional, List, Dict, Any, Tuple
+import pandas as pd
+from collections import defaultdict
+
+from auth.kite_auth import get_kite, is_authenticated
+from core.logger import logger
+from core.options_pricer import options_pricer, OptionPriceResult
+from config.settings import (
+    UNDERLYING_ASSETS, METRICS_CONFIG,
+    get_asset_by_name, get_instrument_token, is_in_watchlist
+)
+
+
+class DataFetcher:
+    """
+    Fetches market data, options chain, and calculates metrics.
+    Includes Greeks and IV calculations via QuantLib/py_vollib.
+    """
+    
+    def __init__(self):
+        self.kite = None
+        self._instruments_cache: Dict[str, List[dict]] = {}
+        self._cache_timestamp: Optional[datetime] = None
+        self._options_chain_cache: Dict[str, pd.DataFrame] = {}
+    
+    def _ensure_connected(self) -> bool:
+        """Ensure Kite connection is established."""
+        if not self.kite:
+            if is_authenticated():
+                self.kite = get_kite()
+        return self.kite is not None
+    
+    def _load_instruments(self, exchange: str = "NFO") -> List[dict]:
+        """
+        Load instruments from Kite.
+        
+        Args:
+            exchange: Exchange to fetch instruments for
+            
+        Returns:
+            List of instruments
+        """
+        cache_key = exchange
+        now = datetime.now()
+        
+        # Use cache if less than 1 hour old
+        if (
+            cache_key in self._instruments_cache
+            and self._cache_timestamp
+            and (now - self._cache_timestamp).seconds < 3600
+        ):
+            return self._instruments_cache[cache_key]
+        
+        if not self._ensure_connected():
+            logger.error("Not connected to Kite")
+            return []
+        
+        try:
+            instruments = self.kite.instruments(exchange)
+            self._instruments_cache[cache_key] = instruments
+            self._cache_timestamp = now
+            logger.info(f"Loaded {len(instruments)} instruments from {exchange}")
+            return instruments
+        except Exception as e:
+            logger.error(f"Failed to load instruments: {e}")
+            return []
+    
+    def get_spot_price(self, underlying: str) -> Optional[float]:
+        """
+        Get current spot price for an underlying.
+        
+        Args:
+            underlying: The underlying asset (NIFTY, BANKNIFTY, etc.)
+            
+        Returns:
+            Current spot price
+        """
+        if not self._ensure_connected():
+            return None
+        
+        try:
+            # Check if it's in UNDERLYING_ASSETS (indices)
+            asset_config = UNDERLYING_ASSETS.get(underlying, {})
+            
+            if asset_config:
+                # Index asset
+                symbol = asset_config.get("symbol", underlying)
+                exchange = asset_config.get("exchange", "NSE")
+            else:
+                # Check watchlist (stocks)
+                watchlist_asset = get_asset_by_name(underlying)
+                if watchlist_asset:
+                    symbol = underlying
+                    exchange = "NSE"
+                else:
+                    symbol = underlying
+                    exchange = "NSE"
+            
+            quote = self.kite.quote(f"{exchange}:{symbol}")
+            return quote[f"{exchange}:{symbol}"]["last_price"]
+        except Exception as e:
+            logger.error(f"Failed to get spot price for {underlying}: {e}")
+            return None
+    
+    def get_ltp(self, symbol: str, exchange: str = "NFO") -> Optional[float]:
+        """
+        Get last traded price for a symbol.
+        
+        Args:
+            symbol: Trading symbol
+            exchange: Exchange
+            
+        Returns:
+            Last traded price
+        """
+        if not self._ensure_connected():
+            return None
+        
+        try:
+            quote = self.kite.ltp(f"{exchange}:{symbol}")
+            return quote[f"{exchange}:{symbol}"]["last_price"]
+        except Exception as e:
+            logger.error(f"Failed to get LTP for {symbol}: {e}")
+            return None
+    
+    def get_quote(self, symbol: str, exchange: str = "NFO") -> Optional[dict]:
+        """
+        Get detailed quote for a symbol.
+        
+        Args:
+            symbol: Trading symbol
+            exchange: Exchange
+            
+        Returns:
+            Quote dictionary
+        """
+        if not self._ensure_connected():
+            return None
+        
+        try:
+            quote = self.kite.quote(f"{exchange}:{symbol}")
+            return quote[f"{exchange}:{symbol}"]
+        except Exception as e:
+            logger.error(f"Failed to get quote for {symbol}: {e}")
+            return None
+    
+    def get_instrument_token(self, symbol: str, exchange: str = "NFO") -> Optional[int]:
+        """
+        Get instrument token for a trading symbol.
+        
+        Args:
+            symbol: Trading symbol
+            exchange: Exchange (NFO for options, NSE for stocks)
+            
+        Returns:
+            Instrument token or None
+        """
+        # Check watchlist first
+        watchlist_asset = get_asset_by_name(symbol)
+        if watchlist_asset:
+            token = watchlist_asset.get("instrument_token")
+            if token:
+                return token
+        
+        # Check underlying assets
+        for asset_name, config in UNDERLYING_ASSETS.items():
+            if config.get("symbol") == symbol:
+                return config.get("instrument_token")
+        
+        # Search in cached instruments
+        instruments = self._load_instruments(exchange)
+        for inst in instruments:
+            if inst.get("tradingsymbol") == symbol:
+                return inst.get("instrument_token")
+        
+        # Try NSE if NFO didn't find it
+        if exchange == "NFO":
+            instruments = self._load_instruments("NSE")
+            for inst in instruments:
+                if inst.get("tradingsymbol") == symbol:
+                    return inst.get("instrument_token")
+        
+        logger.warning(f"No instrument token found for {symbol}")
+        return None
+    
+    def get_options_chain(
+        self,
+        underlying: str,
+        expiry_date: Optional[datetime] = None,
+        num_strikes: int = 10,
+    ) -> pd.DataFrame:
+        """
+        Get options chain for an underlying.
+        
+        Args:
+            underlying: The underlying asset
+            expiry_date: Specific expiry date (optional)
+            num_strikes: Number of strikes above and below ATM
+            
+        Returns:
+            DataFrame with options chain data
+        """
+        if not self._ensure_connected():
+            return pd.DataFrame()
+        
+        try:
+            # Get current spot price
+            spot_price = self.get_spot_price(underlying)
+            if not spot_price:
+                return pd.DataFrame()
+            
+            # Load instruments
+            instruments = self._load_instruments("NFO")
+            
+            # Filter for options of this underlying
+            options = [
+                i for i in instruments
+                if i["name"] == underlying
+                and i["instrument_type"] in ["CE", "PE"]
+            ]
+            
+            if expiry_date:
+                options = [
+                    o for o in options
+                    if o["expiry"].date() == expiry_date.date()
+                ]
+            else:
+                # Get nearest expiry
+                expiries = sorted(set(o["expiry"] for o in options))
+                if expiries:
+                    nearest_expiry = expiries[0]
+                    options = [o for o in options if o["expiry"] == nearest_expiry]
+            
+            # Get ATM strike - determine strike interval based on underlying
+            if underlying in ["NIFTY", "FINNIFTY"]:
+                strike_interval = 50
+            elif underlying == "BANKNIFTY":
+                strike_interval = 100
+            else:
+                # For stocks, determine from available strikes
+                strikes = sorted(set(o["strike"] for o in options))
+                if len(strikes) >= 2:
+                    strike_interval = strikes[1] - strikes[0]
+                else:
+                    strike_interval = 50  # Default
+            
+            atm_strike = round(spot_price / strike_interval) * strike_interval
+            
+            # Filter strikes around ATM
+            min_strike = atm_strike - (num_strikes * strike_interval)
+            max_strike = atm_strike + (num_strikes * strike_interval)
+            
+            options = [
+                o for o in options
+                if min_strike <= o["strike"] <= max_strike
+            ]
+            
+            # Get quotes for all options
+            symbols = [f"NFO:{o['tradingsymbol']}" for o in options]
+            
+            if not symbols:
+                return pd.DataFrame()
+            
+            quotes = self.kite.quote(symbols)
+            
+            # Build options chain DataFrame
+            chain_data = []
+            for opt in options:
+                symbol = f"NFO:{opt['tradingsymbol']}"
+                quote = quotes.get(symbol, {})
+                
+                chain_data.append({
+                    "symbol": opt["tradingsymbol"],
+                    "strike": opt["strike"],
+                    "option_type": opt["instrument_type"],
+                    "expiry": opt["expiry"],
+                    "ltp": quote.get("last_price", 0),
+                    "bid": quote.get("depth", {}).get("buy", [{}])[0].get("price", 0),
+                    "ask": quote.get("depth", {}).get("sell", [{}])[0].get("price", 0),
+                    "oi": quote.get("oi", 0),
+                    "oi_change": quote.get("oi_day_high", 0) - quote.get("oi_day_low", 0),
+                    "volume": quote.get("volume", 0),
+                    "iv": self._calculate_iv(quote, spot_price, opt),
+                    "lot_size": opt["lot_size"],
+                    "instrument_token": opt["instrument_token"],
+                })
+            
+            df = pd.DataFrame(chain_data)
+            
+            if not df.empty:
+                df = df.sort_values(["strike", "option_type"])
+            
+            logger.info(f"Fetched options chain for {underlying}: {len(df)} options")
+            return df
+            
+        except Exception as e:
+            logger.error(f"Failed to get options chain: {e}")
+            return pd.DataFrame()
+    
+    def _calculate_iv(self, quote: dict, spot: float, option: dict) -> float:
+        """
+        Calculate implied volatility using QuantLib/py_vollib.
+        
+        Args:
+            quote: Quote data from Kite
+            spot: Spot price of underlying
+            option: Option instrument data
+            
+        Returns:
+            Implied volatility as percentage
+        """
+        ltp = quote.get("last_price", 0)
+        strike = option["strike"]
+        expiry = option.get("expiry")
+        option_type = option.get("instrument_type", "CE")
+        
+        if ltp <= 0 or not expiry:
+            return 0.0
+        
+        try:
+            # Convert expiry to date if needed
+            if hasattr(expiry, 'date'):
+                expiry_date = expiry.date()
+            else:
+                expiry_date = expiry
+            
+            # Use the options pricer for accurate IV
+            iv = options_pricer.calculate_iv(
+                option_price=ltp,
+                spot_price=spot,
+                strike=strike,
+                expiry_date=expiry_date,
+                option_type=option_type,
+            )
+            
+            return round(iv * 100, 2)  # Return as percentage
+            
+        except Exception as e:
+            logger.debug(f"IV calculation failed for {option.get('tradingsymbol')}: {e}")
+            return 0.0
+    
+    def get_option_greeks(
+        self,
+        symbol: str,
+        spot_price: float,
+        strike: float,
+        expiry_date: date,
+        market_price: float,
+        option_type: str = "CE",
+    ) -> Dict:
+        """
+        Get full Greeks analysis for an option.
+        
+        Args:
+            symbol: Option trading symbol
+            spot_price: Current spot price
+            strike: Strike price
+            expiry_date: Expiry date
+            market_price: Current market price of the option
+            option_type: 'CE' for Call, 'PE' for Put
+            
+        Returns:
+            Dictionary with IV, Greeks, and pricing analysis
+        """
+        try:
+            result = options_pricer.full_analysis(
+                spot_price=spot_price,
+                strike=strike,
+                expiry_date=expiry_date,
+                market_price=market_price,
+                option_type=option_type,
+            )
+            
+            return {
+                "symbol": symbol,
+                **result.to_dict(),
+            }
+            
+        except Exception as e:
+            logger.error(f"Greeks calculation failed for {symbol}: {e}")
+            return {}
+    
+    def get_options_chain_with_greeks(
+        self,
+        underlying: str,
+        expiry_date: Optional[datetime] = None,
+        num_strikes: int = 10,
+    ) -> pd.DataFrame:
+        """
+        Get options chain enriched with Greeks for each option.
+        
+        Args:
+            underlying: The underlying asset
+            expiry_date: Specific expiry date (optional)
+            num_strikes: Number of strikes above and below ATM
+            
+        Returns:
+            DataFrame with options chain including Greeks
+        """
+        # Get basic options chain
+        chain = self.get_options_chain(underlying, expiry_date, num_strikes)
+        
+        if chain.empty:
+            return chain
+        
+        # Get spot price
+        spot_price = self.get_spot_price(underlying)
+        if not spot_price:
+            return chain
+        
+        # Add Greeks for each option
+        greeks_data = []
+        for _, row in chain.iterrows():
+            try:
+                expiry = row['expiry']
+                if hasattr(expiry, 'date'):
+                    expiry_date_val = expiry.date()
+                else:
+                    expiry_date_val = expiry
+                
+                # Calculate IV
+                iv = options_pricer.calculate_iv(
+                    option_price=row['ltp'],
+                    spot_price=spot_price,
+                    strike=row['strike'],
+                    expiry_date=expiry_date_val,
+                    option_type=row['option_type'],
+                )
+                
+                # Calculate Greeks
+                if iv > 0:
+                    greeks = options_pricer.calculate_greeks(
+                        spot_price=spot_price,
+                        strike=row['strike'],
+                        expiry_date=expiry_date_val,
+                        volatility=iv,
+                        option_type=row['option_type'],
+                    )
+                    
+                    greeks_data.append({
+                        'iv': round(iv * 100, 2),
+                        'delta': round(greeks.delta, 4),
+                        'gamma': round(greeks.gamma, 6),
+                        'theta': round(greeks.theta, 4),
+                        'vega': round(greeks.vega, 4),
+                    })
+                else:
+                    greeks_data.append({
+                        'iv': 0,
+                        'delta': 0,
+                        'gamma': 0,
+                        'theta': 0,
+                        'vega': 0,
+                    })
+                    
+            except Exception as e:
+                logger.debug(f"Greeks calc error for {row['symbol']}: {e}")
+                greeks_data.append({
+                    'iv': row.get('iv', 0),
+                    'delta': 0,
+                    'gamma': 0,
+                    'theta': 0,
+                    'vega': 0,
+                })
+        
+        # Add Greeks columns to DataFrame
+        greeks_df = pd.DataFrame(greeks_data)
+        chain = chain.reset_index(drop=True)
+        chain['iv'] = greeks_df['iv']
+        chain['delta'] = greeks_df['delta']
+        chain['gamma'] = greeks_df['gamma']
+        chain['theta'] = greeks_df['theta']
+        chain['vega'] = greeks_df['vega']
+        
+        logger.info(f"Enriched options chain with Greeks for {underlying}")
+        return chain
+    
+    def get_strategy_greeks(self, legs: List[Dict], spot_price: float) -> Dict:
+        """
+        Calculate net Greeks for a multi-leg strategy.
+        
+        Args:
+            legs: List of leg dictionaries
+            spot_price: Current spot price
+            
+        Returns:
+            Dictionary with net Greeks and position analysis
+        """
+        return options_pricer.calculate_strategy_greeks(legs, spot_price)
+    
+    def get_iv_percentile(
+        self,
+        underlying: str,
+        current_iv: float,
+        lookback_days: int = 252,
+    ) -> Dict:
+        """
+        Calculate IV percentile and rank.
+        
+        Args:
+            underlying: Underlying asset
+            current_iv: Current IV value
+            lookback_days: Days to look back for comparison
+            
+        Returns:
+            Dictionary with IV percentile, rank, and historical stats
+        """
+        # In production, you'd fetch historical IV data
+        # For now, return estimated values based on typical ranges
+        
+        # Typical IV ranges for NSE indices
+        iv_ranges = {
+            "NIFTY": {"low": 10, "high": 35, "median": 15},
+            "BANKNIFTY": {"low": 12, "high": 45, "median": 18},
+            "FINNIFTY": {"low": 11, "high": 40, "median": 16},
+        }
+        
+        range_data = iv_ranges.get(underlying, {"low": 15, "high": 50, "median": 25})
+        
+        # Calculate percentile (simplified)
+        iv_range = range_data["high"] - range_data["low"]
+        if iv_range > 0:
+            percentile = ((current_iv - range_data["low"]) / iv_range) * 100
+            percentile = max(0, min(100, percentile))
+        else:
+            percentile = 50
+        
+        # Determine IV regime
+        if percentile < 25:
+            regime = "LOW"
+        elif percentile < 50:
+            regime = "BELOW_AVERAGE"
+        elif percentile < 75:
+            regime = "ABOVE_AVERAGE"
+        else:
+            regime = "HIGH"
+        
+        return {
+            "current_iv": current_iv,
+            "percentile": round(percentile, 1),
+            "regime": regime,
+            "historical_low": range_data["low"],
+            "historical_high": range_data["high"],
+            "historical_median": range_data["median"],
+        }
+    
+    def get_oi_data(self, underlying: str) -> Dict[str, Any]:
+        """
+        Get Open Interest analysis for an underlying.
+        
+        Args:
+            underlying: The underlying asset
+            
+        Returns:
+            Dictionary with OI analysis
+        """
+        chain = self.get_options_chain(underlying)
+        
+        if chain.empty:
+            return {}
+        
+        # Separate calls and puts
+        calls = chain[chain["option_type"] == "CE"]
+        puts = chain[chain["option_type"] == "PE"]
+        
+        # Calculate PCR
+        total_call_oi = calls["oi"].sum()
+        total_put_oi = puts["oi"].sum()
+        pcr = total_put_oi / total_call_oi if total_call_oi > 0 else 0
+        
+        # Find max pain
+        strikes = chain["strike"].unique()
+        max_pain_strike = None
+        min_pain = float("inf")
+        
+        spot = self.get_spot_price(underlying)
+        
+        for strike in strikes:
+            call_oi = calls[calls["strike"] == strike]["oi"].sum()
+            put_oi = puts[puts["strike"] == strike]["oi"].sum()
+            
+            # Calculate pain at this strike
+            call_pain = sum((s - strike) * calls[calls["strike"] == s]["oi"].sum() 
+                          for s in strikes if s < strike)
+            put_pain = sum((strike - s) * puts[puts["strike"] == s]["oi"].sum() 
+                         for s in strikes if s > strike)
+            
+            total_pain = call_pain + put_pain
+            if total_pain < min_pain:
+                min_pain = total_pain
+                max_pain_strike = strike
+        
+        # Find max OI strikes
+        max_call_oi_strike = calls.loc[calls["oi"].idxmax()]["strike"] if not calls.empty else None
+        max_put_oi_strike = puts.loc[puts["oi"].idxmax()]["strike"] if not puts.empty else None
+        
+        return {
+            "pcr": round(pcr, 2),
+            "total_call_oi": total_call_oi,
+            "total_put_oi": total_put_oi,
+            "max_pain": max_pain_strike,
+            "max_call_oi_strike": max_call_oi_strike,
+            "max_put_oi_strike": max_put_oi_strike,
+            "spot": spot,
+            "sentiment": self._interpret_oi(pcr, max_call_oi_strike, max_put_oi_strike, spot),
+        }
+    
+    def _interpret_oi(
+        self,
+        pcr: float,
+        max_call_strike: float,
+        max_put_strike: float,
+        spot: float,
+    ) -> str:
+        """Interpret OI data for market sentiment."""
+        if pcr > METRICS_CONFIG["pcr_bearish_threshold"]:
+            sentiment = "BULLISH"  # High PCR often indicates bullish reversal
+        elif pcr < METRICS_CONFIG["pcr_bullish_threshold"]:
+            sentiment = "BEARISH"  # Low PCR indicates bearish
+        else:
+            sentiment = "NEUTRAL"
+        
+        # Adjust based on max OI strikes
+        if max_call_strike and max_put_strike and spot:
+            if spot > max_call_strike:
+                sentiment = "STRONGLY_BULLISH"
+            elif spot < max_put_strike:
+                sentiment = "STRONGLY_BEARISH"
+        
+        return sentiment
+    
+    def get_historical_data(
+        self,
+        symbol: str,
+        interval: str = "5minute",
+        days: int = 5,
+        exchange: str = "NSE",
+    ) -> pd.DataFrame:
+        """
+        Get historical OHLC data.
+        
+        Args:
+            symbol: Trading symbol
+            interval: Candle interval (minute, 5minute, 15minute, day, etc.)
+            days: Number of days of history
+            exchange: Exchange
+            
+        Returns:
+            DataFrame with OHLC data
+        """
+        if not self._ensure_connected():
+            return pd.DataFrame()
+        
+        try:
+            # Get instrument token
+            instruments = self._load_instruments(exchange)
+            instrument = next(
+                (i for i in instruments if i["tradingsymbol"] == symbol),
+                None
+            )
+            
+            if not instrument:
+                logger.error(f"Instrument not found: {symbol}")
+                return pd.DataFrame()
+            
+            from_date = datetime.now() - timedelta(days=days)
+            to_date = datetime.now()
+            
+            data = self.kite.historical_data(
+                instrument["instrument_token"],
+                from_date,
+                to_date,
+                interval,
+            )
+            
+            df = pd.DataFrame(data)
+            if not df.empty:
+                df.set_index("date", inplace=True)
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Failed to get historical data: {e}")
+            return pd.DataFrame()
+    
+    def get_volatility_metrics(self, underlying: str) -> Dict[str, float]:
+        """
+        Calculate volatility metrics for an underlying.
+        
+        Args:
+            underlying: The underlying asset
+            
+        Returns:
+            Dictionary with volatility metrics
+        """
+        asset_config = UNDERLYING_ASSETS.get(underlying, {})
+        symbol = asset_config.get("symbol", underlying).replace(" ", "")
+        
+        # Get historical data
+        hist_data = self.get_historical_data(symbol, "day", 30, "NSE")
+        
+        if hist_data.empty:
+            return {}
+        
+        # Calculate returns
+        hist_data["returns"] = hist_data["close"].pct_change()
+        
+        # Historical volatility (annualized)
+        hv_20 = hist_data["returns"].tail(20).std() * (252 ** 0.5) * 100
+        hv_10 = hist_data["returns"].tail(10).std() * (252 ** 0.5) * 100
+        
+        # Get ATM IV from options chain
+        chain = self.get_options_chain(underlying, num_strikes=2)
+        spot = self.get_spot_price(underlying)
+        
+        atm_iv = 0
+        if not chain.empty and spot:
+            strike_interval = 50 if underlying == "NIFTY" else 100
+            atm_strike = round(spot / strike_interval) * strike_interval
+            atm_options = chain[chain["strike"] == atm_strike]
+            if not atm_options.empty:
+                atm_iv = atm_options["iv"].mean()
+        
+        return {
+            "hv_20": round(hv_20, 2),
+            "hv_10": round(hv_10, 2),
+            "atm_iv": round(atm_iv, 2),
+            "iv_hv_ratio": round(atm_iv / hv_20, 2) if hv_20 > 0 else 0,
+            "volatility_regime": self._classify_volatility(atm_iv, hv_20),
+        }
+    
+    def _classify_volatility(self, iv: float, hv: float) -> str:
+        """Classify volatility regime."""
+        if iv > METRICS_CONFIG["iv_percentile_high"]:
+            return "HIGH_IV"
+        elif iv < METRICS_CONFIG["iv_percentile_low"]:
+            return "LOW_IV"
+        elif iv > hv * 1.2:
+            return "IV_ELEVATED"
+        elif iv < hv * 0.8:
+            return "IV_DEPRESSED"
+        return "NORMAL"
+    
+    def get_historical_analysis(self, underlying: str, days: int = 30) -> Dict[str, Any]:
+        """
+        Comprehensive historical analysis for an underlying.
+        Analyzes trend, momentum, support/resistance, and recent performance.
+        
+        Args:
+            underlying: The underlying asset
+            days: Number of days to analyze
+            
+        Returns:
+            Dictionary with historical analysis metrics
+        """
+        # Get the correct symbol
+        asset_config = UNDERLYING_ASSETS.get(underlying, {})
+        if asset_config:
+            symbol = asset_config.get("symbol", underlying).replace(" ", "")
+            exchange = "NSE"
+        else:
+            symbol = underlying
+            exchange = "NSE"
+        
+        # Get historical data
+        hist_data = self.get_historical_data(symbol, "day", days, exchange)
+        
+        if hist_data.empty or len(hist_data) < 10:
+            logger.warning(f"Insufficient historical data for {underlying}")
+            return {}
+        
+        try:
+            analysis = {}
+            
+            # Current price
+            current_price = hist_data["close"].iloc[-1]
+            analysis["current_price"] = current_price
+            
+            # ============ TREND ANALYSIS ============
+            # Simple Moving Averages
+            hist_data["sma_5"] = hist_data["close"].rolling(window=5).mean()
+            hist_data["sma_10"] = hist_data["close"].rolling(window=10).mean()
+            hist_data["sma_20"] = hist_data["close"].rolling(window=20).mean()
+            
+            sma_5 = hist_data["sma_5"].iloc[-1]
+            sma_10 = hist_data["sma_10"].iloc[-1]
+            sma_20 = hist_data["sma_20"].iloc[-1] if len(hist_data) >= 20 else sma_10
+            
+            # Trend determination
+            if current_price > sma_5 > sma_10 > sma_20:
+                trend = "STRONG_UPTREND"
+                trend_score = 1.0
+            elif current_price > sma_10 > sma_20:
+                trend = "UPTREND"
+                trend_score = 0.7
+            elif current_price < sma_5 < sma_10 < sma_20:
+                trend = "STRONG_DOWNTREND"
+                trend_score = -1.0
+            elif current_price < sma_10 < sma_20:
+                trend = "DOWNTREND"
+                trend_score = -0.7
+            else:
+                trend = "SIDEWAYS"
+                trend_score = 0.0
+            
+            analysis["trend"] = trend
+            analysis["trend_score"] = trend_score
+            analysis["sma_5"] = round(sma_5, 2)
+            analysis["sma_10"] = round(sma_10, 2)
+            analysis["sma_20"] = round(sma_20, 2)
+            
+            # Price vs SMA (how far from moving averages)
+            analysis["price_vs_sma20_pct"] = round(((current_price - sma_20) / sma_20) * 100, 2)
+            
+            # ============ MOMENTUM ANALYSIS ============
+            # RSI Calculation
+            hist_data["returns"] = hist_data["close"].pct_change()
+            hist_data["gain"] = hist_data["returns"].apply(lambda x: x if x > 0 else 0)
+            hist_data["loss"] = hist_data["returns"].apply(lambda x: abs(x) if x < 0 else 0)
+            
+            avg_gain = hist_data["gain"].rolling(window=14).mean().iloc[-1]
+            avg_loss = hist_data["loss"].rolling(window=14).mean().iloc[-1]
+            
+            if avg_loss > 0:
+                rs = avg_gain / avg_loss
+                rsi = 100 - (100 / (1 + rs))
+            else:
+                rsi = 100
+            
+            analysis["rsi"] = round(rsi, 2)
+            
+            if rsi > 70:
+                analysis["rsi_signal"] = "OVERBOUGHT"
+            elif rsi < 30:
+                analysis["rsi_signal"] = "OVERSOLD"
+            else:
+                analysis["rsi_signal"] = "NEUTRAL"
+            
+            # Recent momentum (5-day return)
+            returns_5d = ((current_price / hist_data["close"].iloc[-6]) - 1) * 100 if len(hist_data) >= 6 else 0
+            returns_10d = ((current_price / hist_data["close"].iloc[-11]) - 1) * 100 if len(hist_data) >= 11 else 0
+            
+            analysis["returns_5d"] = round(returns_5d, 2)
+            analysis["returns_10d"] = round(returns_10d, 2)
+            
+            # Momentum score
+            if returns_5d > 3:
+                momentum = "STRONG_BULLISH"
+                momentum_score = 1.0
+            elif returns_5d > 1:
+                momentum = "BULLISH"
+                momentum_score = 0.5
+            elif returns_5d < -3:
+                momentum = "STRONG_BEARISH"
+                momentum_score = -1.0
+            elif returns_5d < -1:
+                momentum = "BEARISH"
+                momentum_score = -0.5
+            else:
+                momentum = "NEUTRAL"
+                momentum_score = 0.0
+            
+            analysis["momentum"] = momentum
+            analysis["momentum_score"] = momentum_score
+            
+            # ============ VOLATILITY ANALYSIS ============
+            # Historical volatility
+            daily_returns = hist_data["returns"].dropna()
+            hv_10 = daily_returns.tail(10).std() * (252 ** 0.5) * 100
+            hv_20 = daily_returns.tail(20).std() * (252 ** 0.5) * 100 if len(daily_returns) >= 20 else hv_10
+            
+            analysis["hv_10"] = round(hv_10, 2)
+            analysis["hv_20"] = round(hv_20, 2)
+            
+            # Average True Range (ATR) for stop loss sizing
+            hist_data["tr"] = pd.concat([
+                hist_data["high"] - hist_data["low"],
+                abs(hist_data["high"] - hist_data["close"].shift(1)),
+                abs(hist_data["low"] - hist_data["close"].shift(1))
+            ], axis=1).max(axis=1)
+            
+            atr_14 = hist_data["tr"].rolling(window=14).mean().iloc[-1]
+            analysis["atr_14"] = round(atr_14, 2)
+            analysis["atr_percent"] = round((atr_14 / current_price) * 100, 2)
+            
+            # ============ SUPPORT/RESISTANCE ============
+            # Recent high/low
+            high_20 = hist_data["high"].tail(20).max()
+            low_20 = hist_data["low"].tail(20).min()
+            
+            analysis["resistance_20d"] = round(high_20, 2)
+            analysis["support_20d"] = round(low_20, 2)
+            
+            # Position in range (0 = at support, 1 = at resistance)
+            range_position = (current_price - low_20) / (high_20 - low_20) if high_20 != low_20 else 0.5
+            analysis["range_position"] = round(range_position, 2)
+            
+            if range_position > 0.8:
+                analysis["price_zone"] = "NEAR_RESISTANCE"
+            elif range_position < 0.2:
+                analysis["price_zone"] = "NEAR_SUPPORT"
+            else:
+                analysis["price_zone"] = "MID_RANGE"
+            
+            # ============ VOLUME ANALYSIS ============
+            avg_volume_20 = hist_data["volume"].tail(20).mean()
+            recent_volume = hist_data["volume"].tail(5).mean()
+            volume_ratio = recent_volume / avg_volume_20 if avg_volume_20 > 0 else 1
+            
+            analysis["avg_volume_20d"] = int(avg_volume_20)
+            analysis["volume_ratio"] = round(volume_ratio, 2)
+            
+            if volume_ratio > 1.5:
+                analysis["volume_signal"] = "HIGH_VOLUME"
+            elif volume_ratio < 0.7:
+                analysis["volume_signal"] = "LOW_VOLUME"
+            else:
+                analysis["volume_signal"] = "NORMAL"
+            
+            # ============ OVERALL HISTORICAL SENTIMENT ============
+            # Combine all factors for overall historical sentiment
+            combined_score = (trend_score * 0.4) + (momentum_score * 0.4) + (
+                0.2 if analysis["rsi_signal"] == "OVERSOLD" else 
+                -0.2 if analysis["rsi_signal"] == "OVERBOUGHT" else 0
+            )
+            
+            if combined_score > 0.5:
+                analysis["historical_sentiment"] = "BULLISH"
+            elif combined_score > 0.2:
+                analysis["historical_sentiment"] = "MILDLY_BULLISH"
+            elif combined_score < -0.5:
+                analysis["historical_sentiment"] = "BEARISH"
+            elif combined_score < -0.2:
+                analysis["historical_sentiment"] = "MILDLY_BEARISH"
+            else:
+                analysis["historical_sentiment"] = "NEUTRAL"
+            
+            analysis["historical_score"] = round(combined_score, 2)
+            
+            # Confidence boost from historical data
+            analysis["confidence_boost"] = self._calculate_confidence_boost(analysis)
+            
+            return analysis
+            
+        except Exception as e:
+            logger.error(f"Error in historical analysis for {underlying}: {e}")
+            return {}
+    
+    def _calculate_confidence_boost(self, analysis: Dict) -> float:
+        """
+        Calculate confidence boost based on historical analysis.
+        Returns a value between -0.2 and +0.2 to add to base confidence.
+        """
+        boost = 0.0
+        
+        # Trend alignment boost
+        if analysis.get("trend") in ["STRONG_UPTREND", "STRONG_DOWNTREND"]:
+            boost += 0.08
+        elif analysis.get("trend") in ["UPTREND", "DOWNTREND"]:
+            boost += 0.04
+        
+        # Momentum alignment boost
+        if analysis.get("momentum") in ["STRONG_BULLISH", "STRONG_BEARISH"]:
+            boost += 0.06
+        elif analysis.get("momentum") in ["BULLISH", "BEARISH"]:
+            boost += 0.03
+        
+        # RSI extreme levels (potential reversal - reduce confidence)
+        if analysis.get("rsi_signal") in ["OVERBOUGHT", "OVERSOLD"]:
+            boost -= 0.02
+        
+        # Volume confirmation
+        if analysis.get("volume_signal") == "HIGH_VOLUME":
+            boost += 0.04
+        
+        # Cap the boost
+        return max(-0.2, min(0.2, boost))
+
+
+# Singleton instance
+data_fetcher = DataFetcher()
