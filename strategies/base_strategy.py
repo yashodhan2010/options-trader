@@ -18,6 +18,8 @@ class StrategyType(Enum):
     SHORT_PUT = "short_put"
     BULL_CALL_SPREAD = "bull_call_spread"
     BEAR_PUT_SPREAD = "bear_put_spread"
+    BEAR_CALL_SPREAD = "bear_call_spread"  # Credit spread - SELL call, BUY call hedge
+    BULL_PUT_SPREAD = "bull_put_spread"    # Credit spread - SELL put, BUY put hedge
     IRON_CONDOR = "iron_condor"
     STRADDLE = "straddle"
     STRANGLE = "strangle"

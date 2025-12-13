@@ -47,5 +47,48 @@ def setup_logger(name: str = "OptionsTrader") -> logging.Logger:
     return logger
 
 
+def setup_trade_logger(name: str = "TradeLog") -> logging.Logger:
+    """
+    Set up a dedicated logger for trades only.
+    Logs to logs/trades.log with a clean format for easy reading.
+    
+    Args:
+        name: Name for the logger
+        
+    Returns:
+        Configured trade logger instance
+    """
+    trade_logger = logging.getLogger(name)
+    trade_logger.setLevel(logging.INFO)
+    
+    # Prevent duplicate handlers
+    if trade_logger.handlers:
+        return trade_logger
+    
+    # Simple format for trade logs
+    formatter = logging.Formatter('%(asctime)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    
+    # Trade log file handler
+    LOGS_DIR.mkdir(exist_ok=True)
+    trade_file = LOGS_DIR / "trades.log"
+    
+    file_handler = RotatingFileHandler(
+        trade_file,
+        maxBytes=5 * 1024 * 1024,  # 5MB
+        backupCount=10,
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+    trade_logger.addHandler(file_handler)
+    
+    # Don't propagate to root logger
+    trade_logger.propagate = False
+    
+    return trade_logger
+
+
 # Create default logger
 logger = setup_logger()
+
+# Create trade logger
+trade_logger = setup_trade_logger()

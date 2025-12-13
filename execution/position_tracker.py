@@ -2,6 +2,7 @@
 Position Tracker - Monitors and manages open positions
 Supports both polling and WebSocket-based real-time monitoring.
 Includes periodic status updates and position persistence for overnight positions.
+Now includes signal-based intelligent exit system.
 """
 from datetime import datetime
 from typing import Dict, List, Optional, Callable, Set
@@ -17,6 +18,12 @@ from core.database import database
 from core.utils import is_market_open
 
 
+# Lazy import to avoid circular dependency
+def get_exit_signal_generator():
+    from signals.exit_signal_generator import exit_signal_generator
+    return exit_signal_generator
+
+
 class PositionTracker:
     """
     Tracks and monitors all open positions for SL/Target hits.
@@ -27,6 +34,7 @@ class PositionTracker:
     Also provides:
     - Periodic status updates every 15 minutes (configurable)
     - Position persistence for overnight recovery
+    - Signal-based intelligent exits (reversal detection)
     """
     
     def __init__(self):
@@ -44,15 +52,26 @@ class PositionTracker:
             "position_closed": [],
             "status_update": [],  # New callback for status updates
             "greeks_exit": [],    # Greeks-based exit callback
+            "signal_exit": [],    # Signal-based intelligent exit callback
         }
         self.position_metrics: Dict[str, Dict] = {}
         self.entry_greeks: Dict[str, Dict] = {}  # Store entry Greeks for comparison
         self.last_status_update: Optional[datetime] = None
         
+        # Signal-based exit system (runs in dedicated thread to avoid blocking WebSocket)
+        self.signal_exit_enabled: bool = BOT_CONFIG.get("signal_exit_enabled", True)
+        self.signal_exit_interval: int = BOT_CONFIG.get("signal_exit_interval", 60)  # Check every 60s
+        self.last_signal_check: Dict[str, datetime] = {}
+        self.signal_exit_thread: Optional[threading.Thread] = None
+        self.signal_exit_lock: threading.Lock = threading.Lock()
+        
         # WebSocket mode
         self.use_websocket: bool = BOT_CONFIG.get("use_websocket", True)
         self.websocket_manager = None
         self.subscribed_tokens: Set[int] = set()
+        
+        # Paper trading mode - bypass market hour checks
+        self.paper_trading: bool = False
     
     def set_websocket_manager(self, ws_manager) -> None:
         """
@@ -64,12 +83,13 @@ class PositionTracker:
         self.websocket_manager = ws_manager
         logger.info("WebSocket manager attached to position tracker")
     
-    def start_monitoring(self, use_websocket: bool = None) -> None:
+    def start_monitoring(self, use_websocket: bool = None, paper_trading: bool = False) -> None:
         """
         Start the position monitoring.
         
         Args:
             use_websocket: Override default WebSocket setting
+            paper_trading: If True, bypass market hour checks
         """
         if self.is_running:
             logger.warning("Position tracker already running")
@@ -78,6 +98,7 @@ class PositionTracker:
         if use_websocket is not None:
             self.use_websocket = use_websocket
         
+        self.paper_trading = paper_trading
         self.is_running = True
         
         # Load any existing positions from database (overnight recovery)
@@ -87,17 +108,30 @@ class PositionTracker:
             # WebSocket mode - register callback for price updates
             self.websocket_manager.register_callback("price_update", self._on_price_update)
             self._subscribe_active_positions()
-            logger.info("Position tracker started (WebSocket mode)")
+            mode_str = "WebSocket mode"
         else:
-            # Polling mode - start monitoring thread
-            self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
-            self.monitor_thread.start()
-            logger.info(f"Position tracker started (Polling mode, interval: {self.poll_interval}s)")
+            mode_str = f"Polling mode, interval: {self.poll_interval}s"
+        
+        # Always start polling thread as fallback (even in WebSocket mode)
+        # This ensures prices update even if WebSocket subscriptions fail
+        self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self.monitor_thread.start()
+        
+        if self.paper_trading:
+            mode_str += " [PAPER - market hours bypassed]"
+        
+        logger.info(f"Position tracker started ({mode_str} + polling fallback)")
         
         # Start periodic status update thread
         self.status_thread = threading.Thread(target=self._status_update_loop, daemon=True)
         self.status_thread.start()
         logger.info(f"Position status updates enabled (interval: {self.status_interval}s / {self.status_interval // 60} min)")
+        
+        # Start dedicated signal exit thread (separate from WebSocket for performance)
+        if self.signal_exit_enabled:
+            self.signal_exit_thread = threading.Thread(target=self._signal_exit_loop, daemon=True)
+            self.signal_exit_thread.start()
+            logger.info(f"Signal exit monitoring enabled (interval: {self.signal_exit_interval}s)")
     
     def stop_monitoring(self) -> None:
         """Stop the position monitoring."""
@@ -114,6 +148,9 @@ class PositionTracker:
         
         if self.status_thread:
             self.status_thread.join(timeout=10)
+        
+        if self.signal_exit_thread:
+            self.signal_exit_thread.join(timeout=10)
             
         logger.info("Position tracker stopped")
     
@@ -205,7 +242,9 @@ class PositionTracker:
         """Main monitoring loop (Polling mode only)."""
         while self.is_running:
             try:
-                if is_market_open():
+                # In paper trading mode, always check positions
+                # In live mode, only check during market hours
+                if self.paper_trading or is_market_open():
                     self._check_all_positions()
                 time.sleep(self.poll_interval)
             except Exception as e:
@@ -244,10 +283,27 @@ class PositionTracker:
         
         for leg in signal.legs:
             current_price = data_fetcher.get_ltp(leg.symbol)
+            
+            # In paper trading mode, if API returns no price, simulate with entry price
             if current_price:
                 current_prices[leg.symbol] = current_price
                 leg.current_price = current_price
-                total_pnl += leg.pnl()
+            elif self.paper_trading:
+                # Use entry price with small random fluctuation for paper trading
+                import random
+                # Simulate price within +/- 2% of entry price
+                fluctuation = random.uniform(-0.02, 0.02)
+                simulated_price = leg.entry_price * (1 + fluctuation)
+                current_prices[leg.symbol] = simulated_price
+                leg.current_price = simulated_price
+                logger.debug(f"[PAPER] Simulated price for {leg.symbol}: Rs.{simulated_price:.2f}")
+            else:
+                # Fallback to entry price if no current price available
+                if leg.entry_price:
+                    current_prices[leg.symbol] = leg.entry_price
+                    leg.current_price = leg.entry_price
+            
+            total_pnl += leg.pnl()
         
         # Store metrics and check SL/Target
         self._update_metrics_and_check(execution_id, execution, total_pnl, current_prices)
@@ -270,7 +326,19 @@ class PositionTracker:
         for leg in signal.legs:
             if leg.current_price:
                 current_prices[leg.symbol] = leg.current_price
-                total_pnl += leg.pnl()
+            elif self.paper_trading:
+                # Simulate price for paper trading if no websocket price
+                import random
+                fluctuation = random.uniform(-0.02, 0.02)
+                simulated_price = leg.entry_price * (1 + fluctuation)
+                current_prices[leg.symbol] = simulated_price
+                leg.current_price = simulated_price
+            elif leg.entry_price:
+                # Fallback to entry price
+                current_prices[leg.symbol] = leg.entry_price
+                leg.current_price = leg.entry_price
+            
+            total_pnl += leg.pnl()
         
         # Store metrics and check SL/Target
         self._update_metrics_and_check(execution_id, execution, total_pnl, current_prices)
@@ -326,15 +394,144 @@ class PositionTracker:
                 self._trigger_exit(execution_id, exit_reason, total_pnl)
                 self._notify("greeks_exit", execution_id, total_pnl, exit_reason)
                 return
+        
+        # NOTE: Signal-based exits are handled by a dedicated thread (_signal_exit_loop)
+        # to avoid blocking WebSocket callbacks. Not called inline here.
     
-    def on_new_position(self, execution_id: str) -> None:
+    def _check_signal_exit(
+        self,
+        execution_id: str,
+        execution,
+        total_pnl: float,
+        current_prices: Dict[str, float],
+        force: bool = False,
+    ) -> None:
+        """
+        Check for signal-based intelligent exits using the ExitSignalGenerator.
+        This checks for trend reversals, sentiment shifts, thesis invalidation, etc.
+        
+        NOTE: This is an expensive operation (fetches market data). 
+        In WebSocket mode, this is rate-limited and runs asynchronously.
+        
+        Args:
+            execution_id: Execution ID
+            execution: TradeExecution object
+            total_pnl: Current total P&L
+            current_prices: Dict of symbol -> current price
+            force: If True, bypass rate limiting
+        """
+        # Rate limit signal checks (they're more expensive than simple SL/Target)
+        now = datetime.now()
+        last_check = self.last_signal_check.get(execution_id)
+        if not force and last_check and (now - last_check).seconds < self.signal_exit_interval:
+            return
+        
+        self.last_signal_check[execution_id] = now
+        
+        try:
+            exit_generator = get_exit_signal_generator()
+            exit_signal = exit_generator.generate_exit_signal(
+                execution_id=execution_id,
+                signal=execution.signal,
+                current_pnl=total_pnl,
+                current_prices=current_prices,
+            )
+            
+            if exit_signal and exit_signal.should_exit:
+                # Log the exit signal details
+                logger.info(f"[EXIT SIGNAL] {execution_id}")
+                logger.info(f"   Reason:     {exit_signal.reason.value}")
+                logger.info(f"   Confidence: {exit_signal.confidence:.1%}")
+                logger.info(f"   Urgency:    {exit_signal.urgency}")
+                logger.info(f"   Current P&L: Rs.{exit_signal.current_pnl:.2f}")
+                logger.info(f"   Rationale:  {exit_signal.rationale}")
+                
+                # Only act on high confidence or urgent signals
+                should_exit = (
+                    exit_signal.confidence >= 0.70 or
+                    exit_signal.urgency in ["HIGH", "IMMEDIATE"]
+                )
+                
+                if should_exit:
+                    reason_str = f"SIGNAL_{exit_signal.reason.value}"
+                    self._trigger_exit(execution_id, reason_str, total_pnl)
+                    self._notify("signal_exit", execution_id, total_pnl, exit_signal)
+                else:
+                    # Log as advisory but don't exit
+                    logger.info(f"   [ADVISORY] Signal suggests exit but below threshold - monitoring")
+                    
+        except Exception as e:
+            logger.debug(f"Signal exit check failed for {execution_id}: {e}")
+    
+    def _signal_exit_loop(self) -> None:
+        """
+        Dedicated loop for signal-based exit checks.
+        
+        Runs separately from WebSocket callbacks to avoid blocking real-time price updates.
+        This is an expensive operation (fetches market data, analyzes indicators) so it runs
+        at a configurable interval (default 60s) rather than on every price tick.
+        """
+        logger.debug("Signal exit loop started")
+        
+        while self.is_running:
+            try:
+                # Sleep first, then check (allows immediate shutdown)
+                time.sleep(self.signal_exit_interval)
+                
+                if not self.is_running:
+                    break
+                
+                # Check if we have active positions
+                active_executions = order_manager.active_executions.copy()
+                if not active_executions:
+                    continue
+                
+                logger.debug(f"Signal exit check: scanning {len(active_executions)} position(s)")
+                
+                # Check each active position for signal-based exits
+                for execution_id, execution in active_executions.items():
+                    if not self.is_running:
+                        break
+                    
+                    try:
+                        # Get current prices from cached metrics
+                        with self.signal_exit_lock:
+                            metrics = self.position_metrics.get(execution_id, {})
+                        
+                        current_prices = metrics.get("current_prices", {})
+                        current_pnl = metrics.get("current_pnl", 0)
+                        
+                        # If no prices yet, skip (wait for WebSocket/poll to update)
+                        if not current_prices:
+                            continue
+                        
+                        # Run the signal exit check (force=True bypasses rate limit since we control timing)
+                        self._check_signal_exit(
+                            execution_id=execution_id,
+                            execution=execution,
+                            total_pnl=current_pnl,
+                            current_prices=current_prices,
+                            force=True,  # We control the timing, so bypass internal rate limiting
+                        )
+                        
+                    except Exception as e:
+                        logger.debug(f"Signal exit check error for {execution_id}: {e}")
+                
+            except Exception as e:
+                logger.error(f"Signal exit loop error: {e}")
+                time.sleep(5)  # Brief pause on error
+        
+        logger.debug("Signal exit loop stopped")
+
+    def on_new_position(self, execution_id: str, market_data: Dict = None) -> None:
         """
         Called when a new position is opened.
         Subscribes to WebSocket for the position's instruments.
-        Also stores entry Greeks for Greeks-based exit checks.
+        Also stores entry Greeks and market conditions for intelligent exit checks.
         
         Args:
             execution_id: Execution ID of new position
+            market_data: Optional market data at entry time (spot, OI, volatility, historical)
         """
         execution = order_manager.active_executions.get(execution_id)
         if not execution:
@@ -343,6 +540,15 @@ class PositionTracker:
         # Store entry Greeks for comparison during exit checks
         if GREEKS_EXIT_CONFIG.get("enabled", False):
             self.store_entry_greeks(execution_id, execution.signal)
+        
+        # Store entry conditions for signal-based exits
+        if self.signal_exit_enabled and market_data:
+            try:
+                exit_generator = get_exit_signal_generator()
+                exit_generator.store_entry_conditions(execution_id, execution.signal, market_data)
+                logger.debug(f"Stored entry conditions for signal-based exits: {execution_id}")
+            except Exception as e:
+                logger.debug(f"Could not store entry conditions: {e}")
         
         # WebSocket subscription
         if not self.use_websocket or not self.websocket_manager:
@@ -519,7 +725,7 @@ class PositionTracker:
                     "iv": greeks.get("avg_iv", 0),
                     "timestamp": datetime.now(),
                 }
-                logger.debug(f"Stored entry Greeks for {execution_id}: Δ={greeks.get('delta', 0):.4f}")
+                logger.debug(f"Stored entry Greeks for {execution_id}: D={greeks.get('delta', 0):.4f}")
         except Exception as e:
             logger.debug(f"Could not store entry Greeks: {e}")
 
@@ -670,7 +876,7 @@ class PositionTracker:
         self.last_status_update = datetime.now()
         
         logger.info("=" * 60)
-        logger.info(f"📊 POSITION STATUS UPDATE - {self.last_status_update.strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"[STATUS] POSITION STATUS UPDATE - {self.last_status_update.strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info("=" * 60)
         
         total_unrealized_pnl = 0
@@ -709,17 +915,17 @@ class PositionTracker:
                 logger.debug(f"Could not fetch Greeks: {e}")
             
             # Log status
-            pnl_emoji = "🟢" if current_pnl >= 0 else "🔴"
-            logger.info(f"\n📌 {execution_id}")
+            pnl_indicator = "[+]" if current_pnl >= 0 else "[-]"
+            logger.info(f"\n[POS] {execution_id}")
             logger.info(f"   Strategy: {signal.strategy_type.value} | Underlying: {signal.underlying}")
             logger.info(f"   Time in Trade: {time_str}")
-            logger.info(f"   {pnl_emoji} Current P&L: ₹{current_pnl:,.2f} ({pnl_percent:+.1f}% of SL)")
-            logger.info(f"   SL: ₹{signal.stop_loss:,.2f} | Target: ₹{signal.target:,.2f}")
-            logger.info(f"   📊 Greeks: Δ={position_greeks.get('delta', 0):.4f} Γ={position_greeks.get('gamma', 0):.6f} Θ={position_greeks.get('theta', 0):.2f} V={position_greeks.get('vega', 0):.4f}")
+            logger.info(f"   {pnl_indicator} Current P&L: Rs.{current_pnl:,.2f} ({pnl_percent:+.1f}% of SL)")
+            logger.info(f"   SL: Rs.{signal.stop_loss:,.2f} | Target: Rs.{signal.target:,.2f}")
+            logger.info(f"   Greeks: D={position_greeks.get('delta', 0):.4f} G={position_greeks.get('gamma', 0):.6f} T={position_greeks.get('theta', 0):.2f} V={position_greeks.get('vega', 0):.4f}")
             
             for leg in signal.legs:
                 leg_pnl = leg.pnl() if hasattr(leg, 'pnl') else 0
-                logger.info(f"   └─ {leg.direction.value} {leg.symbol}: Entry ₹{leg.entry_price:.2f} → Current ₹{leg.current_price or 0:.2f} (P&L: ₹{leg_pnl:.2f})")
+                logger.info(f"   |-- {leg.direction.value} {leg.symbol}: Entry Rs.{leg.entry_price:.2f} -> Current Rs.{leg.current_price or 0:.2f} (P&L: Rs.{leg_pnl:.2f})")
             
             total_unrealized_pnl += current_pnl
             
@@ -749,7 +955,7 @@ class PositionTracker:
                 "target": signal.target,
             })
         
-        logger.info(f"\n💰 Total Unrealized P&L: ₹{total_unrealized_pnl:,.2f}")
+        logger.info(f"\n[TOTAL] Total Unrealized P&L: Rs.{total_unrealized_pnl:,.2f}")
         logger.info("=" * 60)
     
     def _format_duration(self, seconds: float) -> str:
@@ -786,7 +992,7 @@ class PositionTracker:
                 logger.info("No persisted positions to load")
                 return
             
-            logger.info(f"📥 Loading {len(active_trades)} persisted position(s) from database...")
+            logger.info(f"[LOAD] Loading {len(active_trades)} persisted position(s) from database...")
             
             for trade in active_trades:
                 execution_id = trade.get("execution_id")
@@ -804,7 +1010,7 @@ class PositionTracker:
                 loaded = order_manager.load_persisted_position(execution_id, signal_data)
                 
                 if loaded:
-                    logger.info(f"✅ Loaded position: {execution_id} ({trade.get('strategy_type')} on {trade.get('underlying')})")
+                    logger.info(f"[OK] Loaded position: {execution_id} ({trade.get('strategy_type')} on {trade.get('underlying')})")
                     
                     # Initialize metrics
                     self.position_metrics[execution_id] = {
@@ -813,7 +1019,7 @@ class PositionTracker:
                         "current_prices": {},
                     }
                 else:
-                    logger.warning(f"❌ Failed to load position: {execution_id}")
+                    logger.warning(f"[FAIL] Failed to load position: {execution_id}")
             
             logger.info(f"Finished loading persisted positions")
             

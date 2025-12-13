@@ -49,6 +49,75 @@ def get_expiry_date(underlying: str, days_to_expiry: Optional[int] = None) -> da
     return today + timedelta(days=days_ahead)
 
 
+def get_monthly_expiry_date(underlying: str = None) -> datetime:
+    """
+    Get the next monthly expiry date.
+    Monthly expiry is the last Thursday of the month.
+    
+    Args:
+        underlying: The underlying asset (optional, for future use)
+        
+    Returns:
+        The next monthly expiry date
+    """
+    today = datetime.now()
+    
+    # Start from today's month
+    year = today.year
+    month = today.month
+    
+    # Find last Thursday of current month
+    # Get the last day of the month
+    if month == 12:
+        next_month = datetime(year + 1, 1, 1)
+    else:
+        next_month = datetime(year, month + 1, 1)
+    
+    last_day = next_month - timedelta(days=1)
+    
+    # Find last Thursday (weekday 3)
+    days_since_thursday = (last_day.weekday() - 3) % 7
+    last_thursday = last_day - timedelta(days=days_since_thursday)
+    
+    # If today is past the last Thursday, get next month's last Thursday
+    if today.date() > last_thursday.date():
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+        
+        if month == 12:
+            next_month = datetime(year + 1, 1, 1)
+        else:
+            next_month = datetime(year, month + 1, 1)
+        
+        last_day = next_month - timedelta(days=1)
+        days_since_thursday = (last_day.weekday() - 3) % 7
+        last_thursday = last_day - timedelta(days=days_since_thursday)
+    
+    return last_thursday
+
+
+def is_monthly_expiry_day() -> bool:
+    """
+    Check if today is a monthly expiry day (last Thursday of the month).
+    
+    Returns:
+        True if today is monthly expiry
+    """
+    today = datetime.now()
+    
+    # Check if today is Thursday
+    if today.weekday() != 3:
+        return False
+    
+    # Check if this is the last Thursday of the month
+    next_week = today + timedelta(days=7)
+    
+    # If next week is a different month, this is the last Thursday
+    return next_week.month != today.month
+
+
 def get_strike_price(
     spot_price: float,
     underlying: str,
@@ -266,10 +335,55 @@ def should_square_off() -> bool:
     return now.time() >= square_off_time
 
 
-def is_expiry_day(underlying: str = None) -> bool:
-    """Check if today is an expiry day."""
-    from config.settings import UNDERLYING_ASSETS
+def should_auto_exit() -> bool:
+    """
+    Check if the bot should auto-exit (shutdown) after market hours.
+    Returns True if:
+    - auto_exit_after_close is enabled
+    - Current time is past market_close + buffer_minutes
+    - It's a weekday
     
+    Returns:
+        True if bot should shutdown
+    """
+    from config.settings import MARKET_HOURS
+    
+    # Check if auto-exit is enabled
+    if not MARKET_HOURS.get("auto_exit_after_close", True):
+        return False
+    
+    now = datetime.now()
+    
+    # Don't auto-exit on weekends (bot shouldn't be running anyway)
+    if now.weekday() >= 5:
+        return False
+    
+    # Get market close time and add buffer
+    market_close_str = MARKET_HOURS.get("market_close", "15:30")
+    buffer_minutes = MARKET_HOURS.get("auto_exit_buffer_minutes", 5)
+    
+    market_close = datetime.strptime(market_close_str, "%H:%M").time()
+    
+    # Create datetime for market close today and add buffer
+    market_close_dt = datetime.combine(now.date(), market_close)
+    auto_exit_time = market_close_dt + timedelta(minutes=buffer_minutes)
+    
+    return now >= auto_exit_time
+
+
+def is_expiry_day(underlying: str = None) -> bool:
+    """
+    Check if today is an expiry day.
+    If use_monthly_expiry_only is True, only returns True on monthly expiry.
+    Otherwise, returns True on any weekly expiry.
+    """
+    from config.settings import UNDERLYING_ASSETS, MARKET_HOURS
+    
+    # Check if we only care about monthly expiry
+    if MARKET_HOURS.get("use_monthly_expiry_only", True):
+        return is_monthly_expiry_day()
+    
+    # Otherwise check weekly expiry
     today = datetime.now()
     day_name = today.strftime("%A")  # Monday, Tuesday, etc.
     
@@ -365,12 +479,12 @@ def get_market_status() -> Dict[str, Any]:
         else:
             status["status_message"] = f"No new trades after {trading_end}"
     elif status["should_square_off"]:
-        status["status_message"] = "⚠️ Square off time - closing positions"
+        status["status_message"] = "[!] Square off time - closing positions"
     else:
         time_to_close = get_time_to_market_close()
         if time_to_close:
             status["time_to_close"] = str(time_to_close).split('.')[0]
-        status["status_message"] = "✅ Trading active"
+        status["status_message"] = "[OK] Trading active"
     
     return status
 

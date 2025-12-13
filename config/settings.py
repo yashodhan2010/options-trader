@@ -33,6 +33,7 @@ TRADING_CONFIG = {
     "exchange": "NFO",  # NFO for options
     "default_quantity": 1,  # Lot size multiplier
     "max_positions": 5,
+    "paper_max_positions": 15,  # Relaxed cap for paper trading (set higher than live)
     "capital_per_trade": 150000,  # INR
     "max_loss_per_day": 10000,  # INR
     "default_sl_percent": 30,  # Stop loss percentage
@@ -48,6 +49,10 @@ MARKET_HOURS = {
     "trading_start": "09:30",           # Bot starts trading (after initial volatility)
     "trading_end": "15:15",             # Stop taking new positions (15 min before close)
     "market_close": "15:30",            # NSE market close time
+    
+    # Auto-exit settings
+    "auto_exit_after_close": True,      # Automatically exit bot after market closes
+    "auto_exit_buffer_minutes": 5,      # Minutes after market_close to exit (15:30 + 5 = 15:35)
     
     # Overnight position handling
     "auto_square_off": False,           # Set True to force close at square_off_time
@@ -66,17 +71,25 @@ MARKET_HOURS = {
     "expiry_day_trading": True,         # Trade on expiry days?
     "expiry_day_square_off": True,      # Force square-off on expiry day (recommended)
     "expiry_early_exit_time": "14:30",  # Exit positions earlier on expiry
+    
+    # Monthly vs Weekly expiry settings
+    "use_monthly_expiry_only": True,    # Only trade monthly expiry options (not weekly)
 }
 
 # Bot Scan Configuration
 BOT_CONFIG = {
-    "signal_scan_interval": 60,         # Seconds between signal scans (entry signals)
+    "signal_scan_interval": 900,        # Seconds between signal scans (15 minutes for better data)
     "position_poll_interval": 5,        # Seconds between position checks (exit monitoring)
     "position_status_interval": 900,    # Seconds between status updates (15 minutes = 900s)
     "max_signals_per_scan": 3,          # Maximum signals to generate per scan
     "min_signal_gap_minutes": 15,       # Minimum gap between signals for same underlying
     "use_websocket": True,              # Use WebSocket for real-time exit monitoring
     "persist_positions": True,          # Save positions to database for overnight recovery
+    
+    # Signal-based intelligent exit system
+    "signal_exit_enabled": True,        # Enable reversal/thesis-based exits
+    "signal_exit_interval": 60,         # Seconds between signal exit checks (less frequent, more expensive)
+    "signal_exit_min_confidence": 0.70, # Minimum confidence to trigger exit
 }
 
 # Greeks-Based Exit Configuration (NEW)
@@ -153,6 +166,8 @@ STRATEGY_CONFIG = {
         "short_put",
         "bull_call_spread",
         "bear_put_spread",
+        "bear_call_spread",   # Credit spread - SELL call with BUY hedge
+        "bull_put_spread",    # Credit spread - SELL put with BUY hedge
         "iron_condor",
         "straddle",
         "strangle",

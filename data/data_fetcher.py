@@ -209,6 +209,19 @@ class DataFetcher:
             return pd.DataFrame()
         
         try:
+            def _normalize_expiry(expiry_value):
+                """Convert expiry to a date object for reliable comparisons."""
+                if expiry_value is None:
+                    return None
+                if isinstance(expiry_value, datetime):
+                    return expiry_value.date()
+                if isinstance(expiry_value, date):
+                    return expiry_value
+                try:
+                    return datetime.fromisoformat(str(expiry_value)).date()
+                except Exception:
+                    return None
+            
             # Get current spot price
             spot_price = self.get_spot_price(underlying)
             if not spot_price:
@@ -224,17 +237,62 @@ class DataFetcher:
                 and i["instrument_type"] in ["CE", "PE"]
             ]
             
+            target_expiry_date = None
             if expiry_date:
+                target_expiry_date = expiry_date.date() if isinstance(expiry_date, datetime) else expiry_date
                 options = [
                     o for o in options
-                    if o["expiry"].date() == expiry_date.date()
+                    if _normalize_expiry(o["expiry"]) == target_expiry_date
                 ]
             else:
-                # Get nearest expiry
-                expiries = sorted(set(o["expiry"] for o in options))
+                # Check if we should use monthly expiry only
+                from config.settings import MARKET_HOURS
+                use_monthly = MARKET_HOURS.get("use_monthly_expiry_only", True)
+                
+                expiries = sorted({
+                    _normalize_expiry(o["expiry"]) for o in options
+                    if _normalize_expiry(o["expiry"]) is not None
+                })
                 if expiries:
-                    nearest_expiry = expiries[0]
-                    options = [o for o in options if o["expiry"] == nearest_expiry]
+                    if use_monthly:
+                        # Find monthly expiry (last Thursday of each month)
+                        from core.utils import get_monthly_expiry_date
+                        monthly_expiry = get_monthly_expiry_date()
+                        
+                        # Find the expiry closest to monthly expiry date
+                        target_expiry = None
+                        for exp in expiries:
+                            if exp == monthly_expiry.date():
+                                target_expiry = exp
+                                break
+                        
+                        # If exact match not found, use closest expiry >= monthly
+                        if not target_expiry:
+                            for exp in expiries:
+                                if exp >= monthly_expiry.date():
+                                    target_expiry = exp
+                                    break
+                        
+                        # Fallback to nearest expiry if no monthly found
+                        if not target_expiry:
+                            target_expiry = expiries[0]
+                            logger.warning(
+                                f"Monthly expiry not found for {underlying}, using nearest: {target_expiry}"
+                            )
+                        else:
+                            logger.debug(f"Using monthly expiry for {underlying}: {target_expiry}")
+                        
+                        options = [
+                            o for o in options
+                            if _normalize_expiry(o["expiry"]) == target_expiry
+                        ]
+                    else:
+                        # Use nearest expiry (weekly)
+                        nearest_expiry = expiries[0]
+                        options = [
+                            o for o in options
+                            if _normalize_expiry(o["expiry"]) == nearest_expiry
+                        ]
             
             # Get ATM strike - determine strike interval based on underlying
             if underlying in ["NIFTY", "FINNIFTY"]:

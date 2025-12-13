@@ -27,7 +27,7 @@ class TradingCLI(cmd.Cmd):
 ║  Type 'quit' to exit                                          ║
 ╚═══════════════════════════════════════════════════════════════╝
     """
-    prompt = "📈 options> "
+    prompt = "options> "
     
     def __init__(self):
         super().__init__()
@@ -73,8 +73,8 @@ class TradingCLI(cmd.Cmd):
                 equity = margins.get("equity", {})
                 available = equity.get("available", {}).get("live_balance", 0)
                 used = equity.get("utilised", {}).get("debits", 0)
-                print(f"Available Margin: ₹{available:,.2f}")
-                print(f"Used Margin: ₹{used:,.2f}")
+                print(f"Available Margin: Rs.{available:,.2f}")
+                print(f"Used Margin: Rs.{used:,.2f}")
         else:
             print("✗ Not connected")
     
@@ -89,53 +89,53 @@ class TradingCLI(cmd.Cmd):
         print(f"MARKET STATUS")
         print(f"{'='*60}")
         print(f"Current Time: {status['current_time']}")
-        print(f"\n📅 Today: {datetime.now().strftime('%A, %B %d, %Y')}")
+        print(f"\n[DATE] Today: {datetime.now().strftime('%A, %B %d, %Y')}")
         
         if status['is_weekend']:
-            print("🚫 Weekend - Markets Closed")
+            print("[X] Weekend - Markets Closed")
         else:
-            print(f"\n⏰ Configured Timings:")
+            print(f"\n[TIME] Configured Timings:")
             print(f"   Market Open:    {MARKET_HOURS.get('market_open', '09:15')}")
             print(f"   Trading Start:  {MARKET_HOURS.get('trading_start', '09:30')} (after initial volatility)")
             print(f"   Trading End:    {MARKET_HOURS.get('trading_end', '15:15')} (no new positions)")
             print(f"   Square Off:     {MARKET_HOURS.get('square_off_time', '15:20')}")
             print(f"   Market Close:   {MARKET_HOURS.get('market_close', '15:30')}")
             
-            print(f"\n📊 Current Status:")
-            market_emoji = "🟢" if status['is_market_open'] else "🔴"
+            print(f"\n[STATUS] Current Status:")
+            market_emoji = "[OPEN]" if status['is_market_open'] else "[CLOSED]"
             print(f"   {market_emoji} Market Open: {'Yes' if status['is_market_open'] else 'No'}")
             
-            trading_emoji = "🟢" if status['is_trading_allowed'] else "🟡"
+            trading_emoji = "[OK]" if status['is_trading_allowed'] else "[WAIT]"
             print(f"   {trading_emoji} Trading Allowed: {'Yes' if status['is_trading_allowed'] else 'No'}")
             
             if status.get('time_to_open'):
-                print(f"   ⏳ Time to trading start: {status['time_to_open']}")
+                print(f"   [TIMER] Time to trading start: {status['time_to_open']}")
             if status.get('time_to_close'):
-                print(f"   ⏳ Time to market close: {status['time_to_close']}")
+                print(f"   [TIMER] Time to market close: {status['time_to_close']}")
             
             # Overnight carry settings
-            print(f"\n📦 Position Carry Settings:")
+            print(f"\n[POSITION] Position Carry Settings:")
             carry_overnight = MARKET_HOURS.get('carry_overnight', True)
             auto_square_off = MARKET_HOURS.get('auto_square_off', False)
             
             if carry_overnight:
-                print(f"   ✅ Overnight Carry: ENABLED (positions will be held)")
+                print(f"   [Y] Overnight Carry: ENABLED (positions will be held)")
             else:
-                print(f"   ❌ Overnight Carry: DISABLED")
+                print(f"   [N] Overnight Carry: DISABLED")
             
             if auto_square_off:
-                print(f"   ⚠️  Auto Square Off: ENABLED at {MARKET_HOURS.get('square_off_time', '15:20')}")
+                print(f"   [!] Auto Square Off: ENABLED at {MARKET_HOURS.get('square_off_time', '15:20')}")
             else:
-                print(f"   ✅ Auto Square Off: DISABLED")
+                print(f"   [Y] Auto Square Off: DISABLED")
             
             if is_expiry_day():
-                print(f"\n   📌 TODAY IS AN EXPIRY DAY!")
+                print(f"\n   [!] TODAY IS AN EXPIRY DAY!")
                 if MARKET_HOURS.get('expiry_day_square_off', True):
-                    print(f"   ⚠️  Expiry positions will be squared off at {MARKET_HOURS.get('expiry_early_exit_time', '14:30')}")
+                    print(f"   [!] Expiry positions will be squared off at {MARKET_HOURS.get('expiry_early_exit_time', '14:30')}")
                 else:
                     print(f"   Expiry positions can be carried (if not weekly expiry)")
         
-        print(f"\n💬 {status['status_message']}")
+        print(f"\n[INFO] {status['status_message']}")
         print(f"{'='*60}")
 
     def do_spot(self, arg):
@@ -148,7 +148,7 @@ class TradingCLI(cmd.Cmd):
         
         spot = data_fetcher.get_spot_price(underlying)
         if spot:
-            print(f"{underlying} Spot: ₹{spot:,.2f}")
+            print(f"{underlying} Spot: Rs.{spot:,.2f}")
         else:
             print("Failed to get spot price")
     
@@ -165,7 +165,7 @@ class TradingCLI(cmd.Cmd):
         print(f"\n{'=' * 50}")
         print(f"Market Overview: {underlying}")
         print(f"{'=' * 50}")
-        print(f"Spot Price: ₹{overview.get('spot', 0):,.2f}")
+        print(f"Spot Price: Rs.{overview.get('spot', 0):,.2f}")
         
         oi = overview.get("oi_analysis", {})
         print(f"\nOpen Interest Analysis:")
@@ -183,7 +183,7 @@ class TradingCLI(cmd.Cmd):
         
         print(f"\nRecommended Strategies:")
         for rec in overview.get("recommended_strategies", []):
-            print(f"  • {rec}")
+            print(f"  - {rec}")
     
     def do_signals(self, arg):
         """Generate signals. Usage: signals [NIFTY|BANKNIFTY]"""
@@ -203,9 +203,9 @@ class TradingCLI(cmd.Cmd):
             print(f"   Confidence: {signal.confidence:.2%}")
             print(f"   Risk/Reward: {signal.risk_reward_ratio:.2f}")
             print(f"   Rationale: {signal.rationale}")
-            print(f"   SL: ₹{signal.stop_loss:.2f} | Target: ₹{signal.target:.2f}")
+            print(f"   SL: Rs.{signal.stop_loss:.2f} | Target: Rs.{signal.target:.2f}")
             for leg in signal.legs:
-                print(f"   → {leg.direction.value} {leg.symbol} @ ₹{leg.entry_price:.2f}")
+                print(f"   -> {leg.direction.value} {leg.symbol} @ Rs.{leg.entry_price:.2f}")
             print()
     
     def do_strategies(self, arg):
@@ -213,7 +213,7 @@ class TradingCLI(cmd.Cmd):
         print("\nAvailable Strategies:")
         print("-" * 40)
         for st in StrategyType:
-            print(f"  • {st.value}")
+            print(f"  - {st.value}")
     
     def do_trade(self, arg):
         """Execute a trade. Usage: trade <UNDERLYING> <STRATEGY>"""
@@ -249,9 +249,9 @@ class TradingCLI(cmd.Cmd):
         print(f"Rationale: {signal.rationale}")
         
         for leg in signal.legs:
-            print(f"  → {leg.direction.value} {leg.symbol} @ ₹{leg.entry_price:.2f}")
+            print(f"  -> {leg.direction.value} {leg.symbol} @ Rs.{leg.entry_price:.2f}")
         
-        print(f"\nSL: ₹{signal.stop_loss:.2f} | Target: ₹{signal.target:.2f}")
+        print(f"\nSL: Rs.{signal.stop_loss:.2f} | Target: Rs.{signal.target:.2f}")
         
         confirm = input("\nExecute trade? (y/n): ").strip().lower()
         if confirm == 'y':
@@ -275,15 +275,15 @@ class TradingCLI(cmd.Cmd):
         
         for pos in positions:
             pnl = pos.get('current_pnl', 0)
-            pnl_color = "🟢" if pnl >= 0 else "🔴"
+            pnl_color = "[+]" if pnl >= 0 else "[-]"
             
             print(f"\n{pos['execution_id']}")
             print(f"  Strategy: {pos['strategy']} | {pos['underlying']}")
-            print(f"  P&L: {pnl_color} ₹{pnl:.2f}")
-            print(f"  SL: ₹{pos['stop_loss']:.2f} | Target: ₹{pos['target']:.2f}")
+            print(f"  P&L: {pnl_color} Rs.{pnl:.2f}")
+            print(f"  SL: Rs.{pos['stop_loss']:.2f} | Target: Rs.{pos['target']:.2f}")
         
         print(f"\n{'=' * 60}")
-        print(f"Total P&L: ₹{position_tracker.get_daily_pnl():.2f}")
+        print(f"Total P&L: Rs.{position_tracker.get_daily_pnl():.2f}")
     
     def do_close(self, arg):
         """Close a position. Usage: close <execution_id> or close all"""
@@ -310,7 +310,7 @@ class TradingCLI(cmd.Cmd):
             confirm = input("Enable LIVE trading? (type 'yes' to confirm): ").strip()
             if confirm == 'yes':
                 order_manager.set_paper_trading(False)
-                print("⚠️  LIVE trading: ON")
+                print("[!] LIVE trading: ON")
             else:
                 print("Cancelled")
         else:
@@ -332,26 +332,26 @@ class TradingCLI(cmd.Cmd):
         print(f"{'='*70}")
         
         enabled = GREEKS_EXIT_CONFIG.get("enabled", False)
-        print(f"\n🔧 Master Switch: {'✅ ENABLED' if enabled else '❌ DISABLED'}")
+        print(f"\n[CONFIG] Master Switch: {'[Y] ENABLED' if enabled else '[N] DISABLED'}")
         
-        print(f"\n📊 Delta-Based Exits: {'ON' if GREEKS_EXIT_CONFIG.get('delta_exit_enabled') else 'OFF'}")
-        print(f"   • Min Delta (Long): {GREEKS_EXIT_CONFIG.get('min_delta_long', 0.10)} - Exit if delta falls below")
-        print(f"   • Max Delta (Short): {GREEKS_EXIT_CONFIG.get('max_delta_short', 0.90)} - Exit if delta rises above")
+        print(f"\n[DELTA] Delta-Based Exits: {'ON' if GREEKS_EXIT_CONFIG.get('delta_exit_enabled') else 'OFF'}")
+        print(f"   * Min Delta (Long): {GREEKS_EXIT_CONFIG.get('min_delta_long', 0.10)} - Exit if delta falls below")
+        print(f"   * Max Delta (Short): {GREEKS_EXIT_CONFIG.get('max_delta_short', 0.90)} - Exit if delta rises above")
         
-        print(f"\n⏰ Theta-Based Exits: {'ON' if GREEKS_EXIT_CONFIG.get('theta_exit_enabled') else 'OFF'}")
-        print(f"   • Decay Threshold: {GREEKS_EXIT_CONFIG.get('theta_decay_threshold', 0.5)*100}% of remaining profit")
-        print(f"   • Min DTE: {GREEKS_EXIT_CONFIG.get('days_to_expiry_exit', 2)} days")
+        print(f"\n[THETA] Theta-Based Exits: {'ON' if GREEKS_EXIT_CONFIG.get('theta_exit_enabled') else 'OFF'}")
+        print(f"   * Decay Threshold: {GREEKS_EXIT_CONFIG.get('theta_decay_threshold', 0.5)*100}% of remaining profit")
+        print(f"   * Min DTE: {GREEKS_EXIT_CONFIG.get('days_to_expiry_exit', 2)} days")
         
-        print(f"\n📉 Vega-Based Exits (IV Crush): {'ON' if GREEKS_EXIT_CONFIG.get('vega_exit_enabled') else 'OFF'}")
-        print(f"   • IV Drop Threshold: {GREEKS_EXIT_CONFIG.get('iv_drop_percent', 20)}%")
+        print(f"\n[VEGA] Vega-Based Exits (IV Crush): {'ON' if GREEKS_EXIT_CONFIG.get('vega_exit_enabled') else 'OFF'}")
+        print(f"   * IV Drop Threshold: {GREEKS_EXIT_CONFIG.get('iv_drop_percent', 20)}%")
         
-        print(f"\n⚡ Gamma-Based SL Tightening: {'ON' if GREEKS_EXIT_CONFIG.get('gamma_tighten_enabled') else 'OFF'}")
-        print(f"   • Gamma Threshold: {GREEKS_EXIT_CONFIG.get('gamma_threshold', 0.05)}")
-        print(f"   • SL Tighten: {GREEKS_EXIT_CONFIG.get('gamma_sl_tighten_percent', 20)}%")
+        print(f"\n[GAMMA] Gamma-Based SL Tightening: {'ON' if GREEKS_EXIT_CONFIG.get('gamma_tighten_enabled') else 'OFF'}")
+        print(f"   * Gamma Threshold: {GREEKS_EXIT_CONFIG.get('gamma_threshold', 0.05)}")
+        print(f"   * SL Tighten: {GREEKS_EXIT_CONFIG.get('gamma_sl_tighten_percent', 20)}%")
         
-        print(f"\n💰 Profit Lock: {'ON' if GREEKS_EXIT_CONFIG.get('profit_lock_enabled') else 'OFF'}")
-        print(f"   • Threshold: {GREEKS_EXIT_CONFIG.get('profit_lock_threshold', 0.5)*100}% of target")
-        print(f"   • Lock: {GREEKS_EXIT_CONFIG.get('profit_lock_percent', 0.3)*100}% of profit")
+        print(f"\n[PROFIT] Profit Lock: {'ON' if GREEKS_EXIT_CONFIG.get('profit_lock_enabled') else 'OFF'}")
+        print(f"   * Threshold: {GREEKS_EXIT_CONFIG.get('profit_lock_threshold', 0.5)*100}% of target")
+        print(f"   * Lock: {GREEKS_EXIT_CONFIG.get('profit_lock_percent', 0.3)*100}% of profit")
         
         print(f"\n{'='*70}")
         print("Use 'greeks_settings toggle' to enable/disable Greeks exits")
@@ -447,7 +447,7 @@ class TradingCLI(cmd.Cmd):
         print(f"\n{'='*50}")
         print(f"IV ANALYSIS - {underlying}")
         print(f"{'='*50}")
-        print(f"Spot Price:      ₹{spot:,.2f}")
+        print(f"Spot Price:      Rs.{spot:,.2f}")
         print(f"ATM IV:          {atm_iv:.2f}%")
         print(f"IV Percentile:   {iv_data.get('percentile', 0):.1f}%")
         print(f"IV Regime:       {iv_data.get('regime', 'UNKNOWN')}")
@@ -457,15 +457,15 @@ class TradingCLI(cmd.Cmd):
         
         # Strategy suggestions based on IV
         regime = iv_data.get('regime', '')
-        print("\n📊 Strategy Suggestions:")
+        print("\n[STRATEGY] Strategy Suggestions:")
         if regime == "HIGH":
-            print("  • HIGH IV - Consider selling options (Short Straddle, Iron Condor)")
-            print("  • Credit spreads may offer good premium")
+            print("  * HIGH IV - Consider selling options (Short Straddle, Iron Condor)")
+            print("  * Credit spreads may offer good premium")
         elif regime == "LOW":
-            print("  • LOW IV - Consider buying options (Long Straddle, Long Strangle)")
-            print("  • Debit spreads may be cheaper to enter")
+            print("  * LOW IV - Consider buying options (Long Straddle, Long Strangle)")
+            print("  * Debit spreads may be cheaper to enter")
         else:
-            print("  • NORMAL IV - Directional strategies based on view")
+            print("  * NORMAL IV - Directional strategies based on view")
     
     def do_watchlist(self, arg):
         """Show current watchlist stocks"""
@@ -483,7 +483,7 @@ class TradingCLI(cmd.Cmd):
         print("-" * 60)
         
         for asset in assets:
-            status = "✅" if asset.get('enabled', True) else "❌"
+            status = "[Y]" if asset.get('enabled', True) else "[N]"
             print(f"{asset['name']:<15} {asset.get('equity_token', 'N/A'):>12} {asset.get('lot_size', 'N/A'):>10} {status:>10}")
         
         print(f"{'='*60}")
@@ -528,29 +528,29 @@ class TradingCLI(cmd.Cmd):
             total_capital += signal.capital_required
             total_max_loss += signal.stop_loss
         
-        print(f"\n📊 Portfolio Greeks:")
+        print(f"\n[GREEKS] Portfolio Greeks:")
         print(f"   Delta:  {total_delta:+.4f} (directional exposure)")
         print(f"   Gamma:  {total_gamma:+.6f} (delta sensitivity)")
-        print(f"   Theta:  {total_theta:+.2f} ₹/day (time decay)")
+        print(f"   Theta:  {total_theta:+.2f} Rs./day (time decay)")
         print(f"   Vega:   {total_vega:+.4f} (volatility sensitivity)")
         
-        print(f"\n💰 Capital Metrics:")
-        print(f"   Capital Deployed: ₹{total_capital:,.2f}")
-        print(f"   Max Risk (SL):    ₹{total_max_loss:,.2f}")
+        print(f"\n[CAPITAL] Capital Metrics:")
+        print(f"   Capital Deployed: Rs.{total_capital:,.2f}")
+        print(f"   Max Risk (SL):    Rs.{total_max_loss:,.2f}")
         print(f"   Active Positions: {len(positions)}")
         
         # Risk interpretation
-        print(f"\n📈 Risk Interpretation:")
+        print(f"\n[RISK] Risk Interpretation:")
         if abs(total_delta) > 0.5:
             direction = "bullish" if total_delta > 0 else "bearish"
-            print(f"   ⚠️  Portfolio is {direction} biased (high delta)")
+            print(f"   [!] Portfolio is {direction} biased (high delta)")
         else:
-            print(f"   ✅ Portfolio is relatively delta neutral")
+            print(f"   [OK] Portfolio is relatively delta neutral")
         
         if total_theta < -50:
-            print(f"   ⚠️  High time decay - losing ₹{abs(total_theta):.0f}/day to theta")
+            print(f"   [!] High time decay - losing Rs.{abs(total_theta):.0f}/day to theta")
         elif total_theta > 0:
-            print(f"   ✅ Positive theta - earning ₹{total_theta:.0f}/day from time decay")
+            print(f"   [OK] Positive theta - earning Rs.{total_theta:.0f}/day from time decay")
         
         print(f"{'='*80}")
     
@@ -587,10 +587,10 @@ class TradingCLI(cmd.Cmd):
         
         total_pnl = realized_pnl + unrealized_pnl
         
-        print(f"\n💵 Realized P&L (Closed):   ₹{realized_pnl:>+12,.2f}  ({closed_count} trades)")
-        print(f"📊 Unrealized P&L (Open):   ₹{unrealized_pnl:>+12,.2f}  ({len(positions)} positions)")
-        print(f"{'─'*60}")
-        print(f"💰 Total P&L:               ₹{total_pnl:>+12,.2f}")
+        print(f"\n[CLOSED] Realized P&L:      Rs.{realized_pnl:>+12,.2f}  ({closed_count} trades)")
+        print(f"[OPEN] Unrealized P&L:      Rs.{unrealized_pnl:>+12,.2f}  ({len(positions)} positions)")
+        print(f"{'-'*60}")
+        print(f"[TOTAL] Total P&L:          Rs.{total_pnl:>+12,.2f}")
         
         # Win/loss stats
         if today_trades:
@@ -598,12 +598,12 @@ class TradingCLI(cmd.Cmd):
             losers = [t for t in today_trades if t.get('pnl', 0) < 0]
             win_rate = len(winners) / len(today_trades) * 100 if today_trades else 0
             
-            print(f"\n📈 Today's Stats:")
+            print(f"\n[STATS] Today's Stats:")
             print(f"   Win Rate:  {win_rate:.1f}% ({len(winners)}W / {len(losers)}L)")
             if winners:
-                print(f"   Best Win:  ₹{max(t.get('pnl', 0) for t in winners):,.2f}")
+                print(f"   Best Win:  Rs.{max(t.get('pnl', 0) for t in winners):,.2f}")
             if losers:
-                print(f"   Worst Loss: ₹{min(t.get('pnl', 0) for t in losers):,.2f}")
+                print(f"   Worst Loss: Rs.{min(t.get('pnl', 0) for t in losers):,.2f}")
         
         print(f"{'='*60}")
     
@@ -630,29 +630,29 @@ class TradingCLI(cmd.Cmd):
         
         # Trend info
         trend = analysis.get('trend', 'UNKNOWN')
-        trend_emoji = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "🟡"}.get(trend, "⚪")
+        trend_emoji = {"BULLISH": "[UP]", "BEARISH": "[DN]", "NEUTRAL": "[--]"}.get(trend, "[??]")
         print(f"\n{trend_emoji} Trend: {trend}")
         print(f"   Trend Strength: {analysis.get('trend_strength', 0)*100:.1f}%")
         
         # RSI
         rsi = analysis.get('rsi', 50)
         rsi_status = "Overbought" if rsi > 70 else "Oversold" if rsi < 30 else "Neutral"
-        print(f"\n📊 RSI: {rsi:.1f} ({rsi_status})")
+        print(f"\n[RSI] RSI: {rsi:.1f} ({rsi_status})")
         
         # Momentum
         mom = analysis.get('momentum', 0)
-        mom_emoji = "📈" if mom > 0 else "📉"
+        mom_emoji = "[+]" if mom > 0 else "[-]"
         print(f"{mom_emoji} Momentum: {mom*100:+.2f}%")
         
         # Confidence
         confidence = analysis.get('confidence_boost', 0)
-        print(f"\n🎯 Signal Confidence Boost: {confidence*100:+.1f}%")
+        print(f"\n[SIGNAL] Confidence Boost: {confidence*100:+.1f}%")
         
         # Recent price action
-        print(f"\n📈 Recent Highs/Lows:")
-        print(f"   High (20D): ₹{analysis.get('high_20d', 0):,.2f}")
-        print(f"   Low (20D):  ₹{analysis.get('low_20d', 0):,.2f}")
-        print(f"   Current:    ₹{analysis.get('current_price', 0):,.2f}")
+        print(f"\n[PRICE] Recent Highs/Lows:")
+        print(f"   High (20D): Rs.{analysis.get('high_20d', 0):,.2f}")
+        print(f"   Low (20D):  Rs.{analysis.get('low_20d', 0):,.2f}")
+        print(f"   Current:    Rs.{analysis.get('current_price', 0):,.2f}")
         
         print(f"{'='*60}")
     

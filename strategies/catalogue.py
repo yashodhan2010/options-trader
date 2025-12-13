@@ -8,7 +8,10 @@ from .base_strategy import BaseStrategy, StrategyType, StrategySignal
 from .directional import (
     LongCallStrategy, LongPutStrategy, ShortCallStrategy, ShortPutStrategy
 )
-from .spreads import BullCallSpreadStrategy, BearPutSpreadStrategy
+from .spreads import (
+    BullCallSpreadStrategy, BearPutSpreadStrategy,
+    BearCallSpreadStrategy, BullPutSpreadStrategy
+)
 from .volatility import IronCondorStrategy, StraddleStrategy, StrangleStrategy
 from config.settings import STRATEGY_CONFIG
 from core.logger import logger
@@ -27,6 +30,8 @@ class StrategyCatalogue:
         StrategyType.SHORT_PUT: ShortPutStrategy,
         StrategyType.BULL_CALL_SPREAD: BullCallSpreadStrategy,
         StrategyType.BEAR_PUT_SPREAD: BearPutSpreadStrategy,
+        StrategyType.BEAR_CALL_SPREAD: BearCallSpreadStrategy,  # Credit spread - SELL primary
+        StrategyType.BULL_PUT_SPREAD: BullPutSpreadStrategy,    # Credit spread - SELL primary
         StrategyType.IRON_CONDOR: IronCondorStrategy,
         StrategyType.STRADDLE: StraddleStrategy,
         StrategyType.STRANGLE: StrangleStrategy,
@@ -165,12 +170,37 @@ class StrategyCatalogue:
             List of matching signals
         """
         # Map sentiment to appropriate strategies
+        # Credit spreads (SELL primary) added for premium collection
         sentiment_strategies = {
-            "BULLISH": [StrategyType.LONG_CALL, StrategyType.BULL_CALL_SPREAD, StrategyType.SHORT_PUT],
-            "STRONGLY_BULLISH": [StrategyType.LONG_CALL, StrategyType.BULL_CALL_SPREAD],
-            "BEARISH": [StrategyType.LONG_PUT, StrategyType.BEAR_PUT_SPREAD, StrategyType.SHORT_CALL],
-            "STRONGLY_BEARISH": [StrategyType.LONG_PUT, StrategyType.BEAR_PUT_SPREAD],
-            "NEUTRAL": [StrategyType.IRON_CONDOR, StrategyType.STRADDLE, StrategyType.STRANGLE],
+            "BULLISH": [
+                StrategyType.LONG_CALL, 
+                StrategyType.BULL_CALL_SPREAD, 
+                StrategyType.SHORT_PUT,
+                StrategyType.BULL_PUT_SPREAD,  # Credit spread - SELL put with hedge
+            ],
+            "STRONGLY_BULLISH": [
+                StrategyType.LONG_CALL, 
+                StrategyType.BULL_CALL_SPREAD,
+                StrategyType.BULL_PUT_SPREAD,
+            ],
+            "BEARISH": [
+                StrategyType.LONG_PUT, 
+                StrategyType.BEAR_PUT_SPREAD, 
+                StrategyType.SHORT_CALL,
+                StrategyType.BEAR_CALL_SPREAD,  # Credit spread - SELL call with hedge
+            ],
+            "STRONGLY_BEARISH": [
+                StrategyType.LONG_PUT, 
+                StrategyType.BEAR_PUT_SPREAD,
+                StrategyType.BEAR_CALL_SPREAD,
+            ],
+            "NEUTRAL": [
+                StrategyType.IRON_CONDOR, 
+                StrategyType.STRADDLE, 
+                StrategyType.STRANGLE,
+                StrategyType.BEAR_CALL_SPREAD,  # Also works in neutral (expect no upside)
+                StrategyType.BULL_PUT_SPREAD,   # Also works in neutral (expect no downside)
+            ],
         }
         
         target_types = sentiment_strategies.get(sentiment, [])

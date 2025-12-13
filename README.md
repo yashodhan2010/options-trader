@@ -139,7 +139,7 @@ KITE_REDIRECT_URL=http://localhost:5000/callback
 Edit `config/settings.py` to customize:
 
 - **Underlying Assets**: NIFTY, BANKNIFTY, FINNIFTY
-- **Risk Parameters**: Stop loss %, Target %, Max positions
+- **Risk Parameters**: Stop loss %, Target %, Max positions (live) and paper trading cap
 - **Strategy Settings**: Enabled strategies, strike selection
 - **Market Hours**: Trading windows
 

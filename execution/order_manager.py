@@ -72,6 +72,7 @@ class Order:
 class TradeExecution:
     """Represents a complete trade execution from a signal."""
     signal: StrategySignal
+    execution_id: str = ""
     orders: List[Order] = field(default_factory=list)
     sl_orders: List[Order] = field(default_factory=list)
     target_orders: List[Order] = field(default_factory=list)
@@ -79,6 +80,7 @@ class TradeExecution:
     entry_time: Optional[datetime] = None
     exit_time: Optional[datetime] = None
     realized_pnl: float = 0
+    current_pnl: float = 0
     
     def is_complete(self) -> bool:
         return all(o.status == OrderStatus.COMPLETE for o in self.orders)
@@ -110,6 +112,42 @@ class OrderManager:
         self.is_paper_trading = enabled
         logger.info(f"Paper trading mode: {'enabled' if enabled else 'disabled'}")
     
+    def has_duplicate_position(self, signal: StrategySignal) -> bool:
+        """
+        Check if there's already an open position with same underlying, 
+        strategy type, and strike prices.
+        
+        Args:
+            signal: The signal to check for duplicates
+            
+        Returns:
+            True if duplicate exists, False otherwise
+        """
+        # Get strikes from the new signal
+        new_strikes = set(leg.strike for leg in signal.legs)
+        
+        for exec_id, execution in self.active_executions.items():
+            if execution.status != "ACTIVE":
+                continue
+            
+            existing_signal = execution.signal
+            
+            # Check if same underlying and strategy type
+            if (existing_signal.underlying == signal.underlying and 
+                existing_signal.strategy_type == signal.strategy_type):
+                
+                # Check if same strikes
+                existing_strikes = set(leg.strike for leg in existing_signal.legs)
+                
+                if new_strikes == existing_strikes:
+                    logger.warning(
+                        f"Duplicate position exists: {exec_id} "
+                        f"({signal.underlying} {signal.strategy_type.value} @ {sorted(new_strikes)})"
+                    )
+                    return True
+        
+        return False
+    
     def execute_signal(
         self,
         signal: StrategySignal,
@@ -125,8 +163,14 @@ class OrderManager:
         Returns:
             TradeExecution object with order details
         """
-        execution = TradeExecution(signal=signal)
         execution_id = f"{signal.strategy_type.value}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        execution = TradeExecution(signal=signal, execution_id=execution_id)
+        
+        # Check for duplicate positions
+        if self.has_duplicate_position(signal):
+            execution.status = "DUPLICATE"
+            logger.warning(f"Skipping duplicate trade: {signal.strategy_type.value} for {signal.underlying}")
+            return execution
         
         logger.info(f"Executing signal: {signal.strategy_type.value} for {signal.underlying}")
         
@@ -160,6 +204,13 @@ class OrderManager:
                 # Persist to database for overnight recovery
                 self._persist_trade_to_db(execution_id, signal)
                 
+                # Fetch current market data for exit signal tracking
+                market_data = self._get_market_data_for_exit_tracking(signal.underlying)
+                
+                # Notify position tracker of new position for WebSocket subscription
+                from execution.position_tracker import position_tracker
+                position_tracker.on_new_position(execution_id, market_data)
+                
                 logger.info(f"Signal executed successfully: {execution_id}")
             else:
                 execution.status = "PARTIAL"
@@ -170,6 +221,28 @@ class OrderManager:
             execution.status = "FAILED"
         
         return execution
+    
+    def _get_market_data_for_exit_tracking(self, underlying: str) -> dict:
+        """
+        Fetch current market data to store as entry conditions for exit signal tracking.
+        
+        Args:
+            underlying: The underlying asset
+            
+        Returns:
+            Dict with spot, OI, volatility, and historical data
+        """
+        try:
+            from data.data_fetcher import data_fetcher
+            return {
+                "spot": data_fetcher.get_spot_price(underlying),
+                "oi_data": data_fetcher.get_oi_analysis(underlying) or {},
+                "volatility": data_fetcher.get_volatility_data(underlying) or {},
+                "historical": data_fetcher.get_historical_analysis(underlying, days=5) or {},
+            }
+        except Exception as e:
+            logger.debug(f"Could not fetch market data for exit tracking: {e}")
+            return {}
     
     def _place_leg_order(
         self,
@@ -525,32 +598,35 @@ class OrderManager:
                 leg.current_price = leg_data.get("current_price", leg.entry_price)
                 legs.append(leg)
             
-            # Reconstruct signal
-            signal = StrategySignal(
-                strategy_type=StrategyType(signal_data.get("strategy_type", "LONG_CALL")),
-                underlying=signal_data.get("underlying", ""),
-                legs=legs,
-                confidence=signal_data.get("confidence", 0),
-                risk_reward_ratio=signal_data.get("risk_reward_ratio", 0),
-                stop_loss=signal_data.get("stop_loss", 0),
-                target=signal_data.get("target", 0),
-                rationale=signal_data.get("rationale", "Loaded from database"),
-                timestamp=signal_data.get("timestamp", datetime.now()),
-            )
-            
-            # Create execution
-            execution = TradeExecution(signal=signal)
-            execution.status = "ACTIVE"
-            
             # Parse entry time
             entry_time_str = signal_data.get("entry_time")
             if entry_time_str:
                 try:
-                    execution.entry_time = datetime.fromisoformat(entry_time_str)
+                    entry_time = datetime.fromisoformat(entry_time_str)
                 except:
-                    execution.entry_time = datetime.now()
+                    entry_time = datetime.now()
             else:
-                execution.entry_time = datetime.now()
+                entry_time = datetime.now()
+            
+            # Reconstruct signal
+            # Note: risk_reward_ratio is a computed @property, not a constructor param
+            signal = StrategySignal(
+                strategy_type=StrategyType(signal_data.get("strategy_type", "LONG_CALL")),
+                underlying=signal_data.get("underlying", ""),
+                legs=legs,
+                entry_time=entry_time,
+                confidence=signal_data.get("confidence", 0),
+                expected_profit=signal_data.get("expected_profit", signal_data.get("target", 0)),
+                max_loss=signal_data.get("max_loss", signal_data.get("stop_loss", 0)),
+                stop_loss=signal_data.get("stop_loss", 0),
+                target=signal_data.get("target", 0),
+                rationale=signal_data.get("rationale", "Loaded from database"),
+            )
+            
+            # Create execution
+            execution = TradeExecution(signal=signal, execution_id=execution_id)
+            execution.status = "ACTIVE"
+            execution.entry_time = entry_time
             
             # Add to active executions
             self.active_executions[execution_id] = execution
@@ -585,7 +661,7 @@ class OrderManager:
                     "symbol": leg.symbol,
                     "strike": leg.strike,
                     "option_type": leg.option_type,
-                    "expiry": leg.expiry,
+                    "expiry": leg.expiry.isoformat() if hasattr(leg.expiry, 'isoformat') else str(leg.expiry),
                     "direction": leg.direction.value,
                     "quantity": leg.quantity,
                     "entry_price": leg.entry_price,
@@ -594,6 +670,8 @@ class OrderManager:
                 for leg in signal.legs
             ],
             "confidence": signal.confidence,
+            "expected_profit": signal.expected_profit,
+            "max_loss": signal.max_loss,
             "risk_reward_ratio": signal.risk_reward_ratio,
             "stop_loss": signal.stop_loss,
             "target": signal.target,

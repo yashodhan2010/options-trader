@@ -75,7 +75,7 @@ def connect() -> KiteConnect:
         # Verify token is still valid
         try:
             profile = kite.profile()
-            logger.info(f"✅ Reusing existing access token for {profile.get('user_name', 'user')}")
+            logger.info(f"[OK] Reusing existing access token for {profile.get('user_name', 'user')}")
             return kite
         except Exception as e:
             logger.warning(f"Stored token invalid: {e}")

@@ -137,11 +137,11 @@ class WebSocketManager:
                     time.sleep(1)
                 
                 if self.is_connected:
-                    logger.info("✅ WebSocket connected successfully")
+                    logger.info("[OK] WebSocket connected successfully")
                     self._start_health_monitor()
                     return True
                 else:
-                    logger.error("❌ WebSocket connection timeout")
+                    logger.error("[FAIL] WebSocket connection timeout")
                     return False
                 
         except Exception as e:
@@ -282,7 +282,7 @@ class WebSocketManager:
         """Handle WebSocket connection"""
         self.is_connected = True
         self.reconnect_attempts = 0
-        logger.info("📡 WebSocket connected")
+        logger.info("[WS] WebSocket connected")
         
         # Notify connection callbacks
         for callback in self.connection_callbacks:
@@ -294,7 +294,7 @@ class WebSocketManager:
     def _on_close(self, ws, code, reason):
         """Handle WebSocket disconnection"""
         self.is_connected = False
-        logger.warning(f"📡 WebSocket disconnected: {code} - {reason}")
+        logger.warning(f"[WS] WebSocket disconnected: {code} - {reason}")
         
         # Notify connection callbacks
         for callback in self.connection_callbacks:
@@ -305,7 +305,7 @@ class WebSocketManager:
     
     def _on_error(self, ws, code, reason):
         """Handle WebSocket errors"""
-        logger.error(f"❌ WebSocket error: {code} - {reason}")
+        logger.error(f"[WS ERROR] WebSocket error: {code} - {reason}")
         
         # Notify connection callbacks
         for callback in self.connection_callbacks:
@@ -317,11 +317,11 @@ class WebSocketManager:
     def _on_reconnect(self, ws, attempts_count):
         """Handle WebSocket reconnection"""
         self.reconnect_attempts = attempts_count
-        logger.info(f"🔄 WebSocket reconnecting... (attempt {attempts_count})")
+        logger.info(f"[WS] WebSocket reconnecting... (attempt {attempts_count})")
     
     def _on_noreconnect(self, ws):
         """Handle WebSocket failed reconnection"""
-        logger.error("❌ WebSocket reconnection failed")
+        logger.error("[WS ERROR] WebSocket reconnection failed")
         self.is_connected = False
     
     def _on_ticks(self, ws, ticks):
