@@ -1,5 +1,7 @@
 """
 Options Trading Bot - Main Orchestrator
+
+All trading signals are ML-driven. No rule-based signal generation.
 """
 import argparse
 import time
@@ -10,12 +12,12 @@ import threading
 from auth.kite_auth import connect, get_kite, is_authenticated, get_profile, get_margins
 from data.data_fetcher import data_fetcher
 from data.websocket_manager import WebSocketTicker
-from signals.signal_generator import signal_generator
+from signals.ml_signal_generator import ml_signal_generator as signal_generator
 from execution.order_manager import order_manager, OrderType
 from execution.position_tracker import position_tracker
 from strategies.base_strategy import StrategyType
 from config.settings import (
-    UNDERLYING_ASSETS, TRADING_CONFIG, MARKET_HOURS, NOTIFICATION_CONFIG, BOT_CONFIG
+    UNDERLYING_ASSETS, TRADING_CONFIG, MARKET_HOURS, NOTIFICATION_CONFIG, BOT_CONFIG, ML_CONFIG
 )
 from core.logger import logger, trade_logger
 from core.utils import is_market_open, is_trading_allowed, should_square_off, get_market_status, is_expiry_day, should_auto_exit
@@ -173,8 +175,23 @@ class OptionsTradingBot:
     def start(self) -> None:
         """Start the trading bot."""
         logger.info("=" * 50)
-        logger.info("Starting Options Trading Bot")
+        logger.info("Starting Options Trading Bot (ML-Only Mode)")
         logger.info("=" * 50)
+        
+        # Verify ML model is available
+        ml_status = signal_generator.get_model_status()
+        if not ml_status.get("model_loaded"):
+            logger.error("=" * 50)
+            logger.error("NO ML MODEL FOUND!")
+            logger.error("This bot requires a trained ML model to generate signals.")
+            logger.error("Please train a model first using:")
+            logger.error("  python cli.py -> ml train <SYMBOL>")
+            logger.error("  or: ml train-best <config>")
+            logger.error("=" * 50)
+            return
+        
+        logger.info(f"ML Model: {ml_status.get('model_version')} ({ml_status.get('model_type')})")
+        logger.info(f"Min Confidence: {ml_status.get('min_confidence'):.1%}")
         
         # Login first
         if not self.login():
@@ -198,6 +215,9 @@ class OptionsTradingBot:
         # Initialize WebSocket if enabled
         if self.use_websocket:
             self._start_websocket()
+        
+        # Start auto-retrain monitor if enabled
+        self._start_auto_retrain_monitor()
         
         # Start position tracker (WebSocket or polling mode)
         # Pass paper_trading flag to bypass market hour checks
@@ -228,9 +248,10 @@ class OptionsTradingBot:
     def _run_loop(self) -> None:
         """Main bot loop with market timing awareness."""
         logger.info("=" * 70)
-        logger.info("[BOT] OPTIONS TRADING BOT IS NOW RUNNING")
+        logger.info("[BOT] OPTIONS TRADING BOT IS NOW RUNNING (ML-ONLY MODE)")
         logger.info("=" * 70)
         logger.info(f"Mode: {'PAPER TRADING [TEST]' if order_manager.is_paper_trading else '[!] LIVE TRADING [!]'}")
+        logger.info(f"Signal Source: ML Model ({signal_generator._predictor.model_version if signal_generator._predictor else 'N/A'})")
         logger.info(f"Auto Trade: {'ENABLED [ON]' if self.auto_trade else 'DISABLED [OFF]'}")
         logger.info(f"Scan Interval: {self.scan_interval} seconds")
         logger.info(f"Overnight carry: {'ENABLED' if MARKET_HOURS.get('carry_overnight', True) else 'DISABLED'}")
@@ -524,10 +545,42 @@ class OptionsTradingBot:
         
         return meets_criteria
     
+    def _start_auto_retrain_monitor(self) -> None:
+        """Start background auto-retrain monitor."""
+        auto_retrain_config = ML_CONFIG.get("auto_retrain", {})
+        
+        if not auto_retrain_config.get("enabled", False):
+            logger.info("Auto-retrain monitor disabled")
+            return
+        
+        try:
+            from ml import get_auto_retrainer
+            
+            retrainer = get_auto_retrainer()
+            check_interval = auto_retrain_config.get("check_interval_seconds", 3600)
+            retrainer.start_background_monitor(check_interval=check_interval)
+            
+            logger.info(f"Auto-retrain monitor started (interval: {check_interval}s)")
+            
+        except Exception as e:
+            logger.warning(f"Could not start auto-retrain monitor: {e}")
+    
+    def _stop_auto_retrain_monitor(self) -> None:
+        """Stop auto-retrain monitor."""
+        try:
+            from ml import get_auto_retrainer
+            retrainer = get_auto_retrainer()
+            retrainer.stop_background_monitor()
+        except Exception:
+            pass
+    
     def stop(self) -> None:
         """Stop the trading bot."""
         logger.info("Stopping bot...")
         self.is_running = False
+        
+        # Stop auto-retrain monitor
+        self._stop_auto_retrain_monitor()
         
         # Stop WebSocket
         if self.websocket_manager:

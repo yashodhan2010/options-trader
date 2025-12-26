@@ -1,5 +1,7 @@
 """
 Interactive CLI for the Options Trading Bot
+
+All signals are ML-driven. No rule-based signal generation.
 """
 import cmd
 import sys
@@ -8,11 +10,11 @@ from datetime import datetime
 from bot import OptionsTradingBot
 from auth.kite_auth import connect, get_kite, is_authenticated, get_profile, get_margins, logout
 from data.data_fetcher import data_fetcher
-from signals.signal_generator import signal_generator
+from signals.ml_signal_generator import ml_signal_generator as signal_generator
 from execution.order_manager import order_manager
 from execution.position_tracker import position_tracker
 from strategies import StrategyType
-from config.settings import UNDERLYING_ASSETS
+from config.settings import UNDERLYING_ASSETS, ML_CONFIG
 from core.logger import logger
 
 
@@ -20,12 +22,13 @@ class TradingCLI(cmd.Cmd):
     """Interactive command-line interface for the trading bot."""
     
     intro = """
-╔═══════════════════════════════════════════════════════════════╗
-║           OPTIONS TRADING BOT - Interactive Mode              ║
-║                                                               ║
-║  Type 'help' for available commands                           ║
-║  Type 'quit' to exit                                          ║
-╚═══════════════════════════════════════════════════════════════╝
++---------------------------------------------------------------+
+|      OPTIONS TRADING BOT - Interactive Mode (ML-Only)         |
+|                                                               |
+|  All signals are driven by ML predictions.                    |
+|  Type 'help' for available commands                           |
+|  Type 'quit' to exit                                          |
++---------------------------------------------------------------+
     """
     prompt = "options> "
     
@@ -62,7 +65,7 @@ class TradingCLI(cmd.Cmd):
     def do_status(self, arg):
         """Show connection and account status"""
         if is_authenticated():
-            print("✓ Connected to Kite")
+            print("[OK] Connected to Kite")
             profile = get_profile()
             margins = get_margins()
             
@@ -76,7 +79,7 @@ class TradingCLI(cmd.Cmd):
                 print(f"Available Margin: Rs.{available:,.2f}")
                 print(f"Used Margin: Rs.{used:,.2f}")
         else:
-            print("✗ Not connected")
+            print("[X] Not connected")
     
     def do_market(self, arg):
         """Show market timing status"""
@@ -138,6 +141,20 @@ class TradingCLI(cmd.Cmd):
         print(f"\n[INFO] {status['status_message']}")
         print(f"{'='*60}")
 
+    def do_exit_all(self, arg):
+        """Exit all active positions immediately"""
+        if not is_authenticated():
+            print("Not logged in! Please login first.")
+            return
+            
+        confirm = input("Are you sure you want to exit ALL positions? (yes/no): ")
+        if confirm.lower() == 'yes':
+            print("Exiting all positions...")
+            position_tracker.force_close_all(reason="Manual CLI exit")
+            print("All positions exit command sent.")
+        else:
+            print("Operation cancelled.")
+
     def do_spot(self, arg):
         """Get spot price. Usage: spot [NIFTY|BANKNIFTY|FINNIFTY]"""
         underlying = arg.strip().upper() or "NIFTY"
@@ -181,26 +198,57 @@ class TradingCLI(cmd.Cmd):
         print(f"  ATM IV: {vol.get('atm_iv', 0):.2f}%")
         print(f"  Regime: {vol.get('regime')}")
         
-        print(f"\nRecommended Strategies:")
-        for rec in overview.get("recommended_strategies", []):
-            print(f"  - {rec}")
+        # ML Prediction
+        ml_pred = overview.get("ml_prediction")
+        if ml_pred:
+            print(f"\nML Prediction:")
+            print(f"  Direction: {ml_pred.get('direction')}")
+            print(f"  Confidence: {ml_pred.get('confidence', 0):.1%}")
+            print(f"  Model: {ml_pred.get('model_version')}")
+        else:
+            print(f"\nML Prediction: Not available (no model loaded)")
+        
+        print(f"\nRecommended Strategies (based on ML):")
+        strategies = overview.get("recommended_strategies", [])
+        if strategies:
+            for strategy in strategies:
+                if hasattr(strategy, 'value'):
+                    print(f"  - {strategy.value}")
+                else:
+                    print(f"  - {strategy}")
+        else:
+            print("  No strategies recommended")
     
     def do_signals(self, arg):
-        """Generate signals. Usage: signals [NIFTY|BANKNIFTY]"""
+        """Generate ML signals. Usage: signals [NIFTY|BANKNIFTY]"""
         underlying = arg.strip().upper() if arg.strip() else None
         
-        print("\nGenerating signals...")
+        # Check ML model status first
+        ml_status = signal_generator.get_model_status()
+        if not ml_status.get("model_loaded"):
+            print("\n[!] No ML model loaded!")
+            print("    Please train a model first: ml train <SYMBOL>")
+            print("    Or use: ml train-best <config>")
+            return
+        
+        print(f"\nGenerating ML signals...")
+        print(f"Model: {ml_status.get('model_version')} ({ml_status.get('model_type')})")
+        print(f"Min Confidence: {ml_status.get('min_confidence', 0):.1%}")
+        print()
+        
         signals = signal_generator.generate_signals(underlying)
         
         if not signals:
-            print("No signals generated")
+            print("No signals generated (ML confidence below threshold)")
             return
         
-        print(f"\nGenerated {len(signals)} signal(s):\n")
+        print(f"\nGenerated {len(signals)} ML signal(s):\n")
         
         for i, signal in enumerate(signals, 1):
+            ml_dir = signal.metrics.get('ml_direction', 'N/A')
+            ml_conf = signal.metrics.get('ml_confidence', 0)
             print(f"{i}. {signal.strategy_type.value} ({signal.underlying})")
-            print(f"   Confidence: {signal.confidence:.2%}")
+            print(f"   ML Direction: {ml_dir} | ML Confidence: {ml_conf:.1%}")
             print(f"   Risk/Reward: {signal.risk_reward_ratio:.2f}")
             print(f"   Rationale: {signal.rationale}")
             print(f"   SL: Rs.{signal.stop_loss:.2f} | Target: Rs.{signal.target:.2f}")
@@ -257,9 +305,9 @@ class TradingCLI(cmd.Cmd):
         if confirm == 'y':
             execution = order_manager.execute_signal(signal)
             if execution.status == "ACTIVE":
-                print("✓ Trade executed successfully!")
+                print("[OK] Trade executed successfully!")
             else:
-                print(f"✗ Execution failed: {execution.status}")
+                print(f"[X] Execution failed: {execution.status}")
     
     def do_positions(self, arg):
         """Show current positions"""
@@ -671,6 +719,1011 @@ class TradingCLI(cmd.Cmd):
             self.bot.start()
         except KeyboardInterrupt:
             print("\nStopping bot...")
+    
+    # ========== ML COMMANDS ==========
+    
+    def do_ml(self, arg):
+        """
+        ML model commands. Usage:
+            ml status              - Show ML status and model info
+            ml train [UNDERLYING]  - Train ML model (default: all)
+            ml backtest UNDERLYING - Run backtest on trained model
+            ml paper start         - Start ML paper trading session
+            ml paper stop          - Stop paper trading and show results
+            ml paper stats         - Show current paper trading stats
+            ml predict UNDERLYING  - Get ML prediction for underlying
+            ml features UNDERLYING - Show extracted features
+            ml drift               - Check for model drift
+            ml compare UNDERLYING  - Compare model configurations with trading metrics
+            ml train-best [MODEL]  - Train all symbols with best configuration (default: rf_aggressive)
+            ml retrain             - Retrain from feedback data (trade outcomes)
+            ml retrain-status      - Show auto-retrain status and conditions
+        """
+        args = arg.strip().split()
+        
+        if not args:
+            print("Usage: ml <command> [args]")
+            print("Commands: status, train, train-best, backtest, paper, predict,")
+            print("          features, drift, compare, retrain, retrain-status")
+            return
+        
+        cmd = args[0].lower()
+        
+        if cmd == "status":
+            self._ml_status()
+        elif cmd == "train":
+            underlying = args[1].upper() if len(args) > 1 else None
+            self._ml_train(underlying)
+        elif cmd == "backtest":
+            if len(args) < 2:
+                print("Usage: ml backtest UNDERLYING")
+                return
+            self._ml_backtest(args[1].upper())
+        elif cmd == "paper":
+            if len(args) < 2:
+                print("Usage: ml paper [start|stop|stats]")
+                return
+            self._ml_paper(args[1].lower())
+        elif cmd == "predict":
+            if len(args) < 2:
+                print("Usage: ml predict UNDERLYING")
+                return
+            self._ml_predict(args[1].upper())
+        elif cmd == "features":
+            if len(args) < 2:
+                print("Usage: ml features UNDERLYING")
+                return
+            self._ml_features(args[1].upper())
+        elif cmd == "drift":
+            self._ml_drift()
+        elif cmd == "compare":
+            if len(args) < 2:
+                print("Usage: ml compare UNDERLYING")
+                return
+            self._ml_compare(args[1].upper())
+        elif cmd == "train-best":
+            model_type = args[1].lower() if len(args) > 1 else "rf_aggressive"
+            self._ml_train_best(model_type)
+        elif cmd == "retrain":
+            force = "--force" in args or "-f" in args
+            self._ml_retrain_feedback(force)
+        elif cmd == "retrain-status":
+            self._ml_retrain_status()
+        else:
+            print(f"Unknown ML command: {cmd}")
+    
+    def _ml_status(self):
+        """Show ML system status."""
+        print(f"\n{'='*60}")
+        print("ML SYSTEM STATUS (ML-Only Mode)")
+        print(f"{'='*60}")
+        
+        # Get signal generator status
+        ml_status = signal_generator.get_model_status()
+        
+        print(f"\n[SIGNAL GENERATOR]")
+        print(f"   Status: {ml_status.get('status', 'unknown').upper()}")
+        print(f"   Model Loaded: {'YES' if ml_status.get('model_loaded') else 'NO'}")
+        if ml_status.get('model_loaded'):
+            print(f"   Model Version: {ml_status.get('model_version')}")
+            print(f"   Model Type: {ml_status.get('model_type')}")
+        print(f"   Min Confidence: {ml_status.get('min_confidence', 0):.1%}")
+        print(f"   Trading Symbols: {', '.join(ml_status.get('underlyings', []))}")
+        
+        enabled = ML_CONFIG.get("enabled", False)
+        print(f"\n[CONFIG] ML Enabled: {'YES' if enabled else 'NO'}")
+        print(f"   Confidence Weight: {ML_CONFIG.get('confidence_weight', 0.5):.0%}")
+        print(f"   Optuna Trials: {ML_CONFIG.get('optuna_trials', 50)}")
+        
+        # Show training symbols
+        symbols = ML_CONFIG.get("training_symbols", [])
+        print(f"\n[SYMBOLS] Training Symbols ({len(symbols)}):")
+        for sym in symbols:
+            print(f"   - {sym}")
+        
+        weights = ML_CONFIG.get("ensemble_weights", {})
+        print(f"\n[ENSEMBLE] Model Weights:")
+        print(f"   XGBoost: {weights.get('xgboost', 0.5):.0%}")
+        print(f"   LightGBM: {weights.get('lightgbm', 0.3):.0%}")
+        print(f"   Random Forest: {weights.get('random_forest', 0.2):.0%}")
+        
+        guardrails = ML_CONFIG.get("guardrails", {})
+        print(f"\n[GUARDRAILS]")
+        print(f"   Stop-Loss Sacred: {guardrails.get('stop_loss_sacred', True)}")
+        print(f"   Max Confidence Adj: +/-{guardrails.get('max_confidence_adjustment', 0.3):.0%}")
+        print(f"   Circuit Breaker: {guardrails.get('circuit_breaker_losses', 3)} losses")
+        
+        if enabled:
+            try:
+                from ml import get_model_registry, get_feedback_collector
+                
+                registry = get_model_registry()
+                prod_model = registry.get_production_model()
+                print(f"\n[REGISTRY] Production Model: {prod_model or 'None'}")
+                
+                feedback = get_feedback_collector()
+                stats = feedback.get_performance_stats(days=7)
+                if stats.get("total_predictions", 0) > 0:
+                    print(f"\n[PERFORMANCE] Last 7 Days:")
+                    print(f"   Predictions: {stats.get('total_predictions', 0)}")
+                    print(f"   Accuracy: {stats.get('accuracy', 0):.1%}")
+                    print(f"   Avg P&L: Rs.{stats.get('avg_pnl', 0):,.2f}")
+            except Exception as e:
+                print(f"\n[!] Could not load ML components: {e}")
+        
+        if not ml_status.get('model_loaded'):
+            print(f"\n[!] WARNING: No ML model loaded!")
+            print(f"    The bot cannot generate signals without a trained model.")
+            print(f"    Train a model using: ml train <SYMBOL>")
+            print(f"    Or use: ml train-best <config>")
+        
+        print(f"\n{'='*60}")
+    
+    def _ml_train(self, underlying=None):
+        """Train ML model."""
+        if not ML_CONFIG.get("enabled", False):
+            print("ML is disabled. Enable it in config/settings.py")
+            return
+        
+        print("\n[TRAINING] Starting ML model training...")
+        
+        try:
+            from ml import get_model_trainer, get_data_collector, get_feature_engineer
+            
+            trainer = get_model_trainer()
+            collector = get_data_collector()
+            feature_engineer = get_feature_engineer()
+            
+            # Use training_symbols from ML_CONFIG, or specific underlying
+            if underlying:
+                underlyings = [underlying]
+            else:
+                underlyings = ML_CONFIG.get("training_symbols", list(UNDERLYING_ASSETS.keys()))
+            
+            print(f"[INFO] Training on {len(underlyings)} symbols: {', '.join(underlyings)}")
+            
+            for ul in underlyings:
+                print(f"\n[{ul}] Collecting historical data...")
+                
+                # Collect data (synchronous call) - use config setting
+                days = ML_CONFIG.get("historical_days", 180)
+                data = collector.collect_historical_data(symbols=[ul], days=days)
+                if not data or ul not in data:
+                    print(f"[{ul}] Warning: No historical data collected, skipping...")
+                    continue
+                
+                df = data[ul]
+                print(f"[{ul}] Collected {len(df)} records")
+                
+                # Extract features using batch method (use smaller lookback for limited data)
+                print(f"[{ul}] Extracting features...")
+                lookback = min(20, len(df) - 15)  # Adaptive lookback based on data size
+                if lookback < 15:
+                    print(f"[{ul}] Warning: Not enough data ({len(df)} rows), need at least 35. Skipping...")
+                    continue
+                    
+                X, feature_names = feature_engineer.extract_features_batch(df, lookback=lookback)
+                
+                if X is None or len(X) == 0:
+                    print(f"[{ul}] Warning: Could not extract features, skipping...")
+                    continue
+                
+                # Create target variable (predict next day direction)
+                # 1 = price went up, 0 = price went down
+                df_cols = [c.lower() for c in df.columns]
+                close_col = 'close' if 'close' in df_cols else df.columns[df_cols.index('close')] if 'close' in df_cols else None
+                
+                if close_col is None:
+                    print(f"[{ul}] Warning: No 'close' column found, skipping...")
+                    continue
+                
+                # Create target: 1 if next day close > current close, 0 otherwise
+                closes = df[close_col].values
+                # Target for each day in X (X already starts from lookback)
+                # X[i] corresponds to df row (lookback + i)
+                # Target for X[i] is whether df row (lookback + i + 1) went up
+                y_full = (closes[1:] > closes[:-1]).astype(int)  # Direction for each day
+                y = y_full[lookback:]  # Align with X start point
+                
+                # Remove last sample (no future target available)
+                if len(X) > len(y):
+                    X = X[:len(y)]
+                if len(y) > len(X):
+                    y = y[:len(X)]
+                
+                # Need last one less since we predict "next day"
+                X = X[:-1]
+                y = y[1:]  # Shift target by 1 to predict next day
+                
+                if len(X) < 10:
+                    print(f"[{ul}] Warning: Too few samples ({len(X)}), skipping...")
+                    continue
+                
+                print(f"[{ul}] Training with Optuna optimization ({len(X)} samples, {len(feature_names)} features)...")
+                
+                model, metrics, model_version = trainer.train_direction_model(
+                    X=X,
+                    y=y,
+                    feature_names=feature_names,
+                    model_type="ensemble",
+                    optimize=True
+                )
+                
+                print(f"\n[{ul}] Training Complete!")
+                print(f"   Model Version: {model_version}")
+                print(f"   Accuracy: {metrics.get('accuracy', 0):.2%}")
+                print(f"   F1 Score: {metrics.get('f1_score', 0):.2%}")
+                print(f"   AUC-ROC: {metrics.get('auc_roc', 0):.2%}")
+                
+        except Exception as e:
+            print(f"[ERROR] Training failed: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _ml_backtest(self, underlying):
+        """Run backtest on ML model."""
+        if underlying not in UNDERLYING_ASSETS:
+            print(f"Unknown underlying: {underlying}")
+            return
+        
+        print(f"\n[BACKTEST] Running backtest for {underlying}...")
+        
+        try:
+            from ml.backtester import Backtester
+            from datetime import timedelta
+            
+            bt = Backtester()
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=30)
+            
+            result = bt.run_ml_backtest(
+                underlying=underlying,
+                start_date=start_date,
+                end_date=end_date
+            )
+            
+            print(f"\n[RESULTS] Backtest Results ({start_date.date()} to {end_date.date()}):")
+            print(f"   Total Trades: {result.total_trades}")
+            print(f"   Win Rate: {result.win_rate:.1%}")
+            print(f"   Total P&L: Rs.{result.total_pnl:,.2f}")
+            print(f"   Sharpe Ratio: {result.sharpe_ratio:.2f}")
+            print(f"   Max Drawdown: {result.max_drawdown:.1%}")
+            print(f"   Profit Factor: {result.profit_factor:.2f}")
+            
+        except Exception as e:
+            print(f"[ERROR] Backtest failed: {e}")
+    
+    def _ml_paper(self, action):
+        """Manage ML paper trading session."""
+        try:
+            from ml import get_paper_trading_runner
+            
+            runner = get_paper_trading_runner()
+            
+            if action == "start":
+                capital = ML_CONFIG.get("paper_trading", {}).get("initial_capital", 100000)
+                session_id = runner.start_session(initial_capital=capital)
+                print(f"\n[PAPER] Paper trading session started!")
+                print(f"   Session ID: {session_id}")
+                print(f"   Initial Capital: Rs.{capital:,.2f}")
+                print(f"\n   Use 'ml paper stats' to check progress")
+                print(f"   Use 'ml paper stop' to end session")
+                
+            elif action == "stop":
+                summary = runner.end_session()
+                if "error" in summary:
+                    print(f"[!] {summary['error']}")
+                    return
+                
+                print(f"\n[PAPER] Session Ended!")
+                print(f"{'='*50}")
+                print(f"   Duration: {summary.get('duration_hours', 0):.1f} hours")
+                print(f"   Total Trades: {summary.get('total_trades', 0)}")
+                print(f"   Win Rate: {summary.get('win_rate', 0):.1%}")
+                print(f"   Total P&L: Rs.{summary.get('total_pnl', 0):,.2f}")
+                print(f"   Return: {summary.get('total_pnl_pct', 0):.2%}")
+                print(f"   Sharpe Ratio: {summary.get('sharpe_ratio', 0):.2f}")
+                print(f"   Max Drawdown: {summary.get('max_drawdown', 0):.1%}")
+                print(f"{'='*50}")
+                
+            elif action == "stats":
+                stats = runner.get_current_stats()
+                if not stats:
+                    print("[!] No active paper trading session")
+                    return
+                
+                print(f"\n[PAPER] Current Session Stats:")
+                print(f"   Session: {stats.get('session_id', 'N/A')}")
+                print(f"   Capital: Rs.{stats.get('final_capital', 0):,.2f}")
+                print(f"   P&L: Rs.{stats.get('total_pnl', 0):,.2f} ({stats.get('total_pnl_pct', 0):.2%})")
+                print(f"   Trades: {stats.get('total_trades', 0)} (Win: {stats.get('winning_trades', 0)})")
+                print(f"   Active: {stats.get('active_trades', 0)} positions")
+                
+            else:
+                print(f"Unknown paper action: {action}")
+                print("Use: ml paper [start|stop|stats]")
+                
+        except Exception as e:
+            print(f"[ERROR] Paper trading error: {e}")
+    
+    def _ml_predict(self, underlying):
+        """Get ML prediction for underlying."""
+        if underlying not in UNDERLYING_ASSETS:
+            print(f"Unknown underlying: {underlying}")
+            return
+        
+        if not is_authenticated():
+            print("Please login first to get live data")
+            return
+        
+        print(f"\n[PREDICT] Getting ML prediction for {underlying}...")
+        
+        try:
+            from ml import get_predictor, get_feature_engineer
+            
+            # Get market data
+            spot = data_fetcher.get_spot_price(underlying)
+            oi_data = data_fetcher.get_oi_data(underlying)
+            volatility = data_fetcher.get_volatility_metrics(underlying)
+            historical = data_fetcher.get_historical_analysis(underlying, days=30)
+            
+            market_data = {
+                "oi_data": oi_data,
+                "volatility": volatility,
+                "historical": historical,
+            }
+            
+            # Extract features
+            fe = get_feature_engineer()
+            features = fe.extract_features(
+                spot_price=spot,
+                market_data=market_data,
+                underlying=underlying,
+                strategy_type="LONG_CALL"
+            )
+            
+            # Get prediction
+            predictor = get_predictor()
+            prediction = predictor.predict(features, underlying, "LONG_CALL")
+            
+            print(f"\n[RESULT] ML Prediction for {underlying}:")
+            print(f"   Spot: Rs.{spot:,.2f}")
+            print(f"   Direction: {prediction.direction}")
+            print(f"   Confidence: {prediction.confidence:.1%}")
+            print(f"   Model: {prediction.model_version}")
+            
+            if prediction.feature_importance:
+                print(f"\n   Top Features:")
+                for feat, imp in list(prediction.feature_importance.items())[:5]:
+                    print(f"      {feat}: {imp:.3f}")
+                    
+        except Exception as e:
+            print(f"[ERROR] Prediction failed: {e}")
+    
+    def _ml_features(self, underlying):
+        """Show extracted features for underlying."""
+        if underlying not in UNDERLYING_ASSETS:
+            print(f"Unknown underlying: {underlying}")
+            return
+        
+        if not is_authenticated():
+            print("Please login first to get live data")
+            return
+        
+        print(f"\n[FEATURES] Extracting features for {underlying}...")
+        
+        try:
+            from ml import get_feature_engineer
+            
+            spot = data_fetcher.get_spot_price(underlying)
+            oi_data = data_fetcher.get_oi_data(underlying)
+            volatility = data_fetcher.get_volatility_metrics(underlying)
+            historical = data_fetcher.get_historical_analysis(underlying, days=30)
+            
+            fe = get_feature_engineer()
+            features = fe.extract_features(
+                spot_price=spot,
+                market_data={
+                    "oi_data": oi_data,
+                    "volatility": volatility,
+                    "historical": historical,
+                },
+                underlying=underlying,
+                strategy_type="LONG_CALL"
+            )
+            
+            print(f"\n[{underlying}] Extracted {len(features)} Features:")
+            print(f"{'='*50}")
+            
+            # Group by category
+            categories = {
+                "Price": [k for k in features if k.startswith("price_")],
+                "Technical": [k for k in features if any(k.startswith(p) for p in ["rsi", "macd", "bb_", "ema", "sma"])],
+                "Options": [k for k in features if any(k.startswith(p) for p in ["iv_", "delta", "gamma", "theta", "vega"])],
+                "OI": [k for k in features if k.startswith("oi_")],
+                "Volatility": [k for k in features if k.startswith("vol_")],
+                "Time": [k for k in features if any(k.startswith(p) for p in ["time_", "dte", "day_"])],
+            }
+            
+            for cat, keys in categories.items():
+                if keys:
+                    print(f"\n[{cat}]")
+                    for key in keys[:5]:  # Show top 5 per category
+                        print(f"   {key}: {features.get(key, 0):.4f}")
+                    if len(keys) > 5:
+                        print(f"   ... and {len(keys) - 5} more")
+            
+        except Exception as e:
+            print(f"[ERROR] Feature extraction failed: {e}")
+    
+    def _ml_drift(self):
+        """Check for model drift."""
+        try:
+            from ml import get_feedback_collector
+            
+            feedback = get_feedback_collector()
+            stats = feedback.get_performance_stats(days=30)
+            summary = feedback.get_training_data_summary()
+            
+            print(f"\n[DRIFT] Model Drift Analysis:")
+            print(f"{'='*50}")
+            
+            print(f"\n[DATA] Training Data:")
+            print(f"   Total Samples: {summary.get('total_samples', 0)}")
+            print(f"   With Outcomes: {summary.get('samples_with_outcome', 0)}")
+            print(f"   Win Rate: {summary.get('win_rate', 0):.1%}")
+            
+            print(f"\n[PERFORMANCE] Recent Performance:")
+            print(f"   Predictions: {stats.get('total_predictions', 0)}")
+            print(f"   Accuracy: {stats.get('accuracy', 0):.1%}")
+            
+            if feedback._baseline_accuracy:
+                current = stats.get("accuracy", feedback._baseline_accuracy)
+                drift = feedback._baseline_accuracy - current
+                print(f"\n[DRIFT] Baseline: {feedback._baseline_accuracy:.1%}")
+                print(f"   Current: {current:.1%}")
+                print(f"   Drift: {drift:+.1%}")
+                
+                if drift > 0.1:
+                    print(f"\n   [!] RETRAINING RECOMMENDED (drift > 10%)")
+            
+            if feedback.should_retrain():
+                print(f"\n   [!] Model retraining is recommended")
+            else:
+                print(f"\n   [OK] Model performance is stable")
+                
+        except Exception as e:
+            print(f"[ERROR] Drift check failed: {e}")
+    
+    def _ml_compare(self, underlying):
+        """Compare model configurations with trading-specific metrics."""
+        # Allow both indices (from UNDERLYING_ASSETS) and stocks (from training_symbols)
+        training_symbols = ML_CONFIG.get("training_symbols", [])
+        valid_symbols = list(UNDERLYING_ASSETS.keys()) + training_symbols
+        
+        if underlying not in valid_symbols:
+            print(f"Unknown underlying: {underlying}")
+            print(f"Valid symbols: {', '.join(valid_symbols)}")
+            return
+        
+        print(f"\n{'='*60}")
+        print(f"MODEL COMPARISON - {underlying}")
+        print(f"{'='*60}")
+        print("\nComparing 12 model configurations with trading metrics...")
+        print("This will test: XGBoost, LightGBM, Random Forest, and Ensemble variants\n")
+        
+        try:
+            from ml.evaluator import ModelComparator, TradingEvaluator
+            from ml import get_data_collector, get_feature_engineer, get_mlflow_tracker
+            
+            collector = get_data_collector()
+            feature_engineer = get_feature_engineer()
+            mlflow_tracker = get_mlflow_tracker()
+            
+            # Collect data
+            print(f"[1/4] Collecting historical data...")
+            days = ML_CONFIG.get("historical_days", 180)
+            data = collector.collect_historical_data(symbols=[underlying], days=days)
+            
+            if not data or underlying not in data:
+                print(f"[ERROR] Could not collect data for {underlying}")
+                return
+            
+            df = data[underlying]
+            print(f"   Collected {len(df)} records")
+            
+            # Extract features
+            print(f"[2/4] Extracting features...")
+            lookback = min(20, len(df) - 15)
+            X, feature_names = feature_engineer.extract_features_batch(df, lookback=lookback)
+            
+            if X is None or len(X) == 0:
+                print(f"[ERROR] Could not extract features")
+                return
+            
+            # Create target variable
+            df_cols = [c.lower() for c in df.columns]
+            close_col = 'close' if 'close' in df_cols else df.columns[df_cols.index('close')]
+            closes = df[close_col].values
+            y_full = (closes[1:] > closes[:-1]).astype(int)
+            y = y_full[lookback:]
+            
+            if len(X) > len(y):
+                X = X[:len(y)]
+            if len(y) > len(X):
+                y = y[:len(X)]
+            
+            X = X[:-1]
+            y = y[1:]
+            
+            # Get prices for simulation
+            prices = closes[lookback + 1:lookback + 1 + len(y)]
+            
+            print(f"   Samples: {len(X)}, Features: {len(feature_names)}")
+            
+            # Run comparison
+            print(f"[3/4] Running model comparisons (12 configurations)...")
+            
+            import mlflow
+            # Set up MLflow experiment for comparison
+            mlflow.set_tracking_uri(f"file:///{ML_CONFIG.get('mlflow_uri', 'data/mlflow').replace(chr(92), '/')}")
+            mlflow.set_experiment("model_comparison")
+            
+            with mlflow.start_run(run_name=f"compare_{underlying}"):
+                mlflow.log_param("underlying", underlying)
+                mlflow.log_param("samples", len(X))
+                mlflow.log_param("features", len(feature_names))
+                
+                comparator = ModelComparator(mlflow_tracker)
+                results_df = comparator.compare_configurations(
+                    X, y, feature_names, prices
+                )
+            
+            # Generate and display report
+            print(f"[4/4] Generating comparison report...")
+            report = comparator.generate_report()
+            print(f"\n{report}")
+            
+            # Show best configuration
+            best = comparator.get_best_configuration(
+                metric='sharpe_ratio',
+                secondary_metrics=['profit_factor', 'win_rate']
+            )
+            
+            print(f"\n{'='*60}")
+            print("RECOMMENDED CONFIGURATION")
+            print(f"{'='*60}")
+            print(f"\n   Best Model: {best.get('config_name', 'N/A')}")
+            print(f"   Model Type: {best.get('model_type', 'N/A')}")
+            print(f"\n   Key Metrics:")
+            print(f"      Sharpe Ratio: {best.get('sharpe_ratio', 0):.4f}")
+            print(f"      Profit Factor: {best.get('profit_factor', 0):.4f}")
+            print(f"      Win Rate: {best.get('win_rate', 0):.2%}")
+            print(f"      Max Drawdown: {best.get('max_drawdown', 0):.2%}")
+            print(f"      Risk/Reward: {best.get('risk_reward_ratio', 0):.2f}")
+            
+            print(f"\n   Signal Quality:")
+            print(f"      Bullish Precision: {best.get('bullish_precision', 0):.2%}")
+            print(f"      Bearish Precision: {best.get('bearish_precision', 0):.2%}")
+            print(f"      False Signal Rate: {best.get('false_signal_rate', 0):.2%}")
+            
+            print(f"\n[OK] Results logged to MLflow experiment 'model_comparison'")
+            print(f"     View at: http://127.0.0.1:5000")
+            
+        except Exception as e:
+            print(f"[ERROR] Comparison failed: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _ml_train_best(self, config_name="rf_aggressive"):
+        """Train all symbols with the best configuration from comparison."""
+        if not ML_CONFIG.get("enabled", False):
+            print("ML is disabled. Enable it in config/settings.py")
+            return
+        
+        # Define best configurations based on comparison results
+        BEST_CONFIGS = {
+            "rf_aggressive": {
+                "model_type": "rf",
+                "params": {
+                    "n_estimators": 100,
+                    "max_depth": 20,
+                    "min_samples_split": 2,
+                    "min_samples_leaf": 1,
+                    "max_features": "sqrt"
+                }
+            },
+            "rf_balanced": {
+                "model_type": "rf",
+                "params": {
+                    "n_estimators": 100,
+                    "max_depth": 10,
+                    "min_samples_split": 5,
+                    "min_samples_leaf": 2,
+                    "max_features": "sqrt"
+                }
+            },
+            "rf_conservative": {
+                "model_type": "rf",
+                "params": {
+                    "n_estimators": 100,
+                    "max_depth": 5,
+                    "min_samples_split": 10,
+                    "min_samples_leaf": 5,
+                    "max_features": "sqrt"
+                }
+            },
+            "xgb_aggressive": {
+                "model_type": "xgboost",
+                "params": {
+                    "n_estimators": 200,
+                    "max_depth": 10,
+                    "learning_rate": 0.1,
+                    "subsample": 0.9,
+                    "colsample_bytree": 0.9
+                }
+            },
+            "xgb_balanced": {
+                "model_type": "xgboost",
+                "params": {
+                    "n_estimators": 100,
+                    "max_depth": 6,
+                    "learning_rate": 0.05,
+                    "subsample": 0.8,
+                    "colsample_bytree": 0.8
+                }
+            },
+            "lgb_aggressive": {
+                "model_type": "lightgbm",
+                "params": {
+                    "n_estimators": 200,
+                    "max_depth": 15,
+                    "learning_rate": 0.1,
+                    "num_leaves": 63
+                }
+            },
+            "lgb_balanced": {
+                "model_type": "lightgbm",
+                "params": {
+                    "n_estimators": 100,
+                    "max_depth": 8,
+                    "learning_rate": 0.05,
+                    "num_leaves": 31
+                }
+            }
+        }
+        
+        if config_name not in BEST_CONFIGS:
+            print(f"Unknown configuration: {config_name}")
+            print(f"Available: {', '.join(BEST_CONFIGS.keys())}")
+            return
+        
+        config = BEST_CONFIGS[config_name]
+        model_type = config["model_type"]
+        params = config["params"]
+        
+        print(f"\n{'='*60}")
+        print(f"TRAINING ALL SYMBOLS WITH BEST CONFIGURATION")
+        print(f"{'='*60}")
+        print(f"\nConfiguration: {config_name}")
+        print(f"Model Type: {model_type}")
+        print(f"Parameters: {params}")
+        
+        try:
+            from ml import get_data_collector, get_feature_engineer, get_mlflow_tracker
+            from ml.model_trainer import ModelTrainer
+            import mlflow
+            import numpy as np
+            
+            collector = get_data_collector()
+            feature_engineer = get_feature_engineer()
+            mlflow_tracker = get_mlflow_tracker()
+            
+            # Set up MLflow experiment
+            mlflow.set_tracking_uri(f"file:///{ML_CONFIG.get('mlflow_uri', 'data/mlflow').replace(chr(92), '/')}")
+            mlflow.set_experiment("best_config_training")
+            
+            # Get training symbols
+            symbols = ML_CONFIG.get("training_symbols", list(UNDERLYING_ASSETS.keys()))
+            print(f"\nTraining {len(symbols)} symbols: {', '.join(symbols)}")
+            print(f"{'='*60}\n")
+            
+            results = {}
+            
+            for symbol in symbols:
+                print(f"\n[{symbol}] Starting training...")
+                
+                try:
+                    # Collect data
+                    days = ML_CONFIG.get("historical_days", 180)
+                    data = collector.collect_historical_data(symbols=[symbol], days=days)
+                    
+                    if not data or symbol not in data:
+                        print(f"   [SKIP] No data for {symbol}")
+                        results[symbol] = {"status": "skipped", "reason": "no data"}
+                        continue
+                    
+                    df = data[symbol]
+                    print(f"   Collected {len(df)} records")
+                    
+                    # Extract features
+                    lookback = min(20, len(df) - 15)
+                    if lookback < 15:
+                        print(f"   [SKIP] Insufficient data ({len(df)} rows)")
+                        results[symbol] = {"status": "skipped", "reason": "insufficient data"}
+                        continue
+                    
+                    X, feature_names = feature_engineer.extract_features_batch(df, lookback=lookback)
+                    
+                    if X is None or len(X) == 0:
+                        print(f"   [SKIP] Could not extract features")
+                        results[symbol] = {"status": "skipped", "reason": "feature extraction failed"}
+                        continue
+                    
+                    # Create target variable
+                    df_cols = [c.lower() for c in df.columns]
+                    close_col = 'close' if 'close' in df_cols else df.columns[df_cols.index('close')]
+                    closes = df[close_col].values
+                    y_full = (closes[1:] > closes[:-1]).astype(int)
+                    y = y_full[lookback:]
+                    
+                    if len(X) > len(y):
+                        X = X[:len(y)]
+                    if len(y) > len(X):
+                        y = y[:len(X)]
+                    
+                    X = X[:-1]
+                    y = y[1:]
+                    
+                    if len(X) < 10:
+                        print(f"   [SKIP] Too few samples ({len(X)})")
+                        results[symbol] = {"status": "skipped", "reason": "too few samples"}
+                        continue
+                    
+                    print(f"   Training {model_type} with {len(X)} samples...")
+                    
+                    # Train with specific configuration
+                    trainer = ModelTrainer(mlflow_tracker)
+                    
+                    # Start MLflow run
+                    with mlflow.start_run(run_name=f"{symbol}_{config_name}"):
+                        mlflow.log_param("symbol", symbol)
+                        mlflow.log_param("config", config_name)
+                        mlflow.log_param("model_type", model_type)
+                        mlflow.log_params(params)
+                        mlflow.log_param("samples", len(X))
+                        mlflow.log_param("features", len(feature_names))
+                        
+                        # Train model with fixed params (no Optuna optimization)
+                        model, metrics, model_version = trainer.train_with_params(
+                            X=X,
+                            y=y,
+                            feature_names=feature_names,
+                            model_type=model_type,
+                            params=params,
+                            symbol=symbol,
+                            config_name=config_name
+                        )
+                        
+                        # Log metrics
+                        mlflow.log_metrics({
+                            "accuracy": metrics.get("accuracy", 0),
+                            "precision": metrics.get("precision", 0),
+                            "recall": metrics.get("recall", 0),
+                            "f1_score": metrics.get("f1_score", 0),
+                            "auc_roc": metrics.get("auc_roc", 0)
+                        })
+                    
+                    print(f"   [OK] Accuracy: {metrics.get('accuracy', 0):.2%}, F1: {metrics.get('f1_score', 0):.2%}")
+                    results[symbol] = {
+                        "status": "success",
+                        "model_version": model_version,
+                        "accuracy": metrics.get("accuracy", 0),
+                        "f1_score": metrics.get("f1_score", 0)
+                    }
+                    
+                except Exception as e:
+                    print(f"   [ERROR] {e}")
+                    results[symbol] = {"status": "error", "reason": str(e)}
+            
+            # Summary
+            print(f"\n{'='*60}")
+            print("TRAINING SUMMARY")
+            print(f"{'='*60}\n")
+            
+            success = sum(1 for r in results.values() if r["status"] == "success")
+            skipped = sum(1 for r in results.values() if r["status"] == "skipped")
+            errors = sum(1 for r in results.values() if r["status"] == "error")
+            
+            print(f"Configuration: {config_name}")
+            print(f"Total Symbols: {len(symbols)}")
+            print(f"Successful: {success}")
+            print(f"Skipped: {skipped}")
+            print(f"Errors: {errors}\n")
+            
+            print(f"{'Symbol':<12} {'Status':<10} {'Accuracy':<10} {'F1 Score':<10}")
+            print("-" * 50)
+            
+            for symbol, result in results.items():
+                status = result["status"]
+                if status == "success":
+                    acc = f"{result['accuracy']:.2%}"
+                    f1 = f"{result['f1_score']:.2%}"
+                else:
+                    acc = "-"
+                    f1 = result.get("reason", "-")[:20]
+                print(f"{symbol:<12} {status:<10} {acc:<10} {f1:<10}")
+            
+            print(f"\n[OK] Results logged to MLflow experiment 'best_config_training'")
+            print(f"     View at: http://127.0.0.1:5000")
+            
+        except Exception as e:
+            print(f"\n[ERROR] Training failed: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _ml_retrain_feedback(self, force=False):
+        """Retrain model using actual trade feedback (P&L outcomes)."""
+        if not ML_CONFIG.get("enabled", False):
+            print("ML is disabled. Enable it in config/settings.py")
+            return
+        
+        print(f"\n{'='*60}")
+        print("FEEDBACK-BASED RETRAINING")
+        print(f"{'='*60}")
+        print("\nThis trains the model using actual trade outcomes (P&L)")
+        print("instead of historical price direction.\n")
+        
+        try:
+            from ml import get_auto_retrainer
+            
+            retrainer = get_auto_retrainer()
+            
+            # Check conditions first
+            if not force:
+                print("[1/3] Checking retrain conditions...")
+                conditions = retrainer.check_retrain_conditions()
+                
+                print(f"\n   Available Samples: {conditions['available_samples']}")
+                print(f"   Minimum Required: {retrainer.min_samples}")
+                
+                if conditions.get('days_since_last_train'):
+                    print(f"   Days Since Last Train: {conditions['days_since_last_train']}")
+                
+                if conditions.get('current_accuracy'):
+                    print(f"   Current Accuracy: {conditions['current_accuracy']:.1%}")
+                
+                if conditions.get('drift_detected'):
+                    print(f"   Drift Detected: YES")
+                
+                print(f"\n   Reasons for retrain:")
+                for reason in conditions.get('reasons', []):
+                    print(f"      - {reason}")
+                
+                if not conditions['should_retrain']:
+                    print(f"\n[INFO] Retrain conditions not met.")
+                    print("       Use 'ml retrain --force' to force retrain.")
+                    return
+            else:
+                print("[1/3] Force mode - skipping condition check...")
+            
+            # Get feedback data
+            print("\n[2/3] Loading feedback training data...")
+            X, y, feature_names = retrainer.get_feedback_training_data()
+            
+            if X is None or len(X) == 0:
+                print("\n[ERROR] No feedback training data available.")
+                print("        Execute some trades first to collect feedback.")
+                return
+            
+            print(f"   Samples: {len(X)}")
+            print(f"   Features: {len(feature_names)}")
+            
+            # Distribution
+            import numpy as np
+            unique, counts = np.unique(y, return_counts=True)
+            dist = dict(zip(unique, counts))
+            print(f"   Target Distribution:")
+            print(f"      WIN (2): {dist.get(2, 0)}")
+            print(f"      BREAKEVEN (1): {dist.get(1, 0)}")
+            print(f"      LOSS (0): {dist.get(0, 0)}")
+            
+            # Confirm
+            if not force:
+                confirm = input("\nProceed with retraining? (y/n): ").strip().lower()
+                if confirm != 'y':
+                    print("Cancelled.")
+                    return
+            
+            # Retrain
+            print("\n[3/3] Training model from feedback data...")
+            result = retrainer.retrain_from_feedback(force=True)
+            
+            if result['success']:
+                print(f"\n[OK] Retraining successful!")
+                print(f"     Model Version: {result['model_version']}")
+                print(f"\n   Metrics:")
+                for key, value in result.get('metrics', {}).items():
+                    if isinstance(value, float):
+                        print(f"      {key}: {value:.4f}")
+                    else:
+                        print(f"      {key}: {value}")
+                
+                if result.get('promoted'):
+                    print(f"\n   [OK] Model auto-promoted to production")
+            else:
+                print(f"\n[ERROR] Retraining failed: {result['message']}")
+                
+        except Exception as e:
+            print(f"\n[ERROR] Retrain failed: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _ml_retrain_status(self):
+        """Show auto-retrain status and conditions."""
+        if not ML_CONFIG.get("enabled", False):
+            print("ML is disabled. Enable it in config/settings.py")
+            return
+        
+        print(f"\n{'='*60}")
+        print("AUTO-RETRAIN STATUS")
+        print(f"{'='*60}")
+        
+        try:
+            from ml import get_auto_retrainer, get_feedback_collector
+            
+            retrainer = get_auto_retrainer()
+            feedback = get_feedback_collector()
+            
+            status = retrainer.get_status()
+            
+            print(f"\n[CONFIGURATION]")
+            print(f"   Enabled: {'YES' if status['enabled'] else 'NO'}")
+            print(f"   Background Monitor: {'RUNNING' if status['running'] else 'STOPPED'}")
+            print(f"   Min Samples: {status['min_samples']}")
+            print(f"   Retrain Interval: {status['retrain_interval_days']} days")
+            print(f"   Drift Threshold: {status['drift_threshold']:.1%}")
+            print(f"   Auto-Promote: {'YES' if status['auto_promote'] else 'NO'}")
+            
+            if status.get('last_retrain'):
+                print(f"\n   Last Retrain: {status['last_retrain']}")
+            
+            conditions = status.get('conditions', {})
+            print(f"\n[CURRENT CONDITIONS]")
+            print(f"   Available Samples: {conditions.get('available_samples', 0)}")
+            print(f"   Should Retrain: {'YES' if conditions.get('should_retrain') else 'NO'}")
+            print(f"   Drift Detected: {'YES' if conditions.get('drift_detected') else 'NO'}")
+            
+            if conditions.get('current_accuracy'):
+                print(f"   Current Accuracy: {conditions['current_accuracy']:.1%}")
+            
+            if conditions.get('days_since_last_train'):
+                print(f"   Days Since Training: {conditions['days_since_last_train']}")
+            
+            print(f"\n[REASONS]")
+            for reason in conditions.get('reasons', []):
+                print(f"   - {reason}")
+            
+            # Feedback data summary
+            print(f"\n[FEEDBACK DATA]")
+            summary = feedback.get_training_data_summary()
+            print(f"   Total Records: {summary.get('total_samples', 0)}")
+            print(f"   With Outcomes: {summary.get('samples_with_outcome', 0)}")
+            print(f"   Win Rate: {summary.get('win_rate', 0):.1%}")
+            
+            if summary.get('underlyings'):
+                print(f"   Symbols: {', '.join(summary['underlyings'])}")
+            
+            print(f"\n{'='*60}")
+            print("COMMANDS:")
+            print("   ml retrain         - Manually trigger retrain")
+            print("   ml retrain --force - Force retrain even if conditions not met")
+            print(f"{'='*60}")
+            
+        except Exception as e:
+            print(f"\n[ERROR] Could not get status: {e}")
+            import traceback
+            traceback.print_exc()
     
     def do_quit(self, arg):
         """Exit the CLI"""

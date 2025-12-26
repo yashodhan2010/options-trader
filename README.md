@@ -1,23 +1,41 @@
 # Options Trading Bot 🚀
 
-A comprehensive, modular options trading bot for Indian markets using Zerodha Kite Connect API. This bot provides automated trading capabilities with support for multiple options strategies, real-time signal generation, advanced Greeks calculation, and robust risk management.
+A comprehensive, modular options trading bot for Indian markets using Zerodha Kite Connect API. This bot provides automated trading capabilities with support for multiple options strategies, **ML-driven signal generation**, advanced Greeks calculation, and robust risk management.
+
+**v2.0: ML-Only Mode** - All trading signals are now derived exclusively from ML model predictions.
 
 ## Features
+
+### 🤖 Machine Learning (Primary - ML-Only Mode)
+- **ML-Driven Signals**: All entry signals come from ML predictions
+- **No Rule-Based Signals**: ML is the sole source of trading decisions
+- **Direction Prediction**: BULLISH, BEARISH, or NEUTRAL with confidence
+- **Ensemble Models**: XGBoost, LightGBM, Random Forest
+- **34+ Features**: Price, technicals, Greeks, OI sentiment, volatility
+- **Optuna Optimization**: Hyperparameter tuning with walk-forward validation
+- **Model Comparison**: Compare 12 configurations with trading-specific metrics
+- **Trading Metrics**: Sharpe Ratio, Profit Factor, Win Rate, Max Drawdown
+- **MLflow Tracking**: Experiment versioning and model registry
+- **Risk Guardrails**: Stop-loss protection, confidence bounds, circuit breaker
+- **Paper Trading Mode**: Simulation with feedback loop
+- **Best Config Training**: Train all symbols with optimal hyperparameters
+- See [docs/ML_INTEGRATION.md](docs/ML_INTEGRATION.md) for full guide
 
 ### 📊 Strategy Catalogue
 - **Directional Strategies**: Long Call, Long Put, Short Call, Short Put
 - **Spread Strategies**: Bull Call Spread, Bear Put Spread
 - **Neutral/Volatility Strategies**: Iron Condor, Straddle, Strangle
+- Strategy selection based on ML direction and IV regime
 
-### 📈 Signal Generation
+### 📈 Market Analysis
 - Real-time analysis of options metrics
 - Open Interest (OI) based sentiment analysis
 - Volatility regime detection
 - Put-Call Ratio (PCR) analysis
 - Max Pain calculation
-- **Historical Data Analysis** for confidence scoring (trend, RSI, momentum)
+- Historical Data Analysis for feature extraction
 
-### 🧮 Options Pricing & Greeks (NEW)
+### 🧮 Options Pricing & Greeks
 - **QuantLib-based** accurate Greeks calculation
 - Implied Volatility (IV) using Newton-Raphson solver
 - Full Greeks: Delta, Gamma, Theta, Vega, Rho
@@ -68,13 +86,35 @@ options-trader/
 │   ├── __init__.py
 │   ├── data_fetcher.py       # Market data fetching
 │   └── websocket_manager.py  # Real-time WebSocket streaming
+├── docs/
+│   ├── STRATEGIES.md         # Strategy documentation
+│   └── ML_INTEGRATION.md     # ML module guide
 ├── execution/
 │   ├── __init__.py
 │   ├── order_manager.py      # Order placement and management
 │   └── position_tracker.py   # Position monitoring with WebSocket
 ├── signals/
+│   ├── __init__.py           # Package exports
+│   ├── ml_signal_generator.py # ML-Only signal generator (PRIMARY)
+│   ├── signal_generator.py   # Legacy rule-based (DEPRECATED)
+│   └── exit_signal_generator.py # Exit signals
+├── ml/                       # Machine Learning module
+│   ├── __init__.py           # Module exports
+│   ├── feature_engineer.py   # 34+ feature extraction
+│   ├── data_collector.py     # Historical data caching
+│   ├── model_trainer.py      # XGBoost/LightGBM/RF + Optuna
+│   ├── evaluator.py          # Trading metrics & model comparison
+│   ├── predictor.py          # Ensemble inference
+│   ├── backtester.py         # Historical simulation
+│   ├── feedback_collector.py # Outcome logging & drift
+│   ├── model_registry.py     # Version control & A/B testing
+│   ├── mlflow_tracker.py     # MLflow integration
+│   ├── guardrails.py         # Risk management
+│   └── paper_trading_runner.py # Paper trading orchestration
+├── signals/
 │   ├── __init__.py
-│   └── signal_generator.py   # Signal generation
+│   ├── signal_generator.py   # Signal generation (ML-enhanced)
+│   └── exit_signal_generator.py # Exit signals (ML-enhanced)
 ├── strategies/
 │   ├── __init__.py
 │   ├── base_strategy.py      # Base strategy class
@@ -83,6 +123,8 @@ options-trader/
 │   ├── spreads.py            # Bull/Bear Spreads
 │   └── volatility.py         # Iron Condor, Straddle, Strangle
 ├── logs/                     # Log files directory
+├── ml_models/                # Trained ML models (NEW)
+├── mlruns/                   # MLflow tracking data (NEW)
 ├── bot.py                    # Main bot orchestrator
 ├── cli.py                    # Interactive CLI
 ├── demo_signal.py            # Demo/testing utilities
@@ -185,7 +227,7 @@ python cli.py
 Available commands:
 - `login` - Login to Kite Connect
 - `status` - Show account status
-- `market` - **Show market timing status** (NEW)
+- `market` - Show market timing status
 - `overview NIFTY` - Market overview
 - `signals` - Generate trading signals
 - `strategies` - List available strategies
@@ -200,6 +242,17 @@ Available commands:
 - `watchlist` - Show current stock watchlist
 - `risk` - Show portfolio risk metrics (combined Greeks)
 - `pnl` - Show today's P&L summary
+
+**ML Commands:**
+- `ml status` - Show ML model status and performance
+- `ml train [SYMBOL]` - Train ML model with Optuna optimization
+- `ml train-best [CONFIG]` - Train all symbols with best config (e.g., rf_aggressive)
+- `ml compare SYMBOL` - Compare 12 model configurations with trading metrics
+- `ml backtest SYMBOL` - Run historical backtest
+- `ml paper start/stop/stats` - Paper trading session management
+- `ml predict SYMBOL` - Get ML prediction for underlying
+- `ml features SYMBOL` - Show extracted features
+- `ml drift` - Check for model drift
 
 ### Bot Mode (Automated)
 
@@ -450,6 +503,46 @@ signal = catalogue.get_strategy(StrategyType.LONG_CALL).analyze(chain, metrics)
 # Get all signals
 signals = catalogue.analyze_all(chain, metrics)
 ```
+
+### ML Module (NEW)
+
+```python
+from ml import (
+    get_predictor,
+    get_model_trainer,
+    get_paper_trading_runner,
+    get_feedback_collector
+)
+
+# Train ML model with Optuna optimization
+trainer = get_model_trainer()
+result = trainer.train_direction_model("NIFTY", optimize=True, n_trials=50)
+print(f"Accuracy: {result['metrics']['accuracy']:.2%}")
+
+# Get ML-enhanced prediction
+predictor = get_predictor()
+prediction = predictor.predict_with_guardrails(
+    features=features,
+    underlying="NIFTY",
+    strategy_type="LONG_CALL",
+    rule_confidence=0.72
+)
+print(f"Blended confidence: {prediction.blended_confidence:.2%}")
+
+# Start paper trading session
+runner = get_paper_trading_runner()
+runner.start_session(initial_capital=100000)
+# ... trade signals ...
+summary = runner.end_session()
+print(f"Win rate: {summary['win_rate']:.1%}, Sharpe: {summary['sharpe_ratio']:.2f}")
+
+# Check model performance
+feedback = get_feedback_collector()
+stats = feedback.get_performance_stats(days=30)
+print(f"ML Accuracy: {stats['accuracy']:.1%}")
+```
+
+📖 **Full ML documentation**: [docs/ML_INTEGRATION.md](docs/ML_INTEGRATION.md)
 
 ## Disclaimer
 

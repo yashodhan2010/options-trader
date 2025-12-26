@@ -203,6 +203,111 @@ DATABASE_CONFIG = {
     "path": DATA_DIR / "trading_bot.db",
 }
 
+# ============================================================================
+# ML CONFIGURATION
+# ============================================================================
+
+# ML Models Directory
+ML_MODELS_DIR = DATA_DIR / "ml_models"
+ML_MODELS_DIR.mkdir(exist_ok=True)
+
+ML_CONFIG = {
+    # Master switch
+    "enabled": os.getenv("ML_ENABLED", "true").lower() == "true",
+    
+    # =========================================================================
+    # TRAINING SYMBOLS - Add your 5-6 symbols here for ML training
+    # =========================================================================
+    # These are the symbols the ML model will be trained on
+    # Can be indices (from UNDERLYING_ASSETS) or stocks (from watchlist)
+    "training_symbols": [
+        "NIFTY",           # Index
+        "BANKNIFTY",       # Index
+        "AXISBANK",        # Stock
+        "HDFCBANK",        # Stock
+        "RELIANCE",        # Stock
+        "SBIN",            # Stock
+    ],
+    
+    # Model paths
+    "model_path": ML_MODELS_DIR,
+    "mlflow_tracking_uri": str(BASE_DIR / "mlruns"),
+    "mlflow_enabled": os.getenv("MLFLOW_ENABLED", "true").lower() == "true",
+    
+    # Confidence blending
+    "confidence_weight": 0.5,           # Weight of ML vs rule-based (0.5 = equal)
+    "min_confidence_for_trade": 0.55,   # Minimum blended confidence to take trade
+    
+    # Model training
+    "model_type": "ensemble",           # 'xgboost', 'lightgbm', 'rf', 'ensemble'
+    "retrain_interval_days": 7,         # Days between model retraining
+    "min_training_samples": 100,        # Minimum samples needed for training
+    "validation_split": 0.2,            # Validation set size
+    "walk_forward_splits": 5,           # Number of walk-forward splits
+    
+    # Optuna optimization
+    "optuna_trials": 50,                # Number of Optuna trials
+    "optuna_timeout": 3600,             # Max seconds for optimization
+    "optuna_pruning": True,             # Enable early stopping of bad trials
+    
+    # Ensemble weights (if using ensemble)
+    "ensemble_weights": {
+        "xgboost": 0.5,
+        "lightgbm": 0.3,
+        "random_forest": 0.2,
+    },
+    
+    # Feature engineering
+    "feature_set": "full",              # 'minimal', 'standard', 'full'
+    "lookback_periods": [5, 10, 20, 50],
+    "normalize_features": True,
+    
+    # Prediction caching
+    "prediction_cache_seconds": 60,     # Cache predictions for this long
+    
+    # Data collection
+    "historical_days": 180,             # Days of historical data (Kite allows up to 2000 for daily)
+    "data_update_interval": 86400,      # Seconds between data updates (1 day)
+    
+    # Guardrails (risk management)
+    "guardrails": {
+        "max_confidence_adjustment": 0.3,    # Max ML can adjust confidence ±
+        "min_ml_confidence": 0.4,            # Block trade if ML confidence below
+        "max_model_age_days": 14,            # Use rule-based if model older
+        "daily_loss_threshold_percent": 5.0, # Pause ML if daily loss exceeds
+        "drawdown_circuit_breaker_percent": 10.0,  # Emergency stop
+    },
+    
+    # Paper trading
+    "paper_trading": {
+        "enabled": True,
+        "duration_days": 30,                 # Paper trading duration
+        "min_trades_for_promotion": 20,      # Min trades before model promotion
+        "min_accuracy_for_promotion": 0.55,  # Min accuracy to promote model
+        "min_sharpe_for_promotion": 1.0,     # Min Sharpe ratio to promote
+    },
+    
+    # Feedback loop
+    "feedback": {
+        "log_all_predictions": True,         # Log every prediction to DB
+        "log_features_at_entry": True,       # Store features when trade opens
+        "log_features_at_exit": True,        # Store features when trade closes
+        "drift_detection_enabled": True,     # Monitor for model drift
+        "drift_threshold": 0.1,              # Retrain if accuracy drops by this
+    },
+    
+    # Auto-Retraining from Feedback
+    "auto_retrain": {
+        "enabled": True,                     # Enable automatic retraining
+        "min_samples": 50,                   # Minimum trade outcomes to retrain
+        "interval_days": 7,                  # Retrain every N days if enough data
+        "drift_threshold": 0.15,             # Accuracy drop threshold for retrain
+        "auto_promote": False,               # Auto-promote if accuracy > 55%
+        "use_feedback_target": True,         # Use trade P&L as target (not next-day return)
+        "check_interval_seconds": 3600,      # Background check interval (1 hour)
+    },
+}
+
 # Notification Configuration
 NOTIFICATION_CONFIG = {
     "telegram_enabled": os.getenv("TELEGRAM_ENABLED", "false").lower() == "true",

@@ -1,5 +1,7 @@
 """
 Signal Generator - Generates trading signals based on market analysis
+
+Enhanced with ML-based confidence adjustment and signal filtering.
 """
 from datetime import datetime
 from typing import List, Dict, Any, Optional
@@ -9,16 +11,33 @@ from data.data_fetcher import data_fetcher
 from strategies.catalogue import StrategyCatalogue
 from strategies.base_strategy import StrategySignal, StrategyType
 from config.settings import (
-    UNDERLYING_ASSETS, STRATEGY_CONFIG, 
+    UNDERLYING_ASSETS, STRATEGY_CONFIG, ML_CONFIG,
     WATCHLIST, WATCHLIST_SYMBOLS, is_in_watchlist, get_watchlist_assets
 )
 from core.logger import logger
 from core.utils import is_trading_allowed
 
 
+def _get_ml_components():
+    """Lazy load ML components to avoid circular imports."""
+    try:
+        if not ML_CONFIG.get("enabled", False):
+            return None, None, None
+        
+        from ml.predictor import get_predictor
+        from ml.feature_engineer import get_feature_engineer
+        from ml.guardrails import get_guardrails
+        
+        return get_predictor(), get_feature_engineer(), get_guardrails()
+    except ImportError:
+        return None, None, None
+
+
 class SignalGenerator:
     """
     Generates trading signals by analyzing market data and running strategies.
+    
+    Enhanced with ML-based confidence adjustment and signal filtering.
     """
     
     def __init__(self, underlyings: List[str] = None):
@@ -44,9 +63,24 @@ class SignalGenerator:
         self.last_signals: Dict[str, List[StrategySignal]] = {}
         self.signal_history: List[Dict] = []
         
+        # ML integration
+        self.ml_enabled = ML_CONFIG.get("enabled", False)
+        self.ml_confidence_weight = ML_CONFIG.get("confidence_weight", 0.5)
+        self._predictor = None
+        self._feature_engineer = None
+        self._guardrails = None
+        
         # Initialize strategy catalogues
         for underlying in self.underlyings:
             self.catalogues[underlying] = StrategyCatalogue(underlying)
+        
+        if self.ml_enabled:
+            logger.info("ML-enhanced signal generation enabled")
+    
+    def _init_ml(self):
+        """Initialize ML components on first use."""
+        if self._predictor is None and self.ml_enabled:
+            self._predictor, self._feature_engineer, self._guardrails = _get_ml_components()
     
     def generate_signals(
         self,
@@ -90,8 +124,117 @@ class SignalGenerator:
         # Sort all signals by confidence
         all_signals.sort(key=lambda s: s.confidence, reverse=True)
         
+        # Apply ML enhancement if enabled
+        if self.ml_enabled and all_signals:
+            all_signals = self._enhance_signals_with_ml(all_signals, targets)
+        
         logger.info(f"Generated {len(all_signals)} total signals")
         return all_signals
+    
+    def _enhance_signals_with_ml(
+        self,
+        signals: List[StrategySignal],
+        underlyings: List[str]
+    ) -> List[StrategySignal]:
+        """
+        Enhance signals with ML predictions.
+        
+        Args:
+            signals: Original rule-based signals
+            underlyings: List of underlyings analyzed
+            
+        Returns:
+            ML-enhanced signals
+        """
+        self._init_ml()
+        
+        if not self._predictor or not self._feature_engineer:
+            return signals
+        
+        enhanced_signals = []
+        
+        for signal in signals:
+            try:
+                # Get market data for feature extraction
+                underlying = signal.underlying
+                spot = data_fetcher.get_spot_price(underlying)
+                
+                if not spot:
+                    enhanced_signals.append(signal)
+                    continue
+                
+                oi_data = data_fetcher.get_oi_data(underlying)
+                volatility = data_fetcher.get_volatility_metrics(underlying)
+                historical = data_fetcher.get_historical_analysis(underlying, days=30)
+                
+                market_data = {
+                    "oi_data": oi_data,
+                    "volatility": volatility,
+                    "historical": historical,
+                }
+                
+                # Extract features
+                features = self._feature_engineer.extract_features(
+                    spot_price=spot,
+                    market_data=market_data,
+                    underlying=underlying,
+                    strategy_type=signal.strategy_type.value
+                )
+                
+                # Get ML prediction with guardrails
+                prediction = self._predictor.predict_with_guardrails(
+                    features=features,
+                    underlying=underlying,
+                    strategy_type=signal.strategy_type.value,
+                    rule_confidence=signal.confidence
+                )
+                
+                # Blend confidences
+                original_confidence = signal.confidence
+                blended_confidence = prediction.blended_confidence
+                
+                # Create enhanced signal (copy with updated confidence)
+                enhanced_signal = StrategySignal(
+                    underlying=signal.underlying,
+                    strategy_type=signal.strategy_type,
+                    direction=signal.direction,
+                    confidence=blended_confidence,
+                    legs=signal.legs,
+                    entry_conditions=signal.entry_conditions,
+                    metrics=signal.metrics,
+                    rationale=signal.rationale + f" [ML: {prediction.confidence:.1%}, blend: {blended_confidence:.1%}]",
+                    greeks=signal.greeks,
+                    target_exit=signal.target_exit,
+                    stop_loss=signal.stop_loss,
+                    expected_pnl=signal.expected_pnl,
+                    max_loss=signal.max_loss,
+                    breakeven=signal.breakeven,
+                )
+                
+                # Store ML metadata in metrics
+                if enhanced_signal.metrics is None:
+                    enhanced_signal.metrics = {}
+                enhanced_signal.metrics["ml_confidence"] = prediction.confidence
+                enhanced_signal.metrics["ml_direction"] = prediction.direction
+                enhanced_signal.metrics["ml_model_version"] = prediction.model_version
+                enhanced_signal.metrics["original_confidence"] = original_confidence
+                enhanced_signal.metrics["ml_feature_importance"] = prediction.feature_importance
+                
+                enhanced_signals.append(enhanced_signal)
+                
+                logger.debug(
+                    f"ML enhanced {signal.strategy_type.value}: "
+                    f"rule={original_confidence:.1%} -> blend={blended_confidence:.1%}"
+                )
+                
+            except Exception as e:
+                logger.warning(f"ML enhancement failed for signal: {e}")
+                enhanced_signals.append(signal)
+        
+        # Re-sort by enhanced confidence
+        enhanced_signals.sort(key=lambda s: s.confidence, reverse=True)
+        
+        return enhanced_signals
     
     def _analyze_underlying(
         self,

@@ -1,6 +1,8 @@
 """
 Exit Signal Generator - Systematic exit strategy based on market conditions and reversal signals.
 
+Enhanced with ML-based exit probability prediction.
+
 Instead of static percentage targets, this module generates intelligent exit signals by:
 1. Detecting trend reversals in the underlying
 2. Checking if the original trade thesis is still valid
@@ -9,6 +11,7 @@ Instead of static percentage targets, this module generates intelligent exit sig
 5. Volatility-based exits (IV crush/expansion)
 6. Technical indicator reversals (RSI, momentum)
 7. Support/Resistance breaches
+8. ML-based exit probability prediction (NEW)
 """
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -17,8 +20,23 @@ from typing import Dict, List, Optional, Any
 
 from strategies.base_strategy import StrategySignal, StrategyType, TradeDirection
 from data.data_fetcher import data_fetcher
-from config.settings import TRADING_CONFIG, GREEKS_EXIT_CONFIG
+from config.settings import TRADING_CONFIG, GREEKS_EXIT_CONFIG, ML_CONFIG
 from core.logger import logger
+
+
+def _get_ml_components():
+    """Lazy load ML components to avoid circular imports."""
+    try:
+        if not ML_CONFIG.get("enabled", False):
+            return None, None, None
+        
+        from ml.predictor import get_predictor
+        from ml.feature_engineer import get_feature_engineer
+        from ml.guardrails import get_guardrails
+        
+        return get_predictor(), get_feature_engineer(), get_guardrails()
+    except ImportError:
+        return None, None, None
 
 
 class ExitReason(Enum):
@@ -38,6 +56,9 @@ class ExitReason(Enum):
     MOMENTUM_REVERSAL = "MOMENTUM_REVERSAL"
     RSI_REVERSAL = "RSI_REVERSAL"
     THESIS_INVALIDATED = "THESIS_INVALIDATED"
+    
+    # ML-based (NEW)
+    ML_EXIT_SIGNAL = "ML_EXIT_SIGNAL"
     
     # Technical-based
     SUPPORT_BREACH = "SUPPORT_BREACH"
@@ -197,11 +218,27 @@ class ExitSignalGenerator:
     """
     Generates intelligent exit signals based on market conditions,
     not just static percentage targets.
+    
+    Enhanced with ML-based exit probability prediction.
     """
     
     def __init__(self):
         self.entry_conditions: Dict[str, Dict] = {}  # Store conditions at entry
         self.last_check: Dict[str, datetime] = {}
+        
+        # ML integration
+        self.ml_enabled = ML_CONFIG.get("enabled", False)
+        self._predictor = None
+        self._feature_engineer = None
+        self._guardrails = None
+        
+        if self.ml_enabled:
+            logger.info("ML-enhanced exit signal generation enabled")
+    
+    def _init_ml(self):
+        """Initialize ML components on first use."""
+        if self._predictor is None and self.ml_enabled:
+            self._predictor, self._feature_engineer, self._guardrails = _get_ml_components()
         
     def store_entry_conditions(
         self, 
@@ -343,6 +380,14 @@ class ExitSignalGenerator:
         )
         if thesis_exit:
             exit_signals.append(thesis_exit)
+        
+        # 9. ML-BASED EXIT CHECK (NEW)
+        if self.ml_enabled:
+            ml_exit = self._check_ml_exit(
+                execution_id, signal, entry, current_data, current_pnl, profit_ratio
+            )
+            if ml_exit:
+                exit_signals.append(ml_exit)
         
         # Return highest priority exit signal
         if exit_signals:
@@ -744,6 +789,88 @@ class ExitSignalGenerator:
                 )
         
         return None
+    
+    def _check_ml_exit(
+        self,
+        execution_id: str,
+        signal: StrategySignal,
+        entry: Dict,
+        current: Dict,
+        current_pnl: float,
+        profit_ratio: float,
+    ) -> Optional[ExitSignal]:
+        """
+        Check if ML model recommends exit.
+        
+        Uses ML predictor to assess current market conditions
+        and recommend exit based on predicted adverse movement.
+        
+        Note: ML never overrides stop-loss (handled by guardrails).
+        """
+        self._init_ml()
+        
+        if not self._predictor or not self._feature_engineer:
+            return None
+        
+        try:
+            underlying = signal.underlying
+            spot = current.get("spot", 0)
+            
+            if not spot:
+                return None
+            
+            # Extract current features
+            features = self._feature_engineer.extract_features(
+                spot_price=spot,
+                market_data=current,
+                underlying=underlying,
+                strategy_type=signal.strategy_type.value
+            )
+            
+            # Get ML exit prediction
+            exit_prediction = self._predictor.predict_exit(
+                features=features,
+                underlying=underlying,
+                strategy_type=signal.strategy_type.value,
+                current_pnl_percent=profit_ratio * 100,
+                entry_features=entry.get("features", {})
+            )
+            
+            if exit_prediction is None:
+                return None
+            
+            # ML exit signal only if:
+            # 1. High confidence exit prediction (>0.7)
+            # 2. Position is in profit (protect profits) OR small loss (<2%)
+            # 3. Never on stop-loss path (guardrails handle that)
+            
+            min_exit_confidence = ML_CONFIG.get("guardrails", {}).get("min_ml_confidence", 0.6)
+            
+            if exit_prediction.confidence >= 0.7 and exit_prediction.direction == "EXIT":
+                # Only trigger ML exit if in profit or small loss
+                if profit_ratio >= 0 or profit_ratio >= -0.02:
+                    urgency = "HIGH" if exit_prediction.confidence >= 0.85 else "MEDIUM"
+                    
+                    return self._create_exit_signal(
+                        execution_id,
+                        ExitReason.ML_EXIT_SIGNAL,
+                        exit_prediction.confidence,
+                        urgency,
+                        current_pnl,
+                        current_pnl * 0.7,  # Expected deterioration if held
+                        f"ML model recommends exit (confidence: {exit_prediction.confidence:.1%})",
+                        {
+                            "ml_confidence": exit_prediction.confidence,
+                            "ml_model_version": exit_prediction.model_version,
+                            "top_features": exit_prediction.feature_importance,
+                        }
+                    )
+            
+            return None
+            
+        except Exception as e:
+            logger.debug(f"ML exit check failed: {e}")
+            return None
     
     def _create_exit_signal(
         self,

@@ -1,0 +1,105 @@
+{
+  "model_version": "ensemble_20251226_161911",
+  "model_type": "ensemble",
+  "trained_at": "2025-12-26T16:19:40.399115",
+  "metrics": {
+    "accuracy": 0.42857142857142855,
+    "precision": 0.42857142857142855,
+    "recall": 1.0,
+    "f1_score": 0.6,
+    "auc_roc": 0.5,
+    "confusion_matrix": [
+      [
+        0,
+        12
+      ],
+      [
+        0,
+        9
+      ]
+    ],
+    "individual_metrics": {
+      "xgboost": {
+        "accuracy": 0.42857142857142855,
+        "precision": 0.42857142857142855,
+        "recall": 1.0,
+        "f1_score": 0.6,
+        "auc_roc": 0.5,
+        "confusion_matrix": [
+          [
+            0,
+            12
+          ],
+          [
+            0,
+            9
+          ]
+        ],
+        "best_params": {
+          "max_depth": 5,
+          "learning_rate": 0.2536999076681772,
+          "n_estimators": 233,
+          "min_child_weight": 6,
+          "subsample": 0.6624074561769746,
+          "colsample_bytree": 0.662397808134481,
+          "gamma": 0.2904180608409973,
+          "reg_alpha": 1.7323522915498704,
+          "reg_lambda": 1.2022300234864176
+        }
+      },
+      "lightgbm": {
+        "accuracy": 0.42857142857142855,
+        "precision": 0.42857142857142855,
+        "recall": 1.0,
+        "f1_score": 0.6,
+        "auc_roc": 0.5,
+        "confusion_matrix": [
+          [
+            0,
+            12
+          ],
+          [
+            0,
+            9
+          ]
+        ],
+        "best_params": {
+          "max_depth": 10,
+          "learning_rate": 0.06819074809771597,
+          "n_estimators": 127,
+          "num_leaves": 21,
+          "min_child_samples": 30,
+          "subsample": 0.8084932353340201,
+          "colsample_bytree": 0.8208781805340754,
+          "reg_alpha": 1.2481670543447305,
+          "reg_lambda": 0.07981507143896971
+        }
+      },
+      "random_forest": {
+        "accuracy": 0.42857142857142855,
+        "precision": 0.42857142857142855,
+        "recall": 1.0,
+        "f1_score": 0.6,
+        "auc_roc": 0.5,
+        "confusion_matrix": [
+          [
+            0,
+            12
+          ],
+          [
+            0,
+            9
+          ]
+        ],
+        "best_params": {
+          "n_estimators": 144,
+          "max_depth": 20,
+          "min_samples_split": 15,
+          "min_samples_leaf": 6,
+          "max_features": "sqrt"
+        }
+      }
+    }
+  },
+  "feature_count": 34
+}

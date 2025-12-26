@@ -1,0 +1,105 @@
+{
+  "model_version": "ensemble_20251226_154236",
+  "model_type": "ensemble",
+  "trained_at": "2025-12-26T15:43:10.734098",
+  "metrics": {
+    "accuracy": 0.5238095238095238,
+    "precision": 0.6,
+    "recall": 0.5,
+    "f1_score": 0.5454545454545454,
+    "auc_roc": 0.5277777777777778,
+    "confusion_matrix": [
+      [
+        5,
+        4
+      ],
+      [
+        6,
+        6
+      ]
+    ],
+    "individual_metrics": {
+      "xgboost": {
+        "accuracy": 0.5714285714285714,
+        "precision": 0.6363636363636364,
+        "recall": 0.5833333333333334,
+        "f1_score": 0.6086956521739131,
+        "auc_roc": 0.5694444444444445,
+        "confusion_matrix": [
+          [
+            5,
+            4
+          ],
+          [
+            5,
+            7
+          ]
+        ],
+        "best_params": {
+          "max_depth": 4,
+          "learning_rate": 0.04738783708075719,
+          "n_estimators": 90,
+          "min_child_weight": 2,
+          "subsample": 0.9709053805973722,
+          "colsample_bytree": 0.7786721527371244,
+          "gamma": 0.5944165065672133,
+          "reg_alpha": 1.2396052304534715,
+          "reg_lambda": 1.6169520109661848
+        }
+      },
+      "lightgbm": {
+        "accuracy": 0.5238095238095238,
+        "precision": 0.6,
+        "recall": 0.5,
+        "f1_score": 0.5454545454545454,
+        "auc_roc": 0.5277777777777778,
+        "confusion_matrix": [
+          [
+            5,
+            4
+          ],
+          [
+            6,
+            6
+          ]
+        ],
+        "best_params": {
+          "max_depth": 6,
+          "learning_rate": 0.13323548338574384,
+          "n_estimators": 139,
+          "num_leaves": 100,
+          "min_child_samples": 11,
+          "subsample": 0.8604911724169196,
+          "colsample_bytree": 0.8440686494674072,
+          "reg_alpha": 0.22070626747340966,
+          "reg_lambda": 1.448125572098917
+        }
+      },
+      "random_forest": {
+        "accuracy": 0.5238095238095238,
+        "precision": 0.6,
+        "recall": 0.5,
+        "f1_score": 0.5454545454545454,
+        "auc_roc": 0.5277777777777778,
+        "confusion_matrix": [
+          [
+            5,
+            4
+          ],
+          [
+            6,
+            6
+          ]
+        ],
+        "best_params": {
+          "n_estimators": 198,
+          "max_depth": 3,
+          "min_samples_split": 13,
+          "min_samples_leaf": 2,
+          "max_features": null
+        }
+      }
+    }
+  },
+  "feature_count": 34
+}

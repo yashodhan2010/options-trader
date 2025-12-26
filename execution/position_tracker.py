@@ -13,7 +13,7 @@ from data.data_fetcher import data_fetcher
 from execution.order_manager import order_manager, OrderType
 from strategies.base_strategy import StrategySignal
 from config.settings import TRADING_CONFIG, BOT_CONFIG, GREEKS_EXIT_CONFIG
-from core.logger import logger
+from core.logger import logger, trade_logger
 from core.database import database
 from core.utils import is_market_open
 
@@ -836,6 +836,7 @@ class PositionTracker:
             reason: Reason for closing
         """
         logger.warning(f"Force closing all positions: {reason}")
+        trade_logger.info(f"FORCE CLOSE ALL TRIGGERED | Reason: {reason}")
         
         active_positions = order_manager.get_active_positions()
         
@@ -846,6 +847,8 @@ class PositionTracker:
             
             order_manager.close_position(execution_id)
             self._notify("position_closed", execution_id, pnl, reason)
+            
+            trade_logger.info(f"EXIT | {execution_id} | P&L: {pnl:.2f} | Reason: {reason} (Force Close)")
         
         self.position_metrics.clear()
         logger.info("All positions closed")
