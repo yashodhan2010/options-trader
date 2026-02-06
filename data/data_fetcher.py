@@ -715,22 +715,37 @@ class DataFetcher:
             return pd.DataFrame()
         
         try:
-            # Get instrument token
-            instruments = self._load_instruments(exchange)
-            instrument = next(
-                (i for i in instruments if i["tradingsymbol"] == symbol),
-                None
-            )
+            # First check if it's an index with a known instrument token
+            from config.settings import UNDERLYING_ASSETS, get_instrument_token
             
-            if not instrument:
-                logger.error(f"Instrument not found: {symbol}")
-                return pd.DataFrame()
+            instrument_token = None
+            
+            # Check if symbol is an index with stored instrument_token
+            if symbol in UNDERLYING_ASSETS:
+                instrument_token = UNDERLYING_ASSETS[symbol].get("instrument_token")
+            
+            # If not an index or no token, look up in instruments
+            if not instrument_token:
+                instruments = self._load_instruments(exchange)
+                instrument = next(
+                    (i for i in instruments if i["tradingsymbol"] == symbol),
+                    None
+                )
+                
+                if not instrument:
+                    # Try with get_instrument_token as fallback
+                    instrument_token = get_instrument_token(symbol)
+                    if not instrument_token:
+                        logger.error(f"Instrument not found: {symbol}")
+                        return pd.DataFrame()
+                else:
+                    instrument_token = instrument["instrument_token"]
             
             from_date = datetime.now() - timedelta(days=days)
             to_date = datetime.now()
             
             data = self.kite.historical_data(
-                instrument["instrument_token"],
+                instrument_token,
                 from_date,
                 to_date,
                 interval,
@@ -756,8 +771,14 @@ class DataFetcher:
         Returns:
             Dictionary with volatility metrics
         """
+        # For indices with instrument_token, use the underlying key directly
         asset_config = UNDERLYING_ASSETS.get(underlying, {})
-        symbol = asset_config.get("symbol", underlying).replace(" ", "")
+        if asset_config and "instrument_token" in asset_config:
+            symbol = underlying
+        elif asset_config:
+            symbol = asset_config.get("symbol", underlying)
+        else:
+            symbol = underlying
         
         # Get historical data
         hist_data = self.get_historical_data(symbol, "day", 30, "NSE")
@@ -816,17 +837,20 @@ class DataFetcher:
         Returns:
             Dictionary with historical analysis metrics
         """
-        # Get the correct symbol
+        # For indices with instrument_token, use the underlying key directly
+        # For stocks, use the trading symbol
         asset_config = UNDERLYING_ASSETS.get(underlying, {})
-        if asset_config:
-            symbol = asset_config.get("symbol", underlying).replace(" ", "")
-            exchange = "NSE"
+        if asset_config and "instrument_token" in asset_config:
+            # Index with direct instrument token - pass underlying key
+            symbol = underlying
+        elif asset_config:
+            # Stock - use trading symbol
+            symbol = asset_config.get("symbol", underlying)
         else:
             symbol = underlying
-            exchange = "NSE"
         
         # Get historical data
-        hist_data = self.get_historical_data(symbol, "day", days, exchange)
+        hist_data = self.get_historical_data(symbol, "day", days, "NSE")
         
         if hist_data.empty or len(hist_data) < 10:
             logger.warning(f"Insufficient historical data for {underlying}")
@@ -1002,6 +1026,9 @@ class DataFetcher:
             
             # Confidence boost from historical data
             analysis["confidence_boost"] = self._calculate_confidence_boost(analysis)
+            
+            # Include raw DataFrame for ML feature extraction
+            analysis["df"] = hist_data
             
             return analysis
             

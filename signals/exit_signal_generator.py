@@ -821,10 +821,12 @@ class ExitSignalGenerator:
             
             # Extract current features
             features = self._feature_engineer.extract_features(
-                spot_price=spot,
-                market_data=current,
                 underlying=underlying,
-                strategy_type=signal.strategy_type.value
+                spot_price=spot,
+                historical_data=current.get("historical", {}).get("df") if isinstance(current.get("historical"), dict) else current.get("historical"),
+                options_chain=current.get("options_chain"),
+                oi_analysis=current.get("oi_data"),
+                volatility_data=current.get("volatility"),
             )
             
             # Get ML exit prediction

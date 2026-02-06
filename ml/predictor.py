@@ -74,6 +74,10 @@ class MLPredictor:
         self.model_type: Optional[str] = None
         self.model_timestamp: Optional[datetime] = None
         
+        # Feedback-based adjustments
+        self.confidence_adjustment: float = 1.0  # Multiplier from feedback
+        self.feedback_config: Dict = {}
+        
         # Prediction cache
         self._prediction_cache: Dict[str, Tuple[MLPrediction, datetime]] = {}
         self.cache_ttl = ML_CONFIG.get("prediction_cache_seconds", 60)
@@ -135,19 +139,43 @@ class MLPredictor:
             else:
                 self.model_timestamp = datetime.now()
             
+            # Load feedback config if available
+            self._load_feedback_config(model_version)
+            
             # Clear cache when loading new model
             self._prediction_cache.clear()
             
-            logger.info(f"Loaded model: {model_version} ({self.model_type})")
+            logger.info(f"Loaded model: {model_version} ({self.model_type}), confidence_adj={self.confidence_adjustment:.2f}")
             return True
             
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
             return False
     
+    def _load_feedback_config(self, model_version: str):
+        """Load feedback configuration for confidence adjustment."""
+        try:
+            import json
+            from pathlib import Path
+            
+            config_path = Path("data/ml_models") / model_version / "feedback_config.json"
+            if config_path.exists():
+                with open(config_path) as f:
+                    self.feedback_config = json.load(f)
+                
+                self.confidence_adjustment = self.feedback_config.get("confidence_adjustment", 1.0)
+                logger.info(f"Loaded feedback config: confidence adjustment = {self.confidence_adjustment:.2f}")
+            else:
+                self.confidence_adjustment = 1.0
+                self.feedback_config = {}
+                
+        except Exception as e:
+            logger.warning(f"Could not load feedback config: {e}")
+            self.confidence_adjustment = 1.0
+    
     def predict(
         self,
-        features: Dict[str, float],
+        features,
         underlying: str = None,
         use_cache: bool = True
     ) -> Optional[MLPrediction]:
@@ -155,7 +183,7 @@ class MLPredictor:
         Make a prediction from features.
         
         Args:
-            features: Dictionary of feature values
+            features: Dictionary of feature values or FeatureSet object
             underlying: Optional underlying symbol for caching
             use_cache: Whether to use cached predictions
             
@@ -169,6 +197,12 @@ class MLPredictor:
         if self.model is None:
             if not self.load_model():
                 return None
+        
+        # Convert FeatureSet to dict if needed
+        if hasattr(features, 'to_dict'):
+            features = features.to_dict()
+        elif hasattr(features, 'features'):
+            features = features.features
         
         # Check cache
         cache_key = f"{underlying}_{hash(frozenset(features.items()))}"
@@ -225,6 +259,11 @@ class MLPredictor:
         # Calculate confidence from probability distribution
         confidence = float(np.max(probs))
         
+        # Apply feedback-based confidence adjustment
+        adjusted_confidence = confidence * self.confidence_adjustment
+        # Clamp to valid range
+        adjusted_confidence = max(0.1, min(0.95, adjusted_confidence))
+        
         # Create probability dict
         prob_dict = {
             "BEARISH": float(probs[0]) if len(probs) > 0 else 0,
@@ -234,7 +273,7 @@ class MLPredictor:
         
         return MLPrediction(
             direction=direction,
-            confidence=confidence,
+            confidence=adjusted_confidence,
             probabilities=prob_dict,
             model_version=self.model_version,
             model_type=self.model_type,
@@ -259,10 +298,12 @@ class MLPredictor:
                 
                 # Handle binary vs multiclass
                 if len(probs) == 2:
-                    # Binary: convert to 3-class (assume neutral in middle)
-                    ensemble_probs[0] += weight * probs[0] * 0.5
-                    ensemble_probs[1] += weight * 0.5
-                    ensemble_probs[2] += weight * probs[1] * 0.5
+                    # Binary (0=bearish/down, 1=bullish/up): map directly
+                    # Class 0 = down = BEARISH, Class 1 = up = BULLISH
+                    # Use higher probability as confidence, no NEUTRAL class
+                    ensemble_probs[0] += weight * probs[0]  # BEARISH
+                    ensemble_probs[1] += weight * 0.0       # No NEUTRAL in binary
+                    ensemble_probs[2] += weight * probs[1]  # BULLISH
                 else:
                     ensemble_probs += weight * probs
                 
@@ -276,6 +317,11 @@ class MLPredictor:
         direction = self.DIRECTION_MAP.get(raw_pred, "NEUTRAL")
         confidence = float(np.max(ensemble_probs))
         
+        # Apply feedback-based confidence adjustment
+        adjusted_confidence = confidence * self.confidence_adjustment
+        # Clamp to valid range
+        adjusted_confidence = max(0.1, min(0.95, adjusted_confidence))
+        
         prob_dict = {
             "BEARISH": float(ensemble_probs[0]),
             "NEUTRAL": float(ensemble_probs[1]),
@@ -284,7 +330,7 @@ class MLPredictor:
         
         return MLPrediction(
             direction=direction,
-            confidence=confidence,
+            confidence=adjusted_confidence,
             probabilities=prob_dict,
             model_version=self.model_version,
             model_type="ensemble",

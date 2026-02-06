@@ -91,9 +91,22 @@ class StrategySignal:
     
     @property
     def risk_reward_ratio(self) -> float:
-        if self.max_loss == 0:
-            return 0
-        return abs(self.expected_profit / self.max_loss)
+        """
+        Calculate risk/reward ratio as target profit / stop loss amount.
+        
+        For option buying: reward is target profit, risk is stop loss amount
+        For option selling: reward is premium received, risk is potential loss
+        """
+        # Use stop_loss as the risk (not max_loss)
+        # stop_loss is the amount we lose if SL is hit
+        if self.stop_loss == 0:
+            # Fallback to max_loss if no SL defined
+            if self.max_loss == 0:
+                return 0
+            return abs(self.expected_profit / self.max_loss)
+        
+        # RR = potential reward / potential risk
+        return abs(self.expected_profit / self.stop_loss) if self.stop_loss > 0 else 0
     
     def to_dict(self) -> Dict[str, Any]:
         return {

@@ -228,9 +228,12 @@ class MLSignalGenerator:
         
         # Extract features for ML prediction
         features = self._feature_engineer.extract_features(
-            spot_price=spot,
-            market_data=market_data,
             underlying=underlying,
+            spot_price=spot,
+            historical_data=historical.get("df") if isinstance(historical, dict) else historical,
+            options_chain=options_chain,
+            oi_analysis=oi_data,
+            volatility_data=volatility,
         )
         
         if not features:
@@ -348,36 +351,22 @@ class MLSignalGenerator:
         Returns:
             Enhanced signal with ML confidence
         """
-        # Map ML direction to trade direction
-        if prediction.direction == "BULLISH":
-            direction = TradeDirection.LONG
-        elif prediction.direction == "BEARISH":
-            direction = TradeDirection.SHORT
-        else:
-            direction = base_signal.direction  # Keep strategy default for neutral
-        
-        # Create new signal with ML confidence
+        # Create new signal with ML confidence using actual StrategySignal fields
         ml_signal = StrategySignal(
             underlying=base_signal.underlying,
             strategy_type=base_signal.strategy_type,
-            direction=direction,
             confidence=prediction.confidence,  # Use ML confidence
             legs=base_signal.legs,
-            entry_conditions=base_signal.entry_conditions + [
-                f"ML Direction: {prediction.direction}",
-                f"ML Confidence: {prediction.confidence:.1%}",
-            ],
-            metrics=base_signal.metrics or {},
-            rationale=f"[ML Signal] {prediction.direction} ({prediction.confidence:.1%}) - {base_signal.rationale}",
-            greeks=base_signal.greeks,
-            target_exit=base_signal.target_exit,
-            stop_loss=base_signal.stop_loss,
-            expected_pnl=base_signal.expected_pnl,
+            entry_time=base_signal.entry_time,
+            expected_profit=base_signal.expected_profit,
             max_loss=base_signal.max_loss,
-            breakeven=base_signal.breakeven,
+            stop_loss=base_signal.stop_loss,
+            target=base_signal.target,
+            rationale=f"[ML Signal] {prediction.direction} ({prediction.confidence:.1%}) - {base_signal.rationale}",
+            metrics=base_signal.metrics.copy() if base_signal.metrics else {},
         )
         
-        # Add ML metadata
+        # Add ML metadata to metrics
         ml_signal.metrics["ml_direction"] = prediction.direction
         ml_signal.metrics["ml_confidence"] = prediction.confidence
         ml_signal.metrics["ml_probabilities"] = prediction.probabilities
@@ -417,20 +406,18 @@ class MLSignalGenerator:
         oi_data = data_fetcher.get_oi_data(underlying)
         volatility = data_fetcher.get_volatility_metrics(underlying)
         historical = data_fetcher.get_historical_analysis(underlying, days=30)
+        options_chain = data_fetcher.get_options_chain(underlying)
         
         # Get ML prediction
         ml_prediction = None
         if self.model_loaded and self._feature_engineer:
-            market_data = {
-                "oi_data": oi_data,
-                "volatility": volatility,
-                "historical": historical,
-            }
-            
             features = self._feature_engineer.extract_features(
-                spot_price=spot,
-                market_data=market_data,
                 underlying=underlying,
+                spot_price=spot,
+                historical_data=historical.get("df") if isinstance(historical, dict) else historical,
+                options_chain=options_chain,
+                oi_analysis=oi_data,
+                volatility_data=volatility,
             )
             
             if features:

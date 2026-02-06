@@ -738,13 +738,22 @@ class TradingCLI(cmd.Cmd):
             ml train-best [MODEL]  - Train all symbols with best configuration (default: rf_aggressive)
             ml retrain             - Retrain from feedback data (trade outcomes)
             ml retrain-status      - Show auto-retrain status and conditions
+            ml collect [start|stop|status|once] - Live feature collection for training
+            ml label               - Label collected snapshots with outcomes
+            ml historical [status|date|range|fill|kite] - Download NSE bhavcopy historical data
+            ml backfill [DAYS]     - Backfill last N days of historical data (uses jugaad-data)
+            ml train-full          - Train all symbols using NSE bhavcopy with 59 features
+            ml train-monthly       - Run monthly update pipeline (download + train)
+            ml models              - Show trained per-symbol models and metrics
         """
         args = arg.strip().split()
         
         if not args:
             print("Usage: ml <command> [args]")
-            print("Commands: status, train, train-best, backtest, paper, predict,")
-            print("          features, drift, compare, retrain, retrain-status")
+            print("Commands: status, train, train-best, train-full, train-monthly,")
+            print("          backtest, paper, predict, features, drift, compare,")
+            print("          retrain, retrain-status, collect, label, historical,")
+            print("          backfill, models")
             return
         
         cmd = args[0].lower()
@@ -789,6 +798,24 @@ class TradingCLI(cmd.Cmd):
             self._ml_retrain_feedback(force)
         elif cmd == "retrain-status":
             self._ml_retrain_status()
+        elif cmd == "collect":
+            action = args[1].lower() if len(args) > 1 else "status"
+            self._ml_collect(action)
+        elif cmd == "label":
+            self._ml_label()
+        elif cmd == "historical":
+            action = args[1].lower() if len(args) > 1 else "status"
+            self._ml_historical(action, args[2:] if len(args) > 2 else [])
+        elif cmd == "backfill":
+            days = int(args[1]) if len(args) > 1 else 30
+            self._ml_backfill(days)
+        elif cmd == "train-full":
+            self._ml_train_full(args[1:])
+        elif cmd == "train-monthly":
+            force = "--force" in args or "-f" in args
+            self._ml_train_monthly(force)
+        elif cmd == "models":
+            self._ml_models()
         else:
             print(f"Unknown ML command: {cmd}")
     
@@ -1722,6 +1749,657 @@ class TradingCLI(cmd.Cmd):
             
         except Exception as e:
             print(f"\n[ERROR] Could not get status: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _ml_collect(self, action: str):
+        """Manage live feature collection for ML training."""
+        try:
+            from ml.live_feature_collector import get_collector, label_snapshots
+            
+            collector = get_collector()
+            
+            if action == "start":
+                print("\n" + "="*60)
+                print("STARTING LIVE FEATURE COLLECTION")
+                print("="*60)
+                print(f"\nSymbols: {', '.join(collector.symbols)}")
+                print(f"Interval: {collector.interval} seconds")
+                print("\nThis will collect all 61 features including:")
+                print("  - Price & Technical (34 features)")
+                print("  - Options Chain & Greeks (12 features)")
+                print("  - OI Sentiment (6 features)")
+                print("  - Time/Calendar (7 features)")
+                print("  - Volatility (2 additional features)")
+                print("\nCollection runs in background during market hours.")
+                print("Use 'ml collect status' to check progress.")
+                print("Use 'ml collect stop' to stop collection.")
+                
+                if collector.start():
+                    print("\n[SUCCESS] Collection started!")
+                else:
+                    print("\n[WARNING] Collector already running")
+                    
+            elif action == "stop":
+                collector.stop()
+                print("\n[SUCCESS] Collection stopped")
+                
+            elif action == "status":
+                stats = collector.get_stats()
+                
+                print("\n" + "="*60)
+                print("LIVE FEATURE COLLECTION STATUS")
+                print("="*60)
+                
+                print(f"\n[COLLECTOR]")
+                print(f"   Running: {'YES' if stats.get('running') else 'NO'}")
+                print(f"   Started: {stats.get('started_at', 'N/A')}")
+                print(f"   Interval: {stats.get('interval_seconds', 900)}s")
+                print(f"   Symbols: {', '.join(stats.get('symbols', []))}")
+                
+                print(f"\n[SESSION STATS]")
+                print(f"   Snapshots Collected: {stats.get('snapshots_collected', 0)}")
+                print(f"   Last Snapshot: {stats.get('last_snapshot_time', 'N/A')}")
+                print(f"   Errors: {stats.get('errors', 0)}")
+                
+                print(f"\n[DATABASE]")
+                print(f"   Total Snapshots: {stats.get('total_in_db', 0)}")
+                print(f"   Full Feature Snapshots: {stats.get('full_feature_snapshots', 0)}")
+                
+                if stats.get('db_by_symbol'):
+                    print(f"\n   By Symbol:")
+                    for sym, count in sorted(stats['db_by_symbol'].items()):
+                        print(f"      {sym}: {count}")
+                
+                print(f"\n{'='*60}")
+                print("COMMANDS:")
+                print("   ml collect start  - Start background collection")
+                print("   ml collect stop   - Stop collection")
+                print("   ml collect once   - Collect once for all symbols")
+                print("   ml label          - Label snapshots with outcomes")
+                print(f"{'='*60}")
+                
+            elif action == "once":
+                print("\nCollecting features once for all symbols...")
+                results = collector.collect_once()
+                
+                print(f"\n[RESULTS]")
+                print(f"   Collected: {results['collected']} snapshots")
+                print(f"   Errors: {results['errors']}")
+                
+                if results['symbols']:
+                    print(f"\n   Details:")
+                    for sym, info in results['symbols'].items():
+                        opts = "✓" if info['has_options'] else "✗"
+                        oi = "✓" if info['has_oi'] else "✗"
+                        print(f"      {sym}: {info['features']} features (Options: {opts}, OI: {oi})")
+                        
+            else:
+                print(f"Unknown collect action: {action}")
+                print("Usage: ml collect [start|stop|status|once]")
+                
+        except Exception as e:
+            print(f"\n[ERROR] {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _ml_label(self):
+        """Label collected snapshots with actual outcomes."""
+        try:
+            from ml.live_feature_collector import label_snapshots, get_training_data_from_snapshots
+            
+            print("\n" + "="*60)
+            print("LABELING FEATURE SNAPSHOTS")
+            print("="*60)
+            
+            print("\nLabeling snapshots with actual price movements...")
+            count = label_snapshots(lookback_hours=4)
+            
+            print(f"\n[RESULTS]")
+            print(f"   Labeled: {count} snapshots")
+            
+            # Check training data availability
+            X, y, features = get_training_data_from_snapshots(min_samples=10, require_full_features=False)
+            
+            if X is not None:
+                print(f"\n[TRAINING DATA AVAILABLE]")
+                print(f"   Samples: {len(X)}")
+                print(f"   Features: {len(features)}")
+                print(f"   Positive (UP): {sum(y)} ({sum(y)/len(y)*100:.1f}%)")
+                print(f"   Negative (DOWN/NEUTRAL): {len(y)-sum(y)} ({(len(y)-sum(y))/len(y)*100:.1f}%)")
+                
+                if len(X) >= 100:
+                    print(f"\n   [READY] Sufficient data for training with full features!")
+                    print(f"   Run 'ml train-best' to retrain with collected data")
+                else:
+                    print(f"\n   [NEED MORE] Collect at least {100 - len(X)} more samples")
+            else:
+                print(f"\n   No labeled data available yet")
+            
+            print(f"\n{'='*60}")
+            
+        except Exception as e:
+            print(f"\n[ERROR] {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _ml_historical(self, action: str, args: list):
+        """Manage historical data collection from NSE bhavcopy."""
+        try:
+            from ml.historical_data_collector import get_historical_collector
+            from datetime import date, timedelta
+            
+            collector = get_historical_collector()
+            
+            if action == "status":
+                status = collector.get_collection_status()
+                
+                print("\n" + "="*60)
+                print("HISTORICAL DATA COLLECTION STATUS")
+                print("="*60)
+                
+                print(f"\n[DATABASE]")
+                print(f"   Historical (NSE):  {status.get('historical_snapshots', 0)}")
+                print(f"   Historical (Kite): {status.get('kite_historical_snapshots', 0)}")
+                print(f"   Live Snapshots:    {status.get('live_snapshots', 0)}")
+                print(f"   Total Snapshots:   {status.get('total_snapshots', 0)}")
+                
+                date_range = status.get('date_range', {})
+                if date_range.get('start'):
+                    print(f"\n[DATE RANGE]")
+                    print(f"   Start: {date_range.get('start')}")
+                    print(f"   End: {date_range.get('end')}")
+                
+                symbols = status.get('symbols', [])
+                if symbols:
+                    print(f"\n[SYMBOLS] ({len(symbols)})")
+                    print(f"   {', '.join(symbols)}")
+                
+                print(f"\n[CACHE]")
+                print(f"   Files: {status.get('cache_files', 0)}")
+                print(f"   Size: {status.get('cache_size_mb', 0):.1f} MB")
+                
+                print(f"\n{'='*60}")
+                print("COMMANDS:")
+                print("   ml historical status            - Show collection status")
+                print("   ml historical date YYYY-MM-DD   - Collect for specific date")
+                print("   ml historical range START END   - Collect date range")
+                print("   ml historical fill              - Fill missing dates (30 days)")
+                print("   ml historical load FILE_PATH    - Load manually downloaded bhavcopy")
+                print("   ml historical kite [DAYS]       - Collect via Kite API (default 30)")
+                print("   ml backfill [DAYS]              - Backfill last N days")
+                print(f"\n   NOTE: If NSE blocks downloads, use either:")
+                print(f"         1. 'ml historical kite 30' - Uses Kite API (OHLCV only)")
+                print(f"         2. Download manually from NSE and use 'ml historical load'")
+                print(f"            https://www.nseindia.com/all-reports-derivatives")
+                print(f"{'='*60}")
+                
+            elif action == "date":
+                if not args:
+                    print("Usage: ml historical date YYYY-MM-DD")
+                    return
+                
+                target_date = date.fromisoformat(args[0])
+                print(f"\nCollecting historical data for {target_date}...")
+                
+                result = collector.process_date(target_date)
+                
+                print(f"\n[RESULTS]")
+                print(f"   Date: {result['date']}")
+                print(f"   Collected: {result['collected']} snapshots")
+                print(f"   Errors: {result['errors']}")
+                
+                if result.get('symbols'):
+                    print(f"\n   Symbols:")
+                    for sym, info in result['symbols'].items():
+                        pcr = info.get('pcr', 0)
+                        print(f"      {sym}: Spot={info.get('spot'):.2f}, Features={info.get('features')}, PCR={pcr:.2f}")
+                
+            elif action == "range":
+                if len(args) < 2:
+                    print("Usage: ml historical range START_DATE END_DATE")
+                    print("Example: ml historical range 2025-12-01 2025-12-20")
+                    return
+                
+                start_date = date.fromisoformat(args[0])
+                end_date = date.fromisoformat(args[1])
+                
+                print(f"\nCollecting historical data from {start_date} to {end_date}...")
+                print("This may take a while. Please wait...\n")
+                
+                results = collector.collect_date_range(start_date, end_date)
+                
+                print(f"\n[RESULTS]")
+                print(f"   Date Range: {results['start_date']} to {results['end_date']}")
+                print(f"   Total Dates: {results['total_dates']}")
+                print(f"   Processed: {results['processed_dates']}")
+                print(f"   Skipped (already exists): {results['skipped_dates']}")
+                print(f"   Total Snapshots: {results['total_collected']}")
+                print(f"   Errors: {results['total_errors']}")
+                
+            elif action == "fill":
+                print("\nFinding and filling missing dates in last 30 days...")
+                results = collector.fill_missing_dates(lookback_days=30)
+                
+                print(f"\n[RESULTS]")
+                print(f"   Missing Dates Found: {results.get('missing_dates', 0)}")
+                print(f"   Dates Filled: {results.get('filled', 0)}")
+                print(f"   Errors: {results.get('errors', 0)}")
+                
+                if results.get('dates'):
+                    print(f"\n   Filled Dates:")
+                    for d in results['dates'][:10]:
+                        print(f"      {d['date']}: {d['collected']} snapshots")
+                    if len(results['dates']) > 10:
+                        print(f"      ... and {len(results['dates']) - 10} more")
+            
+            elif action == "load":
+                if not args:
+                    print("Usage: ml historical load FILE_PATH [FILE_PATH2 ...]")
+                    print("\nLoad manually downloaded bhavcopy files from NSE.")
+                    print("Download from: https://www.nseindia.com/all-reports-derivatives")
+                    print("\nExample:")
+                    print("   ml historical load C:\\Downloads\\fo27DEC2024bhav.csv.zip")
+                    return
+                
+                # Load each file
+                from pathlib import Path
+                loaded = 0
+                for file_path in args:
+                    file_path = file_path.strip('"').strip("'")
+                    print(f"\nLoading: {file_path}")
+                    df = collector.load_from_file(file_path)
+                    if df is not None:
+                        print(f"   Records: {len(df)}")
+                        loaded += 1
+                    else:
+                        print(f"   Failed to load file")
+                
+                print(f"\n[RESULT] Loaded {loaded}/{len(args)} files")
+                
+                # Now process the loaded files
+                if loaded > 0:
+                    print("\nProcessing loaded files to extract features...")
+                    status = collector.get_collection_status()
+                    print(f"\n   Cache Files: {status.get('cache_files', 0)}")
+                    print("\n   Run 'ml historical status' to see current data")
+                    print("   Run 'ml historical fill' to process cached files")
+            
+            elif action == "kite":
+                # Collect using Kite API
+                days = 30
+                if args:
+                    try:
+                        days = int(args[0])
+                    except ValueError:
+                        print("Usage: ml historical kite [DAYS]")
+                        return
+                
+                print(f"\n{'='*60}")
+                print("COLLECTING HISTORICAL DATA VIA KITE API")
+                print(f"{'='*60}")
+                print(f"\nDays: {days}")
+                print(f"Symbols: {', '.join(collector.symbols)}")
+                print(f"\nNOTE: This collects OHLCV data only (no options chain).")
+                print("For full features, use live collector during market hours.\n")
+                
+                results = collector.collect_from_kite(days=days)
+                
+                print(f"\n[RESULTS]")
+                print(f"   Method: {results.get('method')}")
+                print(f"   Symbols Collected: {results.get('symbols_collected')}")
+                print(f"   Total Candles: {results.get('total_candles')}")
+                print(f"   Snapshots Created: {results.get('snapshots_created')}")
+                
+                if results.get('errors'):
+                    print(f"\n[ERRORS]")
+                    for err in results['errors'][:5]:
+                        print(f"   - {err}")
+                    if len(results['errors']) > 5:
+                        print(f"   ... and {len(results['errors']) - 5} more")
+                        
+            else:
+                print(f"Unknown historical action: {action}")
+                print("Usage: ml historical [status|date|range|fill|load|kite]")
+                
+        except ValueError as e:
+            print(f"\n[ERROR] Invalid date format. Use YYYY-MM-DD")
+        except Exception as e:
+            print(f"\n[ERROR] {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _ml_backfill(self, days: int = 30):
+        """Backfill historical data for the last N days."""
+        try:
+            from ml.historical_data_collector import get_historical_collector
+            from datetime import date, timedelta
+            
+            collector = get_historical_collector()
+            
+            end_date = date.today() - timedelta(days=1)  # Yesterday
+            start_date = end_date - timedelta(days=days)
+            
+            print(f"\n" + "="*60)
+            print(f"BACKFILLING HISTORICAL DATA")
+            print(f"="*60)
+            print(f"\nDate Range: {start_date} to {end_date} ({days} days)")
+            print(f"Symbols: {', '.join(collector.symbols)}")
+            print("\nDownloading from NSE archives and calculating IV/Greeks...")
+            print("This may take several minutes. Please wait...\n")
+            
+            results = collector.collect_date_range(start_date, end_date)
+            
+            print(f"\n{'='*60}")
+            print(f"BACKFILL COMPLETE")
+            print(f"{'='*60}")
+            print(f"\n[SUMMARY]")
+            print(f"   Total Trading Days: {results['total_dates']}")
+            print(f"   Days Processed: {results['processed_dates']}")
+            print(f"   Days Skipped (already exists): {results['skipped_dates']}")
+            print(f"   Total Snapshots Created: {results['total_collected']}")
+            print(f"   Errors: {results['total_errors']}")
+            
+            # Show current status
+            status = collector.get_collection_status()
+            print(f"\n[DATABASE NOW]")
+            print(f"   Total Historical: {status.get('historical_snapshots', 0)}")
+            print(f"   Total Live: {status.get('live_snapshots', 0)}")
+            print(f"   Grand Total: {status.get('total_snapshots', 0)}")
+            
+            if results['total_collected'] >= 50:
+                print(f"\n[NEXT STEP] Run 'ml label' to label data, then 'ml train-best' to train model")
+            
+        except Exception as e:
+            print(f"\n[ERROR] {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def do_bhavcopy(self, arg):
+        """
+        Download NSE bhavcopy data using jugaad-data library.
+        
+        Usage:
+            bhavcopy download DAYS    - Download last N days of bhavcopy data
+            bhavcopy status           - Show downloaded data status
+            bhavcopy date YYYY-MM-DD  - Download for a specific date
+            bhavcopy range START END  - Download for date range
+            
+        Examples:
+            bhavcopy download 30      - Download last 30 days
+            bhavcopy date 2025-12-01  - Download for Dec 1, 2025
+            bhavcopy range 2025-11-01 2025-11-30
+        """
+        args = arg.strip().split()
+        
+        if not args:
+            print("Usage: bhavcopy <download|status|date|range> [args]")
+            return
+        
+        cmd = args[0].lower()
+        
+        try:
+            from data.nse_bhavcopy import get_bhavcopy_collector, JUGAAD_AVAILABLE
+            from datetime import date, timedelta
+            import pandas as pd
+            
+            if not JUGAAD_AVAILABLE:
+                print("\n[ERROR] jugaad-data not installed!")
+                print("Run: pip install jugaad-data")
+                return
+            
+            collector = get_bhavcopy_collector()
+            
+            if cmd == "status":
+                print("\n" + "="*60)
+                print("BHAVCOPY DATA STATUS")
+                print("="*60)
+                
+                # Count downloaded files
+                equity_count = len(list(collector.equity_dir.glob("*.csv")))
+                fo_count = len(list(collector.fo_dir.glob("*.csv")))
+                
+                print(f"\n[DOWNLOADED FILES]")
+                print(f"   Equity bhavcopy: {equity_count} files")
+                print(f"   F&O bhavcopy:    {fo_count} files")
+                print(f"   Directory: {collector.download_dir}")
+                
+                if collector.downloaded_dates:
+                    dates_list = sorted(collector.downloaded_dates)
+                    print(f"\n[DATE RANGE]")
+                    print(f"   Earliest: {dates_list[0]}")
+                    print(f"   Latest:   {dates_list[-1]}")
+                    print(f"   Total dates: {len(dates_list)}")
+                
+            elif cmd == "download":
+                days = int(args[1]) if len(args) > 1 else 30
+                
+                end_date = date.today() - timedelta(days=1)
+                start_date = end_date - timedelta(days=days)
+                
+                print(f"\n{'='*60}")
+                print(f"DOWNLOADING BHAVCOPY DATA")
+                print(f"{'='*60}")
+                print(f"\nDate range: {start_date} to {end_date}")
+                print(f"This will download F&O bhavcopy files...")
+                print(f"Holidays will be skipped automatically.\n")
+                
+                results = collector.download_historical(start_date, end_date)
+                
+                print(f"\n{'='*60}")
+                print(f"DOWNLOAD COMPLETE")
+                print(f"{'='*60}")
+                print(f"   Equity downloaded: {results.get('equity_success', 0)}")
+                print(f"   F&O downloaded:    {results.get('fo_success', 0)}")
+                print(f"   Skipped (cached):  {results.get('skipped', 0)}")
+                print(f"   Failed:            {results.get('failed', 0)}")
+                
+            elif cmd == "date":
+                if len(args) < 2:
+                    print("Usage: bhavcopy date YYYY-MM-DD")
+                    return
+                
+                target_date = date.fromisoformat(args[1])
+                print(f"\nDownloading bhavcopy for {target_date}...")
+                
+                results = collector.download_historical(target_date, target_date)
+                
+                if results.get('fo_success', 0) > 0:
+                    print(f"✅ Successfully downloaded F&O bhavcopy for {target_date}")
+                else:
+                    print(f"❌ Could not download for {target_date} (holiday or NSE blocking)")
+                    
+            elif cmd == "range":
+                if len(args) < 3:
+                    print("Usage: bhavcopy range START_DATE END_DATE")
+                    print("Example: bhavcopy range 2025-11-01 2025-11-30")
+                    return
+                
+                start_date = date.fromisoformat(args[1])
+                end_date = date.fromisoformat(args[2])
+                
+                print(f"\n{'='*60}")
+                print(f"DOWNLOADING BHAVCOPY DATA")
+                print(f"{'='*60}")
+                print(f"\nDate range: {start_date} to {end_date}")
+                print(f"This may take a while...\n")
+                
+                results = collector.download_historical(start_date, end_date)
+                
+                print(f"\n{'='*60}")
+                print(f"DOWNLOAD COMPLETE")
+                print(f"{'='*60}")
+                print(f"   Equity downloaded: {results.get('equity_success', 0)}")
+                print(f"   F&O downloaded:    {results.get('fo_success', 0)}")
+                print(f"   Skipped (cached):  {results.get('skipped', 0)}")
+                print(f"   Failed:            {results.get('failed', 0)}")
+                
+            else:
+                print(f"Unknown command: {cmd}")
+                print("Usage: bhavcopy <download|status|date|range> [args]")
+                
+        except ImportError as e:
+            print(f"\n[ERROR] Could not import bhavcopy module: {e}")
+            print("Run: pip install jugaad-data")
+        except ValueError as e:
+            print(f"\n[ERROR] Invalid date format: {e}")
+            print("Use YYYY-MM-DD format (e.g., 2025-12-01)")
+        except Exception as e:
+            print(f"\n[ERROR] {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _ml_train_full(self, args: list):
+        """Train all symbols using NSE bhavcopy historical data with 59 features."""
+        try:
+            from ml.full_pipeline import FullPipelineTrainer
+            from datetime import date
+            
+            print("\n" + "="*60)
+            print("FULL TRAINING PIPELINE (NSE Bhavcopy)")
+            print("="*60)
+            
+            # Parse optional date arguments
+            if len(args) >= 2:
+                start_date = date.fromisoformat(args[0])
+                end_date = date.fromisoformat(args[1])
+            else:
+                # Default: Jan-May 2024 (known available in archives)
+                start_date = date(2024, 1, 1)
+                end_date = date(2024, 5, 31)
+            
+            print(f"\nDate Range: {start_date} to {end_date}")
+            print("This downloads NSE bhavcopy data and trains per-symbol models.")
+            print("\nFeatures include:")
+            print("   - OHLCV, Futures OI")
+            print("   - Options OI (calls/puts), PCR")
+            print("   - ATM/OTM analysis, Max Pain")
+            print("   - Technical indicators (RSI, MACD, BB)")
+            print("   - Greek proxies (IV, Delta, Gamma, Theta, Vega)")
+            print("\nStarting training pipeline...\n")
+            
+            trainer = FullPipelineTrainer()
+            results = trainer.run_full_pipeline(
+                start_date=start_date,
+                end_date=end_date,
+                force_download="--force" in args or "-f" in args
+            )
+            
+            if results:
+                print("\n" + "="*60)
+                print("TRAINING COMPLETE!")
+                print("="*60)
+                print(f"Models trained: {len(results)}")
+                
+                import numpy as np
+                avg_acc = np.mean([r["metrics"]["accuracy"] for r in results.values()])
+                avg_f1 = np.mean([r["metrics"]["f1"] for r in results.values()])
+                
+                print(f"Average Accuracy: {avg_acc:.1%}")
+                print(f"Average F1 Score: {avg_f1:.1%}")
+                
+                print("\nModels saved to: data/ml_models/")
+                print("Use 'ml models' to see trained model details.")
+            else:
+                print("\n[ERROR] Training failed. Check logs for details.")
+                
+        except Exception as e:
+            print(f"\n[ERROR] {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _ml_train_monthly(self, force: bool = False):
+        """Run monthly update pipeline - download new data and retrain."""
+        try:
+            from ml.full_pipeline import MonthlyUpdatePipeline
+            
+            print("\n" + "="*60)
+            print("MONTHLY UPDATE PIPELINE")
+            print("="*60)
+            
+            pipeline = MonthlyUpdatePipeline()
+            needs_update, start, end = pipeline.check_update_needed()
+            
+            if not needs_update and not force:
+                print("\nNo update needed. Models are up to date.")
+                print(f"Last update date: {pipeline.get_last_update_date()}")
+                print("\nUse '--force' or '-f' to force retrain.")
+                return
+            
+            if force:
+                print("\nForcing full retrain...")
+            else:
+                print(f"\nUpdating with data from {start} to {end}...")
+            
+            results = pipeline.run_monthly_update(force=force)
+            
+            if results:
+                print("\n[SUCCESS] Monthly update complete!")
+                print(f"Models updated: {len(results)}")
+            else:
+                print("\n[INFO] No new data available or update not needed.")
+                
+        except Exception as e:
+            print(f"\n[ERROR] {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _ml_models(self):
+        """Show trained per-symbol models and their metrics."""
+        try:
+            from ml.historical_predictor import HistoricalModelPredictor
+            from pathlib import Path
+            import json
+            
+            print("\n" + "="*60)
+            print("TRAINED SYMBOL MODELS")
+            print("="*60)
+            
+            predictor = HistoricalModelPredictor()
+            symbols = predictor.get_available_symbols()
+            
+            if not symbols:
+                print("\nNo trained models found.")
+                print("Run 'ml train-full' to train models from NSE bhavcopy data.")
+                return
+            
+            print(f"\nLoaded {len(symbols)} symbol models:")
+            print("-"*50)
+            print(f"{'Symbol':<12} | {'Accuracy':<10} | {'F1 Score':<10} | {'Samples':<8}")
+            print("-"*50)
+            
+            for symbol in symbols:
+                metrics = predictor.get_model_metrics(symbol)
+                if metrics:
+                    model_data = predictor.models.get(symbol, {})
+                    n_samples = model_data.get("n_samples", "?")
+                    print(f"{symbol:<12} | {metrics.get('accuracy', 0):>8.1%} | {metrics.get('f1', 0):>8.1%} | {n_samples:>8}")
+            
+            print("-"*50)
+            
+            # Show feature count
+            if predictor.feature_names:
+                print(f"\nFeatures: {len(predictor.feature_names)}")
+                print("Top features include: iv_proxy, pcr_oi, delta_proxy, rsi, macd")
+            
+            # Show latest training summary
+            model_dir = Path("data/ml_models")
+            summaries = list(model_dir.glob("training_summary_*.json"))
+            if summaries:
+                latest = max(summaries, key=lambda p: p.stat().st_mtime)
+                with open(latest) as f:
+                    summary = json.load(f)
+                
+                date_range = summary.get("date_range", [])
+                print(f"\nTraining Data: {date_range[0]} to {date_range[1]}" if len(date_range) == 2 else "")
+                print(f"Training Time: {summary.get('timestamp', 'unknown')}")
+            
+            print("\nCommands:")
+            print("   ml train-full [START END]  - Train all symbols")
+            print("   ml train-monthly           - Monthly update pipeline")
+                
+        except Exception as e:
+            print(f"\n[ERROR] {e}")
             import traceback
             traceback.print_exc()
     

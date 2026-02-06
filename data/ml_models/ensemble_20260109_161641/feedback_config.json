@@ -1,11 +1,11 @@
 {
-  "class_weights": {
-    "0": 1.0251220819445823,
-    "1": 0.9748779180554179
-  },
-  "confidence_adjustment": 0.3,
-  "feedback_based": true,
-  "training_trades": 39,
-  "training_win_rate": 0.20512820512820512,
-  "training_pnl": -15194.12855633051
+    "class_weights":  {
+                          "0":  1.0251220819445823,
+                          "1":  0.9748779180554179
+                      },
+    "confidence_adjustment":  1,
+    "feedback_based":  true,
+    "training_trades":  39,
+    "training_win_rate":  0.20512820512820512,
+    "training_pnl":  -15194.12855633051
 }

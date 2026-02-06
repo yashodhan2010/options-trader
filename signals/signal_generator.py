@@ -166,19 +166,16 @@ class SignalGenerator:
                 oi_data = data_fetcher.get_oi_data(underlying)
                 volatility = data_fetcher.get_volatility_metrics(underlying)
                 historical = data_fetcher.get_historical_analysis(underlying, days=30)
-                
-                market_data = {
-                    "oi_data": oi_data,
-                    "volatility": volatility,
-                    "historical": historical,
-                }
+                options_chain = data_fetcher.get_options_chain(underlying)
                 
                 # Extract features
                 features = self._feature_engineer.extract_features(
-                    spot_price=spot,
-                    market_data=market_data,
                     underlying=underlying,
-                    strategy_type=signal.strategy_type.value
+                    spot_price=spot,
+                    historical_data=historical.get("df") if isinstance(historical, dict) else historical,
+                    options_chain=options_chain,
+                    oi_analysis=oi_data,
+                    volatility_data=volatility,
                 )
                 
                 # Get ML prediction with guardrails
@@ -197,23 +194,18 @@ class SignalGenerator:
                 enhanced_signal = StrategySignal(
                     underlying=signal.underlying,
                     strategy_type=signal.strategy_type,
-                    direction=signal.direction,
-                    confidence=blended_confidence,
                     legs=signal.legs,
-                    entry_conditions=signal.entry_conditions,
-                    metrics=signal.metrics,
-                    rationale=signal.rationale + f" [ML: {prediction.confidence:.1%}, blend: {blended_confidence:.1%}]",
-                    greeks=signal.greeks,
-                    target_exit=signal.target_exit,
-                    stop_loss=signal.stop_loss,
-                    expected_pnl=signal.expected_pnl,
+                    entry_time=signal.entry_time,
+                    confidence=blended_confidence,
+                    expected_profit=signal.expected_profit,
                     max_loss=signal.max_loss,
-                    breakeven=signal.breakeven,
+                    stop_loss=signal.stop_loss,
+                    target=signal.target,
+                    rationale=signal.rationale + f" [ML: {prediction.confidence:.1%}, blend: {blended_confidence:.1%}]",
+                    metrics=signal.metrics.copy() if signal.metrics else {},
                 )
                 
                 # Store ML metadata in metrics
-                if enhanced_signal.metrics is None:
-                    enhanced_signal.metrics = {}
                 enhanced_signal.metrics["ml_confidence"] = prediction.confidence
                 enhanced_signal.metrics["ml_direction"] = prediction.direction
                 enhanced_signal.metrics["ml_model_version"] = prediction.model_version

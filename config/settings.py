@@ -50,6 +50,14 @@ MARKET_HOURS = {
     "trading_end": "15:15",             # Stop taking new positions (15 min before close)
     "market_close": "15:30",            # NSE market close time
     
+    # Aliases for backwards compatibility
+    "start": "09:15",                   # Alias for market_open
+    "end": "15:30",                     # Alias for market_close
+    "pre_open_start": "09:00",          # Pre-open session start
+    "pre_open_end": "09:08",            # Pre-open session end
+    "no_trade_before": "09:20",         # Avoid first 5 minutes
+    "no_trade_after": "15:15",          # Avoid last 15 minutes
+    
     # Auto-exit settings
     "auto_exit_after_close": True,      # Automatically exit bot after market closes
     "auto_exit_buffer_minutes": 5,      # Minutes after market_close to exit (15:30 + 5 = 15:35)
@@ -129,6 +137,7 @@ UNDERLYING_ASSETS = {
         "lot_size": 25,
         "tick_size": 0.05,
         "expiry_day": "Thursday",  # Weekly expiry
+        "instrument_token": 256265,  # NSE NIFTY 50 index token
     },
     "BANKNIFTY": {
         "symbol": "NIFTY BANK",
@@ -136,6 +145,7 @@ UNDERLYING_ASSETS = {
         "lot_size": 15,
         "tick_size": 0.05,
         "expiry_day": "Wednesday",  # Weekly expiry
+        "instrument_token": 260105,  # NSE NIFTY BANK index token
     },
     "FINNIFTY": {
         "symbol": "NIFTY FIN SERVICE",
@@ -143,6 +153,7 @@ UNDERLYING_ASSETS = {
         "lot_size": 25,
         "tick_size": 0.05,
         "expiry_day": "Tuesday",
+        "instrument_token": 257801,  # NSE NIFTY FIN SERVICE index token
     },
 }
 
@@ -177,16 +188,6 @@ STRATEGY_CONFIG = {
     "max_days_to_expiry": 30,
     "strike_selection_mode": "atm",  # atm, otm, itm
     "otm_offset": 1,  # Number of strikes OTM
-}
-
-# Market Hours
-MARKET_HOURS = {
-    "start": "09:15",
-    "end": "15:30",
-    "pre_open_start": "09:00",
-    "pre_open_end": "09:08",
-    "no_trade_before": "09:20",  # Avoid first 5 minutes
-    "no_trade_after": "15:15",  # Avoid last 15 minutes
 }
 
 # Logging Configuration
@@ -236,7 +237,7 @@ ML_CONFIG = {
     
     # Confidence blending
     "confidence_weight": 0.5,           # Weight of ML vs rule-based (0.5 = equal)
-    "min_confidence_for_trade": 0.55,   # Minimum blended confidence to take trade
+    "min_confidence_for_trade": 0.50,   # Minimum blended confidence to take trade (lowered for testing)
     
     # Model training
     "model_type": "ensemble",           # 'xgboost', 'lightgbm', 'rf', 'ensemble'

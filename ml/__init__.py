@@ -33,6 +33,17 @@ from ml.paper_trading_runner import get_paper_trading_runner
 from ml.mlflow_tracker import get_mlflow_tracker
 from ml.evaluator import TradingEvaluator, ModelComparator, TradingMetrics
 from ml.auto_retrain import AutoRetrainer, get_auto_retrainer
+from ml.live_feature_collector import LiveFeatureCollector, get_collector as get_live_collector
+from ml.historical_data_collector import HistoricalDataCollector, get_historical_collector
+from ml.full_pipeline import FullPipelineTrainer, MonthlyUpdatePipeline, GreeksCalculator
+from ml.historical_predictor import HistoricalModelPredictor, get_historical_predictor
+from ml.unified_features import (
+    UnifiedFeatureDefinition,
+    HistoricalFeatureAdapter,
+    LiveFeatureAdapter,
+    get_unified_feature_names,
+    get_unified_feature_count
+)
 
 __all__ = [
     # Classes
@@ -43,6 +54,15 @@ __all__ = [
     "ModelComparator",
     "TradingMetrics",
     "AutoRetrainer",
+    "LiveFeatureCollector",
+    "HistoricalDataCollector",
+    "FullPipelineTrainer",
+    "MonthlyUpdatePipeline",
+    "GreeksCalculator",
+    "HistoricalModelPredictor",
+    "UnifiedFeatureDefinition",
+    "HistoricalFeatureAdapter",
+    "LiveFeatureAdapter",
     # Singleton getters
     "get_feature_engineer",
     "get_predictor",
@@ -54,4 +74,9 @@ __all__ = [
     "get_paper_trading_runner",
     "get_mlflow_tracker",
     "get_auto_retrainer",
+    "get_live_collector",
+    "get_historical_collector",
+    "get_historical_predictor",
+    "get_unified_feature_names",
+    "get_unified_feature_count",
 ]
