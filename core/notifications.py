@@ -11,12 +11,18 @@ from core.logger import logger
 class NotificationService:
     """
     Service for sending notifications via various channels.
+    Supports: Telegram, WhatsApp (via CallMeBot)
     """
     
     def __init__(self):
         self.telegram_enabled = NOTIFICATION_CONFIG.get("telegram_enabled", False)
         self.telegram_token = NOTIFICATION_CONFIG.get("telegram_bot_token", "")
         self.telegram_chat_id = NOTIFICATION_CONFIG.get("telegram_chat_id", "")
+        
+        # WhatsApp via CallMeBot
+        self.whatsapp_enabled = NOTIFICATION_CONFIG.get("whatsapp_enabled", False)
+        self.whatsapp_phone = NOTIFICATION_CONFIG.get("whatsapp_phone", "")
+        self.whatsapp_apikey = NOTIFICATION_CONFIG.get("whatsapp_apikey", "")
     
     def send_telegram(self, message: str, parse_mode: str = "HTML") -> bool:
         """
@@ -58,6 +64,59 @@ class NotificationService:
             logger.error(f"Failed to send Telegram notification: {e}")
             return False
     
+    def send_whatsapp(self, message: str) -> bool:
+        """
+        Send a WhatsApp notification via CallMeBot.
+        
+        Setup: Send "I allow callmebot to send me messages" to +34 644 59 71 67
+        on WhatsApp. You'll receive your API key.
+        
+        Args:
+            message: Message to send (plain text, no HTML)
+            
+        Returns:
+            True if successful
+        """
+        if not self.whatsapp_enabled:
+            logger.debug("WhatsApp notifications disabled")
+            return False
+        
+        if not self.whatsapp_phone or not self.whatsapp_apikey:
+            logger.warning("WhatsApp not configured properly (need phone + apikey)")
+            return False
+        
+        try:
+            import urllib.parse
+            encoded_msg = urllib.parse.quote_plus(message)
+            url = (
+                f"https://api.callmebot.com/whatsapp.php"
+                f"?phone={self.whatsapp_phone}"
+                f"&text={encoded_msg}"
+                f"&apikey={self.whatsapp_apikey}"
+            )
+            
+            response = requests.get(url, timeout=15)
+            
+            if response.status_code == 200:
+                logger.debug("WhatsApp notification sent")
+                return True
+            else:
+                logger.error(f"WhatsApp error ({response.status_code}): {response.text[:200]}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Failed to send WhatsApp notification: {e}")
+            return False
+    
+    def _strip_html(self, message: str) -> str:
+        """Strip HTML tags from message for WhatsApp (plain text only)."""
+        import re
+        # Replace <b>text</b> with *text* (WhatsApp bold)
+        text = re.sub(r'<b>(.*?)</b>', r'*\1*', message)
+        # Remove any remaining HTML tags
+        text = re.sub(r'<[^>]+>', '', text)
+        return text.strip()
+    
     def send_trade_alert(
         self,
         action: str,
@@ -98,6 +157,7 @@ class NotificationService:
             message += f"\n{pnl_emoji} <b>P&L:</b> ₹{pnl:,.2f}"
         
         self.send_telegram(message)
+        self.send_whatsapp(self._strip_html(message))
     
     def send_daily_summary(
         self,
@@ -132,6 +192,7 @@ class NotificationService:
 """
         
         self.send_telegram(message)
+        self.send_whatsapp(self._strip_html(message))
     
     def send_signal_alert(
         self,
@@ -159,6 +220,7 @@ class NotificationService:
 """
         
         self.send_telegram(message)
+        self.send_whatsapp(self._strip_html(message))
 
 
 # Singleton instance

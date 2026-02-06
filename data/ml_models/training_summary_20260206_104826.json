@@ -1,0 +1,149 @@
+{
+  "timestamp": "20260206_104826",
+  "data_sources": [
+    "historical_bhavcopy_2024",
+    "live_snapshots_2025-2026"
+  ],
+  "symbols": [
+    "AXISBANK",
+    "BANKNIFTY",
+    "HDFCBANK",
+    "IDFCFIRSTB",
+    "NIFTY",
+    "RELIANCE",
+    "SBIN"
+  ],
+  "metrics": {
+    "AXISBANK": {
+      "accuracy": 0.25,
+      "precision": 0.03225806451612903,
+      "recall": 1.0,
+      "f1": 0.0625
+    },
+    "BANKNIFTY": {
+      "accuracy": 0.35,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0
+    },
+    "HDFCBANK": {
+      "accuracy": 1.0,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0
+    },
+    "IDFCFIRSTB": {
+      "accuracy": 0.775,
+      "precision": 0.7692307692307693,
+      "recall": 1.0,
+      "f1": 0.8695652173913043
+    },
+    "NIFTY": {
+      "accuracy": 0.25,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0
+    },
+    "RELIANCE": {
+      "accuracy": 0.975,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0
+    },
+    "SBIN": {
+      "accuracy": 0.926829268292683,
+      "precision": 0.75,
+      "recall": 1.0,
+      "f1": 0.8571428571428571
+    }
+  },
+  "sample_counts": {
+    "AXISBANK": {
+      "historical": 100,
+      "live": 145,
+      "total": 245
+    },
+    "BANKNIFTY": {
+      "historical": 100,
+      "live": 143,
+      "total": 243
+    },
+    "HDFCBANK": {
+      "historical": 100,
+      "live": 143,
+      "total": 243
+    },
+    "IDFCFIRSTB": {
+      "historical": 100,
+      "live": 144,
+      "total": 244
+    },
+    "NIFTY": {
+      "historical": 100,
+      "live": 145,
+      "total": 245
+    },
+    "RELIANCE": {
+      "historical": 100,
+      "live": 145,
+      "total": 245
+    },
+    "SBIN": {
+      "historical": 100,
+      "live": 146,
+      "total": 246
+    }
+  },
+  "feature_names": [
+    "return_1d",
+    "return_5d",
+    "return_10d",
+    "return_20d",
+    "intraday_range_pct",
+    "close_to_high_pct",
+    "gap_pct",
+    "price_vs_sma20",
+    "price_vs_sma50",
+    "log_return",
+    "rsi_14",
+    "rsi_signal",
+    "macd",
+    "macd_signal",
+    "macd_histogram",
+    "bb_position",
+    "bb_width",
+    "sma_crossover_5_20",
+    "ema_crossover_9_21",
+    "stochastic_k",
+    "stochastic_d",
+    "atr_pct",
+    "iv_current",
+    "iv_percentile",
+    "iv_rank",
+    "delta_proxy",
+    "gamma_proxy",
+    "theta_proxy",
+    "vega_proxy",
+    "iv_hv_ratio",
+    "pcr",
+    "pcr_ma5",
+    "pcr_change",
+    "max_pain_distance_pct",
+    "call_oi_change_pct",
+    "put_oi_change_pct",
+    "oi_buildup_signal",
+    "atm_pcr",
+    "hv_10",
+    "hv_20",
+    "hv_ratio",
+    "volatility_regime",
+    "volatility_trend",
+    "range_volatility",
+    "momentum_5d",
+    "momentum_10d",
+    "trend_strength",
+    "price_acceleration",
+    "volume_trend",
+    "oi_trend"
+  ]
+}

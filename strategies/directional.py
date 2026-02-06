@@ -96,8 +96,8 @@ class LongCallStrategy(BaseStrategy):
         
         # Calculate SL and target
         entry_price = option["ltp"] * quantity
-        stop_loss = self.calculate_stop_loss(entry_price)
-        target = self.calculate_target(entry_price)
+        stop_loss = self.calculate_stop_loss(entry_price, iv_regime=iv_regime)
+        target = self.calculate_target(entry_price, iv_regime=iv_regime)
         
         # Create signal
         signal = StrategySignal(
@@ -203,13 +203,25 @@ class LongCallStrategy(BaseStrategy):
         return " | ".join(parts)
     
     def calculate_stop_loss(self, entry_price: float, **kwargs) -> float:
-        """Calculate stop loss as percentage of premium."""
-        sl_percent = TRADING_CONFIG.get("default_sl_percent", 30)
+        """Calculate stop loss based on IV regime - tighter in low IV, wider in high IV."""
+        iv_regime = kwargs.get("iv_regime", "NORMAL")
+        if iv_regime in ["HIGH_IV", "IV_ELEVATED"]:
+            sl_percent = 40  # Wider SL in high IV (more noise)
+        elif iv_regime in ["LOW_IV", "IV_DEPRESSED"]:
+            sl_percent = 25  # Tighter SL in low IV (less noise)
+        else:
+            sl_percent = TRADING_CONFIG.get("default_sl_percent", 30)
         return entry_price * (sl_percent / 100)
     
     def calculate_target(self, entry_price: float, **kwargs) -> float:
-        """Calculate target as percentage of premium."""
-        target_percent = TRADING_CONFIG.get("default_target_percent", 50)
+        """Calculate target based on IV regime - higher targets when IV is low (vol expansion expected)."""
+        iv_regime = kwargs.get("iv_regime", "NORMAL")
+        if iv_regime in ["LOW_IV", "IV_DEPRESSED"]:
+            target_percent = 60  # Higher target when vol expansion expected
+        elif iv_regime in ["HIGH_IV", "IV_ELEVATED"]:
+            target_percent = 35  # Lower target in high IV (premium already inflated)
+        else:
+            target_percent = TRADING_CONFIG.get("default_target_percent", 50)
         return entry_price * (target_percent / 100)
 
 
@@ -283,8 +295,8 @@ class LongPutStrategy(BaseStrategy):
         )
         
         entry_price = option["ltp"] * quantity
-        stop_loss = self.calculate_stop_loss(entry_price)
-        target = self.calculate_target(entry_price)
+        stop_loss = self.calculate_stop_loss(entry_price, iv_regime=iv_regime)
+        target = self.calculate_target(entry_price, iv_regime=iv_regime)
         
         signal = StrategySignal(
             strategy_type=self.strategy_type,
@@ -330,11 +342,25 @@ class LongPutStrategy(BaseStrategy):
         return min(confidence, 1.0)
     
     def calculate_stop_loss(self, entry_price: float, **kwargs) -> float:
-        sl_percent = TRADING_CONFIG.get("default_sl_percent", 30)
+        """Calculate stop loss based on IV regime."""
+        iv_regime = kwargs.get("iv_regime", "NORMAL")
+        if iv_regime in ["HIGH_IV", "IV_ELEVATED"]:
+            sl_percent = 40
+        elif iv_regime in ["LOW_IV", "IV_DEPRESSED"]:
+            sl_percent = 25
+        else:
+            sl_percent = TRADING_CONFIG.get("default_sl_percent", 30)
         return entry_price * (sl_percent / 100)
     
     def calculate_target(self, entry_price: float, **kwargs) -> float:
-        target_percent = TRADING_CONFIG.get("default_target_percent", 50)
+        """Calculate target based on IV regime."""
+        iv_regime = kwargs.get("iv_regime", "NORMAL")
+        if iv_regime in ["LOW_IV", "IV_DEPRESSED"]:
+            target_percent = 60
+        elif iv_regime in ["HIGH_IV", "IV_ELEVATED"]:
+            target_percent = 35
+        else:
+            target_percent = TRADING_CONFIG.get("default_target_percent", 50)
         return entry_price * (target_percent / 100)
 
 

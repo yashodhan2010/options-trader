@@ -144,10 +144,17 @@ class OptionsTradingBot:
         trade_logger.info("")
 
     def _send_notification(self, message: str) -> None:
-        """Send notification via configured channels."""
+        """Send notification via configured channels (Telegram, WhatsApp)."""
+        from core.notifications import notification_service
+        
+        # Send via WhatsApp
+        if NOTIFICATION_CONFIG.get("whatsapp_enabled"):
+            notification_service.send_whatsapp(message)
+        
+        # Send via Telegram
         if NOTIFICATION_CONFIG.get("telegram_enabled"):
-            # TODO: Implement Telegram notification
-            pass
+            notification_service.send_telegram(message)
+        
         logger.info(f"[NOTIFICATION] {message}")
     
     def login(self) -> bool:
@@ -218,6 +225,9 @@ class OptionsTradingBot:
         
         # Start auto-retrain monitor if enabled
         self._start_auto_retrain_monitor()
+        
+        # Start live ML feature collection (background thread)
+        self._start_live_feature_collection()
         
         # Start position tracker (WebSocket or polling mode)
         # Pass paper_trading flag to bypass market hour checks
@@ -377,6 +387,16 @@ class OptionsTradingBot:
             logger.warning(f"   [!] Max positions ({max_positions}) reached - skipping signal generation")
             return
         
+        # Get underlyings that already have active positions (for deduplication)
+        active_underlyings = set()
+        for pos in order_manager.get_active_positions():
+            underlying = getattr(pos, 'underlying', None) or pos.get('underlying', None) if isinstance(pos, dict) else None
+            if underlying:
+                active_underlyings.add(underlying)
+        
+        if active_underlyings:
+            logger.info(f"   [DEDUP] Active positions on: {', '.join(active_underlyings)}")
+        
         # Generate signals
         logger.info(f"   [SCAN] Generating signals for: {', '.join(self.underlyings)}")
         signals = signal_generator.generate_signals()
@@ -411,6 +431,11 @@ class OptionsTradingBot:
             
             # Check all signals and execute the first one that meets criteria
             for signal in signals:
+                # Position deduplication: skip if we already have a position on this underlying
+                if signal.underlying in active_underlyings:
+                    logger.info(f"   [DEDUP] Skipping {signal.strategy_type.value} on {signal.underlying} - already have active position")
+                    continue
+                
                 if self._meets_auto_trade_criteria(signal):
                     logger.info(f"   [EXECUTE] Auto-executing signal: {signal.strategy_type.value}")
                     execution = order_manager.execute_signal(signal)
@@ -498,9 +523,11 @@ class OptionsTradingBot:
             StrategyType.SHORT_CALL,
             StrategyType.SHORT_PUT,
             StrategyType.IRON_CONDOR,
+            StrategyType.BEAR_CALL_SPREAD,
+            StrategyType.BULL_PUT_SPREAD,
         ]
         
-        # Spread strategies - balanced approach
+        # Debit spread strategies - balanced approach
         spread_strategies = [
             StrategyType.BULL_CALL_SPREAD,
             StrategyType.BEAR_PUT_SPREAD,
@@ -574,6 +601,30 @@ class OptionsTradingBot:
         except Exception:
             pass
     
+    def _start_live_feature_collection(self) -> None:
+        """Start background live ML feature collection for training data."""
+        try:
+            from ml.live_feature_collector import get_collector
+            
+            collector = get_collector()
+            if not collector.running:
+                collector.start()
+                logger.info("Live ML feature collection started (background)")
+            else:
+                logger.info("Live ML feature collection already running")
+                
+        except Exception as e:
+            logger.warning(f"Could not start live feature collection: {e}")
+    
+    def _stop_live_feature_collection(self) -> None:
+        """Stop live ML feature collection."""
+        try:
+            from ml.live_feature_collector import get_collector
+            collector = get_collector()
+            collector.stop()
+        except Exception:
+            pass
+    
     def stop(self) -> None:
         """Stop the trading bot."""
         logger.info("Stopping bot...")
@@ -581,6 +632,9 @@ class OptionsTradingBot:
         
         # Stop auto-retrain monitor
         self._stop_auto_retrain_monitor()
+        
+        # Stop live feature collection
+        self._stop_live_feature_collection()
         
         # Stop WebSocket
         if self.websocket_manager:

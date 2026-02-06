@@ -28,6 +28,10 @@ def main():
     
     args = parser.parse_args()
     
+    # --paper implies --bot (auto-start in paper mode)
+    if args.paper:
+        args.bot = True
+    
     if args.bot:
         # Start automated bot
         from bot import OptionsTradingBot

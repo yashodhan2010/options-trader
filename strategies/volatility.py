@@ -207,6 +207,12 @@ class StraddleStrategy(BaseStrategy):
     
     def analyze(self, options_chain: pd.DataFrame, metrics: Dict[str, Any]) -> Optional[StrategySignal]:
         """Analyze and generate signal for straddle."""
+        # Straddles require high liquidity - restrict to indices only
+        INDEX_UNDERLYINGS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "NIFTY 50", "NIFTY BANK"]
+        if self.underlying not in INDEX_UNDERLYINGS:
+            logger.debug(f"Straddle skipped for {self.underlying} - index-only strategy")
+            return None
+        
         is_valid, reason = self.validate_conditions(metrics)
         if not is_valid:
             return None
@@ -345,6 +351,12 @@ class StrangleStrategy(BaseStrategy):
     
     def analyze(self, options_chain: pd.DataFrame, metrics: Dict[str, Any]) -> Optional[StrategySignal]:
         """Analyze and generate signal for strangle."""
+        # Strangles require high liquidity - restrict to indices only
+        INDEX_UNDERLYINGS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "NIFTY 50", "NIFTY BANK"]
+        if self.underlying not in INDEX_UNDERLYINGS:
+            logger.debug(f"Strangle skipped for {self.underlying} - index-only strategy")
+            return None
+        
         is_valid, reason = self.validate_conditions(metrics)
         if not is_valid:
             return None

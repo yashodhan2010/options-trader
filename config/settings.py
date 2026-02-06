@@ -44,10 +44,10 @@ TRADING_CONFIG = {
 
 # Market Hours Configuration
 MARKET_HOURS = {
-    # Market opens at 9:15 but we wait for initial volatility to settle
-    "market_open": "09:15",             # NSE market open time
-    "trading_start": "09:30",           # Bot starts trading (after initial volatility)
-    "trading_end": "15:15",             # Stop taking new positions (15 min before close)
+    # Market opens at 9:15 - data collection starts here
+    "market_open": "09:15",             # NSE market open time (data collection active)
+    "trading_start": "11:00",           # Bot starts trading (skip morning volatility noise)
+    "trading_end": "14:00",             # Stop taking new positions (avoid late-day theta)
     "market_close": "15:30",            # NSE market close time
     
     # Aliases for backwards compatibility
@@ -55,8 +55,8 @@ MARKET_HOURS = {
     "end": "15:30",                     # Alias for market_close
     "pre_open_start": "09:00",          # Pre-open session start
     "pre_open_end": "09:08",            # Pre-open session end
-    "no_trade_before": "09:20",         # Avoid first 5 minutes
-    "no_trade_after": "15:15",          # Avoid last 15 minutes
+    "no_trade_before": "11:00",         # No trades before 11 AM (morning noise)
+    "no_trade_after": "14:00",          # No new trades after 2 PM
     
     # Auto-exit settings
     "auto_exit_after_close": True,      # Automatically exit bot after market closes
@@ -72,8 +72,8 @@ MARKET_HOURS = {
     "early_close_days": [],             # Days with early market close
     
     # Initial volatility handling
-    "skip_first_minutes": 15,           # Minutes after open to skip (9:15 + 15 = 9:30)
-    "skip_last_minutes": 15,            # Minutes before close to stop new trades
+    "skip_first_minutes": 105,          # Minutes after open to skip (9:15 + 105 = 11:00)
+    "skip_last_minutes": 90,            # Minutes before close to stop new trades (15:30 - 90 = 14:00)
     
     # Expiry day settings
     "expiry_day_trading": True,         # Trade on expiry days?
@@ -314,6 +314,10 @@ NOTIFICATION_CONFIG = {
     "telegram_enabled": os.getenv("TELEGRAM_ENABLED", "false").lower() == "true",
     "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
     "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
+    # WhatsApp via CallMeBot (free)
+    "whatsapp_enabled": os.getenv("WHATSAPP_ENABLED", "false").lower() == "true",
+    "whatsapp_phone": os.getenv("WHATSAPP_PHONE", ""),
+    "whatsapp_apikey": os.getenv("WHATSAPP_APIKEY", ""),
 }
 
 

@@ -45,19 +45,21 @@ class MLSignalGenerator:
     """
     
     # Direction to strategy mapping based on IV regime
+    # PRIORITY: Credit spreads first (sell premium, time decay in our favor)
+    # Debit strategies only in LOW_IV where premium is cheap to buy
     DIRECTION_STRATEGY_MAP = {
         "BULLISH": {
-            "LOW_IV": [StrategyType.LONG_CALL, StrategyType.BULL_CALL_SPREAD],
-            "NORMAL": [StrategyType.BULL_CALL_SPREAD, StrategyType.BULL_PUT_SPREAD],
+            "LOW_IV": [StrategyType.BULL_PUT_SPREAD, StrategyType.BULL_CALL_SPREAD],
+            "NORMAL": [StrategyType.BULL_PUT_SPREAD, StrategyType.BULL_CALL_SPREAD],
             "HIGH_IV": [StrategyType.BULL_PUT_SPREAD, StrategyType.SHORT_PUT],
         },
         "BEARISH": {
-            "LOW_IV": [StrategyType.LONG_PUT, StrategyType.BEAR_PUT_SPREAD],
-            "NORMAL": [StrategyType.BEAR_PUT_SPREAD, StrategyType.BEAR_CALL_SPREAD],
+            "LOW_IV": [StrategyType.BEAR_CALL_SPREAD, StrategyType.BEAR_PUT_SPREAD],
+            "NORMAL": [StrategyType.BEAR_CALL_SPREAD, StrategyType.BEAR_PUT_SPREAD],
             "HIGH_IV": [StrategyType.BEAR_CALL_SPREAD, StrategyType.SHORT_CALL],
         },
         "NEUTRAL": {
-            "LOW_IV": [StrategyType.STRADDLE, StrategyType.STRANGLE],
+            "LOW_IV": [StrategyType.IRON_CONDOR],
             "NORMAL": [StrategyType.IRON_CONDOR],
             "HIGH_IV": [StrategyType.IRON_CONDOR, StrategyType.SHORT_CALL, StrategyType.SHORT_PUT],
         },
@@ -260,6 +262,13 @@ class MLSignalGenerator:
             )
             return []
         
+        # Trend confirmation: validate ML direction against recent prediction history
+        if not self._confirm_trend(underlying, prediction.direction):
+            logger.info(
+                f"Trend confirmation failed for {underlying} ({prediction.direction}) - skipping"
+            )
+            return []
+        
         # Determine strategy based on ML direction
         if force_strategy:
             strategy_types = [force_strategy]
@@ -294,6 +303,71 @@ class MLSignalGenerator:
                 logger.error(f"Strategy {strategy_type.value} failed: {e}")
         
         return signals
+    
+    def _confirm_trend(self, underlying: str, ml_direction: str) -> bool:
+        """
+        Validate ML prediction against recent feature snapshot labels from the database.
+        Requires 60%+ of recent labels to align with the ML direction.
+        
+        Args:
+            underlying: The underlying asset
+            ml_direction: ML predicted direction (BULLISH/BEARISH/NEUTRAL)
+            
+        Returns:
+            True if trend is confirmed or no history available
+        """
+        if ml_direction == "NEUTRAL":
+            return True  # Neutral doesn't need trend confirmation
+        
+        try:
+            import sqlite3
+            import os
+            
+            db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "trading_bot.db")
+            if not os.path.exists(db_path):
+                return True  # No DB, skip confirmation
+            
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            
+            # Check if table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ml_feature_snapshots'")
+            if not cursor.fetchone():
+                conn.close()
+                return True
+            
+            # Get recent labels for this underlying (last 5 trading days)
+            cursor.execute("""
+                SELECT label_direction FROM ml_feature_snapshots 
+                WHERE underlying = ? AND label_direction IS NOT NULL AND label_direction != 'NEUTRAL'
+                ORDER BY snapshot_time DESC LIMIT 5
+            """, (underlying,))
+            
+            rows = cursor.fetchall()
+            conn.close()
+            
+            if len(rows) < 3:
+                return True  # Not enough history, allow the trade
+            
+            labels = [r[0] for r in rows]
+            
+            # Map ML direction to expected label
+            expected_label = "UP" if ml_direction == "BULLISH" else "DOWN"
+            
+            # Count alignment
+            aligned = sum(1 for l in labels if l == expected_label)
+            alignment_pct = aligned / len(labels)
+            
+            logger.info(
+                f"Trend confirmation for {underlying}: {aligned}/{len(labels)} recent labels = "
+                f"{expected_label} ({alignment_pct:.0%}), ML says {ml_direction}"
+            )
+            
+            return alignment_pct >= 0.6  # Require 60%+ alignment
+            
+        except Exception as e:
+            logger.warning(f"Trend confirmation check failed: {e}")
+            return True  # On error, allow the trade
     
     def _get_strategies_for_direction(
         self,

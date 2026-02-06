@@ -196,9 +196,9 @@ class BearPutSpreadStrategy(BaseStrategy):
         strike_interval = 50 if self.underlying in ["NIFTY", "FINNIFTY"] else 100
         atm_strike = round(spot / strike_interval) * strike_interval
         
-        # Buy ATM/slightly ITM, Sell OTM
+        # Buy ATM/slightly ITM, Sell 1 strike OTM (tighter spread for better fill & realistic targets)
         buy_strike = atm_strike
-        sell_strike = atm_strike - (2 * strike_interval)
+        sell_strike = atm_strike - strike_interval
         
         buy_option = puts[puts["strike"] == buy_strike]
         sell_option = puts[puts["strike"] == sell_strike]
@@ -341,10 +341,8 @@ class BearCallSpreadStrategy(BaseStrategy):
         if sentiment in ["BULLISH", "STRONGLY_BULLISH"]:
             return None
         
-        # Prefer high IV for selling premium
+        # Credit spreads work in any IV regime - higher IV gives better premiums
         iv_regime = volatility.get("volatility_regime", "NORMAL")
-        if iv_regime in ["LOW_IV", "IV_DEPRESSED"]:
-            return None
         
         calls = options_chain[options_chain["option_type"] == "CE"].sort_values("strike")
         if len(calls) < 2:
@@ -356,8 +354,11 @@ class BearCallSpreadStrategy(BaseStrategy):
         # Use max call OI as resistance - sell at or near this level
         max_call_oi_strike = oi_data.get("max_call_oi_strike", atm_strike + 2 * strike_interval)
         
+        # Ensure sell strike is at least 1 interval OTM for safety
+        min_sell_strike = atm_strike + strike_interval
+        sell_strike = max(max_call_oi_strike, min_sell_strike)
+        
         # SELL lower strike call (at resistance), BUY higher strike call (hedge)
-        sell_strike = max_call_oi_strike
         buy_strike = sell_strike + strike_interval
         
         sell_option = calls[calls["strike"] == sell_strike]
@@ -510,10 +511,8 @@ class BullPutSpreadStrategy(BaseStrategy):
         if sentiment in ["BEARISH", "STRONGLY_BEARISH"]:
             return None
         
-        # Prefer high IV for selling premium
+        # Credit spreads work in any IV regime - higher IV gives better premiums
         iv_regime = volatility.get("volatility_regime", "NORMAL")
-        if iv_regime in ["LOW_IV", "IV_DEPRESSED"]:
-            return None
         
         puts = options_chain[options_chain["option_type"] == "PE"].sort_values("strike")
         if len(puts) < 2:
@@ -525,8 +524,11 @@ class BullPutSpreadStrategy(BaseStrategy):
         # Use max put OI as support - sell at or near this level
         max_put_oi_strike = oi_data.get("max_put_oi_strike", atm_strike - 2 * strike_interval)
         
+        # Ensure sell strike is at least 1 interval OTM for safety
+        max_sell_strike = atm_strike - strike_interval
+        sell_strike = min(max_put_oi_strike, max_sell_strike)
+        
         # SELL higher strike put (at support), BUY lower strike put (hedge)
-        sell_strike = max_put_oi_strike
         buy_strike = sell_strike - strike_interval
         
         sell_option = puts[puts["strike"] == sell_strike]

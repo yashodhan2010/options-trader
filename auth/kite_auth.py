@@ -80,13 +80,34 @@ def connect() -> KiteConnect:
         except Exception as e:
             logger.warning(f"Stored token invalid: {e}")
     
-    # Else require fresh login
+    # Else attempt auto-login first, then fall back to manual
     login_url = get_login_url()
-    print(f"\n{'='*60}")
-    print("🔐 KITE CONNECT LOGIN REQUIRED")
-    print(f"{'='*60}")
-    print(f"\n📎 Click here to log in to Zerodha Kite Connect:\n{login_url}\n")
-    request_token = input("Paste the `request_token` you got after login and hit Enter: ").strip()
+    request_token = None
+    
+    # Try automated login (Selenium + TOTP)
+    try:
+        from auth.auto_login import auto_login, is_auto_login_configured
+        
+        if is_auto_login_configured():
+            logger.info("Attempting automated login...")
+            request_token = auto_login(login_url)
+            
+            if request_token:
+                logger.info("Automated login succeeded!")
+            else:
+                logger.warning("Automated login failed - falling back to manual login")
+        else:
+            logger.info("Auto-login not configured (set KITE_USER_ID, KITE_PASSWORD, KITE_TOTP_SECRET in .env)")
+    except Exception as e:
+        logger.warning(f"Auto-login error: {e} - falling back to manual login")
+    
+    # Fall back to manual login if auto-login didn't work
+    if not request_token:
+        print(f"\n{'='*60}")
+        print("🔐 KITE CONNECT LOGIN REQUIRED")
+        print(f"{'='*60}")
+        print(f"\n📎 Click here to log in to Zerodha Kite Connect:\n{login_url}\n")
+        request_token = input("Paste the `request_token` you got after login and hit Enter: ").strip()
     
     if not request_token:
         raise ValueError("Request token cannot be empty")
