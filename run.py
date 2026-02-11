@@ -36,7 +36,7 @@ def main():
         # Start automated bot
         from bot import OptionsTradingBot
         bot = OptionsTradingBot(paper_trading=args.paper)
-        bot.run()
+        bot.start()
     else:
         # Start interactive CLI
         from cli import TradingCLI

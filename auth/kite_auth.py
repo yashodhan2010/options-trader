@@ -103,10 +103,17 @@ def connect() -> KiteConnect:
     
     # Fall back to manual login if auto-login didn't work
     if not request_token:
+        # Check if running interactively (batch files redirect stdin)
+        import sys
+        if not sys.stdin.isatty():
+            raise RuntimeError(
+                "Auto-login failed and manual login is not available in non-interactive mode. "
+                "Check Chrome/ChromeDriver compatibility or run the bot interactively."
+            )
         print(f"\n{'='*60}")
-        print("🔐 KITE CONNECT LOGIN REQUIRED")
+        print("[LOGIN] KITE CONNECT LOGIN REQUIRED")
         print(f"{'='*60}")
-        print(f"\n📎 Click here to log in to Zerodha Kite Connect:\n{login_url}\n")
+        print(f"\nClick here to log in to Zerodha Kite Connect:\n{login_url}\n")
         request_token = input("Paste the `request_token` you got after login and hit Enter: ").strip()
     
     if not request_token:
