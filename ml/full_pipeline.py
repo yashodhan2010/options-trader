@@ -165,7 +165,7 @@ class FullPipelineTrainer:
     """
     
     # Default symbols (indices + stocks)
-    INDEX_SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
+    INDEX_SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"]
     
     def __init__(
         self,

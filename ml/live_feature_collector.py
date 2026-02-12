@@ -99,7 +99,7 @@ class LiveFeatureCollector:
                         symbols = watchlist.get("underlyings", [])
                     
                     # Add index symbols if not present
-                    for idx in ["NIFTY", "BANKNIFTY"]:
+                    for idx in ["NIFTY", "BANKNIFTY", "SENSEX"]:
                         if idx not in symbols:
                             symbols.append(idx)
                     

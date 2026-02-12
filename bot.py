@@ -398,7 +398,7 @@ class OptionsTradingBot:
             logger.info(f"   [DEDUP] Active positions on: {', '.join(active_underlyings)}")
         
         # Generate signals
-        logger.info(f"   [SCAN] Generating signals for: {', '.join(self.underlyings)}")
+        logger.info(f"   [SCAN] Generating signals for: {', '.join(signal_generator.underlyings)}")
         signals = signal_generator.generate_signals()
         
         if not signals:

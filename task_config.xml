@@ -7,6 +7,7 @@
   </RegistrationInfo>
   <Principals>
     <Principal id="Author">
+      <UserId>LAPTOP-RV3GMHB8\Yashodhan</UserId>
       <LogonType>InteractiveToken</LogonType>
       <RunLevel>HighestAvailable</RunLevel>
     </Principal>

@@ -1200,12 +1200,17 @@ class HistoricalDataCollector:
             try:
                 logger.info(f"Collecting Kite historical data for {symbol}...")
                 
+                # Determine correct exchange for the symbol
+                from config.settings import UNDERLYING_ASSETS
+                asset_cfg = UNDERLYING_ASSETS.get(symbol, {})
+                exchange = asset_cfg.get("exchange", "NSE")
+                
                 # Get historical OHLCV from Kite
                 hist_df = data_fetcher.get_historical_data(
                     symbol=symbol,
                     interval=interval,
                     days=days,
-                    exchange="NSE"
+                    exchange=exchange
                 )
                 
                 if hist_df.empty:

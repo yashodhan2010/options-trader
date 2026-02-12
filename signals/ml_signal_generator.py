@@ -77,8 +77,12 @@ class MLSignalGenerator:
         if underlyings:
             self.underlyings = underlyings
         elif WATCHLIST.get("enabled", False) and WATCHLIST_SYMBOLS:
-            self.underlyings = WATCHLIST_SYMBOLS
-            logger.info(f"Using watchlist: {self.underlyings}")
+            # Merge watchlist stocks with index symbols from UNDERLYING_ASSETS
+            self.underlyings = list(WATCHLIST_SYMBOLS)  # Copy to avoid mutating
+            for idx_symbol in UNDERLYING_ASSETS:
+                if idx_symbol not in self.underlyings:
+                    self.underlyings.append(idx_symbol)
+            logger.info(f"Using watchlist + indices: {self.underlyings}")
         else:
             # Use ML training symbols as default
             self.underlyings = ML_CONFIG.get("training_symbols", list(UNDERLYING_ASSETS.keys()))

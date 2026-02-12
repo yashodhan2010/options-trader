@@ -46,8 +46,8 @@ TRADING_CONFIG = {
 MARKET_HOURS = {
     # Market opens at 9:15 - data collection starts here
     "market_open": "09:15",             # NSE market open time (data collection active)
-    "trading_start": "11:00",           # Bot starts trading (skip morning volatility noise)
-    "trading_end": "14:00",             # Stop taking new positions (avoid late-day theta)
+    "trading_start": "10:00",           # Bot starts trading (skip morning volatility noise)
+    "trading_end": "15:00",             # Stop taking new positions (avoid late-day theta)
     "market_close": "15:30",            # NSE market close time
     
     # Aliases for backwards compatibility
@@ -134,26 +134,42 @@ UNDERLYING_ASSETS = {
     "NIFTY": {
         "symbol": "NIFTY 50",
         "exchange": "NSE",
+        "options_exchange": "NFO",  # NSE F&O
         "lot_size": 25,
         "tick_size": 0.05,
+        "strike_interval": 50,
         "expiry_day": "Thursday",  # Weekly expiry
         "instrument_token": 256265,  # NSE NIFTY 50 index token
     },
     "BANKNIFTY": {
         "symbol": "NIFTY BANK",
         "exchange": "NSE",
+        "options_exchange": "NFO",  # NSE F&O
         "lot_size": 15,
         "tick_size": 0.05,
+        "strike_interval": 100,
         "expiry_day": "Wednesday",  # Weekly expiry
         "instrument_token": 260105,  # NSE NIFTY BANK index token
     },
     "FINNIFTY": {
         "symbol": "NIFTY FIN SERVICE",
         "exchange": "NSE",
+        "options_exchange": "NFO",  # NSE F&O
         "lot_size": 25,
         "tick_size": 0.05,
+        "strike_interval": 50,
         "expiry_day": "Tuesday",
         "instrument_token": 257801,  # NSE NIFTY FIN SERVICE index token
+    },
+    "SENSEX": {
+        "symbol": "SENSEX",
+        "exchange": "BSE",
+        "options_exchange": "BFO",  # BSE F&O
+        "lot_size": 10,
+        "tick_size": 0.05,
+        "strike_interval": 100,
+        "expiry_day": "Friday",  # Weekly expiry
+        "instrument_token": 265,  # BSE SENSEX index token
     },
 }
 
@@ -222,8 +238,9 @@ ML_CONFIG = {
     # These are the symbols the ML model will be trained on
     # Can be indices (from UNDERLYING_ASSETS) or stocks (from watchlist)
     "training_symbols": [
-        "NIFTY",           # Index
-        "BANKNIFTY",       # Index
+        "NIFTY",           # Index (NFO)
+        "BANKNIFTY",       # Index (NFO)
+        "SENSEX",          # Index (BFO)
         "AXISBANK",        # Stock
         "HDFCBANK",        # Stock
         "RELIANCE",        # Stock
@@ -418,6 +435,43 @@ def get_lot_size(name: str) -> int:
         return asset.get("lot_size", 25)
     
     return 25  # Default
+
+
+def get_options_exchange(name: str) -> str:
+    """
+    Get the F&O exchange for an underlying.
+    SENSEX options trade on BFO (BSE F&O), everything else on NFO (NSE F&O).
+    
+    Args:
+        name: Symbol name
+        
+    Returns:
+        Exchange string ('NFO' or 'BFO')
+    """
+    if name in UNDERLYING_ASSETS:
+        return UNDERLYING_ASSETS[name].get("options_exchange", "NFO")
+    
+    # Check watchlist for stock-specific exchange override
+    asset = get_asset_by_name(name)
+    if asset:
+        return asset.get("options_exchange", asset.get("exchange", "NFO"))
+    
+    return "NFO"  # Default
+
+
+def get_strike_interval(name: str) -> int:
+    """
+    Get strike interval for an underlying.
+    
+    Args:
+        name: Symbol name
+        
+    Returns:
+        Strike interval (defaults to 50)
+    """
+    if name in UNDERLYING_ASSETS:
+        return UNDERLYING_ASSETS[name].get("strike_interval", 50)
+    return 50  # Default for stocks
 
 
 # Load watchlist on module import

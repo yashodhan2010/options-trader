@@ -9,7 +9,7 @@ import time
 
 from auth.kite_auth import get_kite, is_authenticated
 from strategies.base_strategy import StrategySignal, OptionLeg, TradeDirection
-from config.settings import TRADING_CONFIG, UNDERLYING_ASSETS
+from config.settings import TRADING_CONFIG, UNDERLYING_ASSETS, get_options_exchange
 from core.logger import logger
 
 
@@ -175,9 +175,12 @@ class OrderManager:
         logger.info(f"Executing signal: {signal.strategy_type.value} for {signal.underlying}")
         
         try:
+            # Determine the correct F&O exchange for this signal's underlying
+            signal_exchange = get_options_exchange(signal.underlying)
+            
             # Place orders for each leg
             for i, leg in enumerate(signal.legs):
-                order = self._place_leg_order(leg, order_type, execution_id, i)
+                order = self._place_leg_order(leg, order_type, execution_id, i, exchange=signal_exchange)
                 execution.orders.append(order)
                 
                 if order.status == OrderStatus.REJECTED:
@@ -250,6 +253,7 @@ class OrderManager:
         order_type: OrderType,
         execution_id: str,
         leg_index: int,
+        exchange: str = "NFO",
     ) -> Order:
         """
         Place order for a single leg.
@@ -259,13 +263,14 @@ class OrderManager:
             order_type: Type of order
             execution_id: Parent execution ID
             leg_index: Index of the leg
+            exchange: F&O exchange (NFO or BFO)
             
         Returns:
             Order object
         """
         order = Order(
             symbol=leg.symbol,
-            exchange="NFO",
+            exchange=exchange,
             transaction_type=leg.direction.value,
             quantity=leg.quantity,
             order_type=order_type,
@@ -292,7 +297,7 @@ class OrderManager:
                 
                 order_id = self.kite.place_order(
                     variety="regular",
-                    exchange="NFO",
+                    exchange=exchange,
                     tradingsymbol=leg.symbol,
                     transaction_type=leg.direction.value,
                     quantity=leg.quantity,
@@ -469,6 +474,9 @@ class OrderManager:
         logger.info(f"Closing position: {execution_id}")
         
         try:
+            # Determine exchange from the signal's underlying
+            exit_exchange = get_options_exchange(execution.signal.underlying)
+            
             # Place exit orders for each leg (opposite direction)
             for i, leg in enumerate(execution.signal.legs):
                 exit_direction = TradeDirection.SELL if leg.is_long else TradeDirection.BUY
@@ -483,7 +491,7 @@ class OrderManager:
                     entry_price=leg.current_price or leg.entry_price,
                 )
                 
-                order = self._place_leg_order(exit_leg, order_type, f"{execution_id}_exit", i)
+                order = self._place_leg_order(exit_leg, order_type, f"{execution_id}_exit", i, exchange=exit_exchange)
                 
                 if order.status in [OrderStatus.COMPLETE, OrderStatus.PLACED]:
                     # Calculate P&L

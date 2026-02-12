@@ -12,7 +12,8 @@ from core.logger import logger
 from core.options_pricer import options_pricer, OptionPriceResult
 from config.settings import (
     UNDERLYING_ASSETS, METRICS_CONFIG,
-    get_asset_by_name, get_instrument_token, is_in_watchlist
+    get_asset_by_name, get_instrument_token, is_in_watchlist,
+    get_options_exchange, get_strike_interval
 )
 
 
@@ -113,7 +114,7 @@ class DataFetcher:
         
         Args:
             symbol: Trading symbol
-            exchange: Exchange
+            exchange: Exchange (auto-detected for SENSEX options → BFO)
             
         Returns:
             Last traded price
@@ -122,6 +123,10 @@ class DataFetcher:
             return None
         
         try:
+            # Auto-detect BFO exchange for SENSEX options
+            if exchange == "NFO" and symbol.startswith("SENSEX"):
+                exchange = "BFO"
+            
             quote = self.kite.ltp(f"{exchange}:{symbol}")
             return quote[f"{exchange}:{symbol}"]["last_price"]
         except Exception as e:
@@ -134,7 +139,7 @@ class DataFetcher:
         
         Args:
             symbol: Trading symbol
-            exchange: Exchange
+            exchange: Exchange (auto-detected for SENSEX options → BFO)
             
         Returns:
             Quote dictionary
@@ -143,6 +148,10 @@ class DataFetcher:
             return None
         
         try:
+            # Auto-detect BFO exchange for SENSEX options
+            if exchange == "NFO" and symbol.startswith("SENSEX"):
+                exchange = "BFO"
+            
             quote = self.kite.quote(f"{exchange}:{symbol}")
             return quote[f"{exchange}:{symbol}"]
         except Exception as e:
@@ -155,11 +164,15 @@ class DataFetcher:
         
         Args:
             symbol: Trading symbol
-            exchange: Exchange (NFO for options, NSE for stocks)
+            exchange: Exchange (NFO for options, NSE for stocks, BFO for BSE F&O)
             
         Returns:
             Instrument token or None
         """
+        # Auto-detect BFO exchange for SENSEX options
+        if exchange == "NFO" and symbol.startswith("SENSEX"):
+            exchange = "BFO"
+        
         # Check watchlist first
         watchlist_asset = get_asset_by_name(symbol)
         if watchlist_asset:
@@ -178,9 +191,10 @@ class DataFetcher:
             if inst.get("tradingsymbol") == symbol:
                 return inst.get("instrument_token")
         
-        # Try NSE if NFO didn't find it
-        if exchange == "NFO":
-            instruments = self._load_instruments("NSE")
+        # Try NSE/BSE if F&O exchange didn't find it
+        if exchange in ("NFO", "BFO"):
+            fallback_exchange = "BSE" if exchange == "BFO" else "NSE"
+            instruments = self._load_instruments(fallback_exchange)
             for inst in instruments:
                 if inst.get("tradingsymbol") == symbol:
                     return inst.get("instrument_token")
@@ -227,8 +241,9 @@ class DataFetcher:
             if not spot_price:
                 return pd.DataFrame()
             
-            # Load instruments
-            instruments = self._load_instruments("NFO")
+            # Load instruments from the correct F&O exchange
+            options_exchange = get_options_exchange(underlying)
+            instruments = self._load_instruments(options_exchange)
             
             # Filter for options of this underlying
             options = [
@@ -295,11 +310,8 @@ class DataFetcher:
                         ]
             
             # Get ATM strike - determine strike interval based on underlying
-            if underlying in ["NIFTY", "FINNIFTY"]:
-                strike_interval = 50
-            elif underlying == "BANKNIFTY":
-                strike_interval = 100
-            else:
+            strike_interval = get_strike_interval(underlying)
+            if underlying not in UNDERLYING_ASSETS:
                 # For stocks, determine from available strikes
                 strikes = sorted(set(o["strike"] for o in options))
                 if len(strikes) >= 2:
@@ -576,6 +588,7 @@ class DataFetcher:
             "NIFTY": {"low": 10, "high": 35, "median": 15},
             "BANKNIFTY": {"low": 12, "high": 45, "median": 18},
             "FINNIFTY": {"low": 11, "high": 40, "median": 16},
+            "SENSEX": {"low": 10, "high": 35, "median": 15},
         }
         
         range_data = iv_ranges.get(underlying, {"low": 15, "high": 50, "median": 25})
@@ -780,8 +793,9 @@ class DataFetcher:
         else:
             symbol = underlying
         
-        # Get historical data
-        hist_data = self.get_historical_data(symbol, "day", 30, "NSE")
+        # Get historical data (use correct exchange for the underlying)
+        exchange = asset_config.get("exchange", "NSE")
+        hist_data = self.get_historical_data(symbol, "day", 30, exchange)
         
         if hist_data.empty:
             return {}
@@ -799,7 +813,7 @@ class DataFetcher:
         
         atm_iv = 0
         if not chain.empty and spot:
-            strike_interval = 50 if underlying == "NIFTY" else 100
+            strike_interval = get_strike_interval(underlying)
             atm_strike = round(spot / strike_interval) * strike_interval
             atm_options = chain[chain["strike"] == atm_strike]
             if not atm_options.empty:
@@ -849,8 +863,9 @@ class DataFetcher:
         else:
             symbol = underlying
         
-        # Get historical data
-        hist_data = self.get_historical_data(symbol, "day", days, "NSE")
+        # Get historical data - use the correct exchange for the underlying
+        hist_exchange = asset_config.get("exchange", "NSE") if asset_config else "NSE"
+        hist_data = self.get_historical_data(symbol, "day", days, hist_exchange)
         
         if hist_data.empty or len(hist_data) < 10:
             logger.warning(f"Insufficient historical data for {underlying}")
