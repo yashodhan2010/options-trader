@@ -42,6 +42,10 @@ class MLSignalGenerator:
     3. Strategy execution builds the actual option legs
     
     No rule-based signal generation - ML is the sole source of truth.
+    
+    RSI Logic (momentum vs reversion):
+    - Stocks: RSI extremes indicate momentum (crash/rally) — avoid counter-trend trades
+    - Indices: RSI extremes indicate mean-reversion — favor counter-trend trades
     """
     
     # Direction to strategy mapping based on IV regime
@@ -273,13 +277,19 @@ class MLSignalGenerator:
             )
             return []
         
-        # Determine strategy based on ML direction
+        # Determine strategy based on ML direction + RSI context
+        rsi = historical.get("rsi", 50) if isinstance(historical, dict) else 50
+        rsi_signal = historical.get("rsi_signal", "NEUTRAL") if isinstance(historical, dict) else "NEUTRAL"
+        is_index = underlying in UNDERLYING_ASSETS
+        
         if force_strategy:
             strategy_types = [force_strategy]
         else:
             strategy_types = self._get_strategies_for_direction(
                 prediction.direction,
-                volatility.get("volatility_regime", "NORMAL")
+                volatility.get("volatility_regime", "NORMAL"),
+                rsi=rsi,
+                is_index=is_index,
             )
         
         # Generate signals for selected strategies
@@ -393,17 +403,37 @@ class MLSignalGenerator:
             logger.warning(f"Trend confirmation check failed: {e}")
             return True  # On error, allow the trade
     
+    # Credit-only strategies for cautious RSI situations
+    _CREDIT_ONLY = {
+        "BULLISH": [StrategyType.BULL_PUT_SPREAD],
+        "BEARISH": [StrategyType.BEAR_CALL_SPREAD],
+    }
+
     def _get_strategies_for_direction(
         self,
         direction: str,
         iv_regime: str,
+        rsi: float = 50.0,
+        is_index: bool = False,
     ) -> List[StrategyType]:
         """
-        Get appropriate strategies based on ML direction and IV regime.
+        Get appropriate strategies based on ML direction, IV regime, and RSI context.
+        
+        RSI-aware filtering (momentum vs mean-reversion):
+        - Stocks follow momentum: RSI extremes aligned with ML direction confirm the move
+          and allow full strategy list. RSI extremes opposing ML direction signal caution
+          (e.g., RSI < 30 but ML says BULLISH = catching a falling knife) — restrict
+          to credit-only (defined risk, time decay in our favor).
+        - Indices mean-revert: RSI extremes opposing the recent trend are opportunities
+          (e.g., RSI < 30 + BULLISH ML = bounce likely) — allow full strategy list.
+          RSI extremes confirming the trend are stretched (e.g., RSI > 70 + BULLISH ML
+          = overbought index) — restrict to credit-only.
         
         Args:
             direction: ML predicted direction (BULLISH/BEARISH/NEUTRAL)
             iv_regime: Current IV regime (LOW_IV/NORMAL/HIGH_IV)
+            rsi: Current 14-period RSI value (0-100)
+            is_index: True for index underlyings, False for stocks
             
         Returns:
             List of suitable strategy types
@@ -416,9 +446,49 @@ class MLSignalGenerator:
         else:
             regime_key = "NORMAL"
         
-        # Get strategies from mapping
+        # Get base strategies from IV-direction mapping
         direction_map = self.DIRECTION_STRATEGY_MAP.get(direction, {})
-        strategies = direction_map.get(regime_key, [])
+        strategies = list(direction_map.get(regime_key, []))
+        
+        # ── RSI-aware filtering ──────────────────────────────────────
+        RSI_OVERSOLD = 30
+        RSI_OVERBOUGHT = 70
+
+        rsi_caution = False  # True → restrict to credit-only
+
+        if direction != "NEUTRAL" and (rsi < RSI_OVERSOLD or rsi > RSI_OVERBOUGHT):
+            if is_index:
+                # Indices mean-revert:
+                #   RSI < 30 + BULLISH  → bounce likely (reversion) → full list ✓
+                #   RSI > 70 + BEARISH  → drop likely (reversion)  → full list ✓
+                #   RSI < 30 + BEARISH  → stretched down, ML says more → caution
+                #   RSI > 70 + BULLISH  → stretched up, ML says more  → caution
+                if (rsi < RSI_OVERSOLD and direction == "BEARISH") or \
+                   (rsi > RSI_OVERBOUGHT and direction == "BULLISH"):
+                    rsi_caution = True
+                    logger.info(
+                        f"RSI caution (INDEX mean-reversion): RSI={rsi:.1f} with "
+                        f"{direction} — stretched, restricting to credit-only"
+                    )
+            else:
+                # Stocks follow momentum:
+                #   RSI < 30 + BEARISH  → momentum confirms → full list ✓
+                #   RSI > 70 + BULLISH  → momentum confirms → full list ✓
+                #   RSI < 30 + BULLISH  → catching falling knife → caution
+                #   RSI > 70 + BEARISH  → shorting a strong rally   → caution
+                if (rsi < RSI_OVERSOLD and direction == "BULLISH") or \
+                   (rsi > RSI_OVERBOUGHT and direction == "BEARISH"):
+                    rsi_caution = True
+                    logger.info(
+                        f"RSI caution (STOCK momentum): RSI={rsi:.1f} with "
+                        f"{direction} — counter-momentum, restricting to credit-only"
+                    )
+
+        if rsi_caution:
+            credit_list = self._CREDIT_ONLY.get(direction, [])
+            if credit_list:
+                strategies = list(credit_list)
+        # ──────────────────────────────────────────────────────────────
         
         # Filter by enabled strategies
         enabled = STRATEGY_CONFIG.get("enabled_strategies", [])

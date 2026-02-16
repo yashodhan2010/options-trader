@@ -49,15 +49,20 @@ class BullCallSpreadStrategy(BaseStrategy):
         strike_interval = 50 if self.underlying in ["NIFTY", "FINNIFTY"] else 100
         atm_strike = round(spot / strike_interval) * strike_interval
         
-        # Buy ATM/slightly ITM, Sell OTM
+        # ATR-based spread width: span at least 1 ATR so the spread covers normal movement
+        historical = metrics.get("historical", {})
+        atr_14 = historical.get("atr_14", strike_interval) if isinstance(historical, dict) else strike_interval
+        min_spread_strikes = max(1, round(atr_14 / strike_interval))
+        
+        # Buy ATM/slightly ITM, Sell OTM (at least min_spread_strikes away)
         available_strikes = sorted(calls["strike"].unique())
         buy_strike = min(available_strikes, key=lambda s: abs(s - atm_strike)) if available_strikes else atm_strike
         sell_candidates = [s for s in available_strikes if s > buy_strike]
-        # Pick the 2nd OTM strike if available, otherwise 1st
-        if len(sell_candidates) >= 2:
-            sell_strike = sell_candidates[1]
+        # Pick the strike at least min_spread_strikes away (ATR-based)
+        if len(sell_candidates) >= min_spread_strikes:
+            sell_strike = sell_candidates[min_spread_strikes - 1]
         elif sell_candidates:
-            sell_strike = sell_candidates[0]
+            sell_strike = sell_candidates[-1]  # Farthest available
         else:
             return None
         
@@ -70,6 +75,13 @@ class BullCallSpreadStrategy(BaseStrategy):
         
         buy_option = buy_option.iloc[0]
         sell_option = sell_option.iloc[0]
+        
+        # Liquidity guard
+        for leg_row in [buy_option, sell_option]:
+            is_liquid, liq_reason = self.check_leg_liquidity(leg_row)
+            if not is_liquid:
+                logger.info(f"Bull Call Spread {self.underlying}: {liq_reason}")
+                return None
         
         # Calculate net debit
         net_debit = buy_option["ltp"] - sell_option["ltp"]
@@ -214,11 +226,22 @@ class BearPutSpreadStrategy(BaseStrategy):
         strike_interval = 50 if self.underlying in ["NIFTY", "FINNIFTY"] else 100
         atm_strike = round(spot / strike_interval) * strike_interval
         
-        # Buy ATM/slightly ITM, Sell 1 strike OTM (tighter spread for better fill & realistic targets)
+        # ATR-based spread width: span at least 1 ATR so the spread covers normal movement
+        historical = metrics.get("historical", {})
+        atr_14 = historical.get("atr_14", strike_interval) if isinstance(historical, dict) else strike_interval
+        min_spread_strikes = max(1, round(atr_14 / strike_interval))
+        
+        # Buy ATM/slightly ITM, Sell OTM (at least min_spread_strikes away)
         available_strikes = sorted(puts["strike"].unique())
         buy_strike = min(available_strikes, key=lambda s: abs(s - atm_strike)) if available_strikes else atm_strike
         sell_candidates = [s for s in available_strikes if s < buy_strike]
-        sell_strike = sell_candidates[-1] if sell_candidates else None
+        # Pick the strike at least min_spread_strikes away below buy_strike
+        if len(sell_candidates) >= min_spread_strikes:
+            sell_strike = sell_candidates[-min_spread_strikes]  # From sorted ascending
+        elif sell_candidates:
+            sell_strike = sell_candidates[0]  # Farthest available below
+        else:
+            sell_strike = None
         
         if sell_strike is None:
             logger.info(f"Bear Put Spread {self.underlying}: skipped - no OTM put strike below {buy_strike}")
@@ -233,6 +256,13 @@ class BearPutSpreadStrategy(BaseStrategy):
         
         buy_option = buy_option.iloc[0]
         sell_option = sell_option.iloc[0]
+        
+        # Liquidity guard
+        for leg_row in [buy_option, sell_option]:
+            is_liquid, liq_reason = self.check_leg_liquidity(leg_row)
+            if not is_liquid:
+                logger.info(f"Bear Put Spread {self.underlying}: {liq_reason}")
+                return None
         
         # Calculate net debit
         net_debit = buy_option["ltp"] - sell_option["ltp"]
@@ -382,6 +412,11 @@ class BearCallSpreadStrategy(BaseStrategy):
         strike_interval = 50 if self.underlying in ["NIFTY", "FINNIFTY"] else 100
         atm_strike = round(spot / strike_interval) * strike_interval
         
+        # ATR-based minimum OTM distance for credit spreads
+        historical = metrics.get("historical", {})
+        atr_14 = historical.get("atr_14", strike_interval) if isinstance(historical, dict) else strike_interval
+        min_otm_strikes = max(1, round(atr_14 / strike_interval))
+        
         # Use max call OI as resistance - sell at or near this level
         max_call_oi_strike = oi_data.get("max_call_oi_strike", atm_strike + 2 * strike_interval)
         
@@ -389,8 +424,8 @@ class BearCallSpreadStrategy(BaseStrategy):
         if max_call_oi_strike is None or abs(max_call_oi_strike - atm_strike) > 10 * strike_interval:
             max_call_oi_strike = atm_strike + 2 * strike_interval
         
-        # Ensure sell strike is at least 1 interval OTM for safety
-        min_sell_strike = atm_strike + strike_interval
+        # Ensure sell strike is at least min_otm_strikes away from ATM (ATR-based safety)
+        min_sell_strike = atm_strike + min_otm_strikes * strike_interval
         sell_strike = max(max_call_oi_strike, min_sell_strike)
         
         # SELL lower strike call (at resistance), BUY higher strike call (hedge)
@@ -411,6 +446,13 @@ class BearCallSpreadStrategy(BaseStrategy):
         
         sell_option = sell_option.iloc[0]
         buy_option = buy_option.iloc[0]
+        
+        # Liquidity guard
+        for leg_row in [sell_option, buy_option]:
+            is_liquid, liq_reason = self.check_leg_liquidity(leg_row)
+            if not is_liquid:
+                logger.info(f"Bear Call Spread {self.underlying}: {liq_reason}")
+                return None
         
         # Calculate net credit (sell premium > buy premium)
         net_credit = sell_option["ltp"] - buy_option["ltp"]
@@ -569,6 +611,11 @@ class BullPutSpreadStrategy(BaseStrategy):
         strike_interval = 50 if self.underlying in ["NIFTY", "FINNIFTY"] else 100
         atm_strike = round(spot / strike_interval) * strike_interval
         
+        # ATR-based minimum OTM distance for credit spreads
+        historical = metrics.get("historical", {})
+        atr_14 = historical.get("atr_14", strike_interval) if isinstance(historical, dict) else strike_interval
+        min_otm_strikes = max(1, round(atr_14 / strike_interval))
+        
         # Use max put OI as support - sell at or near this level
         max_put_oi_strike = oi_data.get("max_put_oi_strike", atm_strike - 2 * strike_interval)
         
@@ -576,8 +623,8 @@ class BullPutSpreadStrategy(BaseStrategy):
         if max_put_oi_strike is None or max_put_oi_strike <= 0 or abs(max_put_oi_strike - atm_strike) > 10 * strike_interval:
             max_put_oi_strike = atm_strike - 2 * strike_interval
         
-        # Ensure sell strike is at least 1 interval OTM for safety
-        max_sell_strike = atm_strike - strike_interval
+        # Ensure sell strike is at least min_otm_strikes away from ATM (ATR-based safety)
+        max_sell_strike = atm_strike - min_otm_strikes * strike_interval
         sell_strike = min(max_put_oi_strike, max_sell_strike)
         
         # SELL higher strike put (at support), BUY lower strike put (hedge)
@@ -598,6 +645,13 @@ class BullPutSpreadStrategy(BaseStrategy):
         
         sell_option = sell_option.iloc[0]
         buy_option = buy_option.iloc[0]
+        
+        # Liquidity guard
+        for leg_row in [sell_option, buy_option]:
+            is_liquid, liq_reason = self.check_leg_liquidity(leg_row)
+            if not is_liquid:
+                logger.info(f"Bull Put Spread {self.underlying}: {liq_reason}")
+                return None
         
         # Calculate net credit (sell premium > buy premium)
         net_credit = sell_option["ltp"] - buy_option["ltp"]

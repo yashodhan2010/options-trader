@@ -70,6 +70,12 @@ class LongCallStrategy(BaseStrategy):
         
         option = option.iloc[0]
         
+        # Liquidity guard
+        is_liquid, liq_reason = self.check_leg_liquidity(option)
+        if not is_liquid:
+            logger.info(f"Long Call {self.underlying}: {liq_reason}")
+            return None
+        
         # Get historical data for enhanced confidence
         historical = metrics.get("historical", {})
         
@@ -278,6 +284,12 @@ class LongPutStrategy(BaseStrategy):
         
         option = option.iloc[0]
         
+        # Liquidity guard
+        is_liquid, liq_reason = self.check_leg_liquidity(option)
+        if not is_liquid:
+            logger.info(f"Long Put {self.underlying}: {liq_reason}")
+            return None
+        
         confidence = self._calculate_confidence(oi_data, volatility, sentiment)
         
         if not self.ml_override and confidence < self.min_confidence:
@@ -420,6 +432,12 @@ class ShortCallStrategy(BaseStrategy):
         
         option = option.iloc[0]
         
+        # Liquidity guard
+        is_liquid, liq_reason = self.check_leg_liquidity(option)
+        if not is_liquid:
+            logger.info(f"Short Call {self.underlying}: {liq_reason}")
+            return None
+        
         confidence = self._calculate_confidence(oi_data, volatility, sentiment)
         
         if not self.ml_override and confidence < self.min_confidence:
@@ -536,6 +554,12 @@ class ShortPutStrategy(BaseStrategy):
             return None
         
         option = option.iloc[0]
+        
+        # Liquidity guard
+        is_liquid, liq_reason = self.check_leg_liquidity(option)
+        if not is_liquid:
+            logger.info(f"Short Put {self.underlying}: {liq_reason}")
+            return None
         
         confidence = self._calculate_confidence(oi_data, volatility, sentiment)
         

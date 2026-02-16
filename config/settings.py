@@ -82,7 +82,10 @@ MARKET_HOURS = {
     "expiry_early_exit_time": "14:30",  # Exit positions earlier on expiry
     
     # Monthly vs Weekly expiry settings
-    "use_monthly_expiry_only": True,    # Only trade monthly expiry options (not weekly)
+    # NOTE: This global flag is now overridden by per-underlying logic in data_fetcher:
+    #   - Indices (NIFTY, BANKNIFTY, etc.) → weekly expiry (faster theta decay)
+    #   - Stocks → monthly expiry (better liquidity, wider strike availability)
+    "use_monthly_expiry_only": True,    # Legacy flag; per-underlying logic takes precedence
 }
 
 # Bot Scan Configuration
@@ -207,6 +210,21 @@ STRATEGY_CONFIG = {
     "otm_offset": 1,  # Number of strikes OTM
 }
 
+# Liquidity guard — minimum thresholds an option leg must meet before entry.
+# Prevents trading illiquid strikes where fills are bad and exits are worse.
+LIQUIDITY_GUARD = {
+    "enabled": True,
+    # Minimum traded volume on the option contract today
+    "min_volume_index": 1000,
+    "min_volume_stock": 500,
+    # Minimum open interest on the contract
+    "min_oi_index": 5000,
+    "min_oi_stock": 1000,
+    # Maximum bid-ask spread as % of option mid-price
+    # (e.g. 5.0 means reject if spread > 5% of mid-price)
+    "max_bid_ask_spread_pct": 5.0,
+}
+
 # Logging Configuration
 LOGGING_CONFIG = {
     "level": "INFO",
@@ -268,6 +286,9 @@ ML_CONFIG = {
     "optuna_trials": 50,                # Number of Optuna trials
     "optuna_timeout": 3600,             # Max seconds for optimization
     "optuna_pruning": True,             # Enable early stopping of bad trials
+    
+    # Parallel training (trains XGB/LGB/RF concurrently with cores/3 each)
+    "parallel_training": True,          # Train ensemble sub-models in parallel
     
     # Ensemble weights (if using ensemble)
     "ensemble_weights": {

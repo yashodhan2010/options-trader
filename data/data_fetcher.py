@@ -260,9 +260,14 @@ class DataFetcher:
                     if _normalize_expiry(o["expiry"]) == target_expiry_date
                 ]
             else:
-                # Check if we should use monthly expiry only
+                # Determine expiry mode: indices use weekly, stocks use monthly
                 from config.settings import MARKET_HOURS
-                use_monthly = MARKET_HOURS.get("use_monthly_expiry_only", True)
+                
+                # Per-underlying expiry logic:
+                # Indices (in UNDERLYING_ASSETS) → weekly expiry for faster theta decay
+                # Stocks → monthly expiry for better liquidity and wider strikes
+                is_index = underlying in UNDERLYING_ASSETS
+                use_monthly = not is_index  # Stocks monthly, indices weekly
                 
                 expiries = sorted({
                     _normalize_expiry(o["expiry"]) for o in options
@@ -302,8 +307,9 @@ class DataFetcher:
                             if _normalize_expiry(o["expiry"]) == target_expiry
                         ]
                     else:
-                        # Use nearest expiry (weekly)
+                        # Use nearest expiry (weekly) for indices — faster theta decay
                         nearest_expiry = expiries[0]
+                        logger.debug(f"Using weekly expiry for INDEX {underlying}: {nearest_expiry}")
                         options = [
                             o for o in options
                             if _normalize_expiry(o["expiry"]) == nearest_expiry

@@ -30,12 +30,21 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from data.nse_downloader import NSEDownloader
+from config.settings import ML_CONFIG
 from core.logger import logger
 from ml.unified_features import (
     UnifiedFeatureDefinition,
     HistoricalFeatureAdapter,
     get_unified_feature_names
 )
+
+try:
+    import optuna
+    OPTUNA_AVAILABLE = True
+    # Suppress noisy per-trial Optuna logs — we log our own summaries
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+except ImportError:
+    OPTUNA_AVAILABLE = False
 
 
 class GreeksCalculator:
@@ -419,8 +428,22 @@ class FullPipelineTrainer:
         # Use the unified feature adapter
         return self.feature_adapter.extract_features(df)
     
-    def create_labels(self, df: pd.DataFrame, horizon: int = 1) -> pd.DataFrame:
-        """Create prediction labels."""
+    def create_labels(self, df: pd.DataFrame, horizon: int = 1, threshold: float = None) -> pd.DataFrame:
+        """Create prediction labels with ternary threshold.
+        
+        Labels:
+            +1 (BULLISH): future_return > +threshold
+            -1 (BEARISH): future_return < -threshold
+             0 (NEUTRAL): within dead zone (noise)
+        
+        After label shift in model_trainer: -1,0,1 → 0,1,2
+        Maps to DIRECTION_MAP: {0: BEARISH, 1: NEUTRAL, 2: BULLISH}
+        
+        Args:
+            df: DataFrame with 'close' column
+            horizon: Forward-looking periods for return calc
+            threshold: Dead-zone threshold (decimal). If None, uses default 0.5%
+        """
         if df.empty:
             return df
         
@@ -429,13 +452,120 @@ class FullPipelineTrainer:
         # Future return
         df["future_return"] = df["close"].shift(-horizon) / df["close"] - 1
         
-        # Binary label
-        df["label"] = (df["future_return"] > 0).astype(float)
+        # Ternary label with dead zone to filter noise
+        if threshold is None:
+            threshold = 0.005  # 0.5% default
+        
+        df["label"] = np.where(
+            df["future_return"] > threshold, 1.0,
+            np.where(df["future_return"] < -threshold, -1.0, 0.0)
+        )
         
         # Drop rows without labels
         df = df.dropna(subset=["future_return"])
         
+        # Log label distribution
+        label_counts = df["label"].value_counts().to_dict()
+        logger.info(f"Label distribution (threshold={threshold:.4f}): "
+                    f"BEARISH(-1)={label_counts.get(-1.0, 0)}, "
+                    f"NEUTRAL(0)={label_counts.get(0.0, 0)}, "
+                    f"BULLISH(+1)={label_counts.get(1.0, 0)}")
+        
         return df
+    
+    def optimize_label_threshold(
+        self,
+        df: pd.DataFrame,
+        feature_names: List[str],
+        n_trials: int = 30,
+        timeout: int = 120
+    ) -> float:
+        """Use Optuna to find the optimal ternary label threshold.
+        
+        Trains lightweight RF models at different thresholds and picks
+        the one that maximizes cross-validated F1 score.
+        
+        Args:
+            df: DataFrame with features + 'close' column
+            feature_names: List of feature column names
+            n_trials: Number of Optuna trials
+            timeout: Max seconds
+            
+        Returns:
+            Optimal threshold (decimal)
+        """
+        try:
+            import optuna
+            from optuna.samplers import TPESampler
+            from sklearn.ensemble import RandomForestClassifier
+            from sklearn.model_selection import TimeSeriesSplit
+            from sklearn.metrics import f1_score
+        except ImportError:
+            logger.warning("Optuna/sklearn not available, using default threshold 0.005")
+            return 0.005
+        
+        # We need the raw DataFrame with 'close' to recompute labels at each threshold
+        df_base = df.copy()
+        df_base["future_return"] = df_base["close"].shift(-1) / df_base["close"] - 1
+        df_base = df_base.dropna(subset=["future_return"])
+        
+        # Pre-extract features as array (constant across trials)
+        available_features = [f for f in feature_names if f in df_base.columns]
+        X_all = df_base[available_features].fillna(0).replace([np.inf, -np.inf], 0).values
+        returns = df_base["future_return"].values
+        
+        if len(X_all) < 50:
+            logger.warning(f"Too few samples ({len(X_all)}) for threshold optimization, using default")
+            return 0.005
+        
+        def objective(trial):
+            threshold = trial.suggest_float("threshold", 0.001, 0.02, log=True)
+            
+            # Create labels with this threshold
+            y = np.where(returns > threshold, 1.0,
+                        np.where(returns < -threshold, -1.0, 0.0))
+            
+            # Shift to non-negative: -1,0,1 → 0,1,2
+            y_adj = y + 1
+            
+            # Check we have at least 2 classes with enough samples
+            unique, counts = np.unique(y_adj, return_counts=True)
+            if len(unique) < 2 or min(counts) < 5:
+                return 0.0  # Bad threshold — too few classes
+            
+            # Time-series CV with lightweight RF
+            tscv = TimeSeriesSplit(n_splits=3)
+            scores = []
+            
+            for train_idx, val_idx in tscv.split(X_all):
+                X_train, X_val = X_all[train_idx], X_all[val_idx]
+                y_train, y_val = y_adj[train_idx], y_adj[val_idx]
+                
+                # Quick RF (fewer trees, shallow)
+                model = RandomForestClassifier(
+                    n_estimators=50, max_depth=6,
+                    min_samples_leaf=5, random_state=42, n_jobs=-1
+                )
+                model.fit(X_train, y_train)
+                y_pred = model.predict(X_val)
+                
+                n_classes = len(np.unique(y_train))
+                avg = "binary" if n_classes == 2 else "weighted"
+                scores.append(f1_score(y_val, y_pred, average=avg, zero_division=0))
+            
+            return np.mean(scores)
+        
+        study = optuna.create_study(
+            direction="maximize",
+            sampler=TPESampler(seed=42)
+        )
+        study.optimize(objective, n_trials=n_trials, timeout=timeout)
+        
+        best_threshold = study.best_params["threshold"]
+        logger.info(f"Optuna label threshold: {best_threshold:.4f} "
+                    f"(F1={study.best_value:.4f}, {len(study.trials)} trials)")
+        
+        return best_threshold
     
     def prepare_features(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[str]]:
         """Prepare X, y arrays for training using UNIFIED feature set."""
@@ -470,50 +600,109 @@ class FullPipelineTrainer:
         symbol: str,
         feature_names: List[str]
     ) -> Dict:
-        """Train model for a single symbol."""
-        from sklearn.model_selection import TimeSeriesSplit
-        from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+        """Train model for a single symbol using full Optuna-tuned ensemble.
+        
+        Delegates to ModelTrainer which handles:
+        - XGBoost/LightGBM/RF with Optuna hyperparameter tuning
+        - Optuna-optimized ensemble weights
+        - Pruning of bad trials
+        - Proper ternary label handling
+        """
+        from sklearn.metrics import accuracy_score, f1_score
         
         if len(X) < 30:
             logger.warning(f"{symbol}: Insufficient data ({len(X)} samples)")
             return None
         
-        # Time series split
-        tscv = TimeSeriesSplit(n_splits=3)
+        try:
+            from ml.model_trainer import ModelTrainer
+            
+            trainer = ModelTrainer()
+            trainer.feature_names = feature_names
+            
+            model_type = ML_CONFIG.get("model_type", "ensemble")
+            optimize = OPTUNA_AVAILABLE
+            
+            logger.info(f"{symbol}: Training {model_type} with Optuna optimization "
+                       f"({len(X)} samples, {len(feature_names)} features)")
+            
+            model, metrics, model_version = trainer.train_direction_model(
+                X=X,
+                y=y,
+                feature_names=feature_names,
+                model_type=model_type,
+                optimize=optimize
+            )
+            
+            # Get feature importance from the trained model
+            importance = trainer._get_feature_importance(model, model_type)
+            if importance:
+                importance_df = pd.DataFrame([
+                    {"feature": k, "importance": v}
+                    for k, v in importance.items()
+                ]).sort_values("importance", ascending=False)
+            else:
+                importance_df = pd.DataFrame(columns=["feature", "importance"])
+            
+            logger.info(f"{symbol}: Acc={metrics.get('accuracy', 0):.2%}, "
+                       f"F1={metrics.get('f1_score', 0):.2%}, "
+                       f"Weights={metrics.get('optimized_weights', 'N/A')}")
+            
+            return {
+                "model": model,
+                "metrics": metrics,
+                "model_version": model_version,
+                "feature_importance": importance_df,
+                "feature_names": feature_names,
+                "n_samples": len(X),
+                "symbol": symbol
+            }
+            
+        except Exception as e:
+            logger.error(f"{symbol}: Ensemble training failed ({e}), falling back to RF")
+            # Fallback to simple RF if ensemble fails
+            return self._train_fallback_rf(X, y, symbol, feature_names)
+    
+    def _train_fallback_rf(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        symbol: str,
+        feature_names: List[str]
+    ) -> Dict:
+        """Fallback training with simple Random Forest (no Optuna)."""
+        from sklearn.model_selection import TimeSeriesSplit
+        from sklearn.ensemble import RandomForestClassifier
+        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
         
-        # Train on last fold
+        tscv = TimeSeriesSplit(n_splits=3)
         train_idx, test_idx = list(tscv.split(X))[-1]
         X_train, X_test = X[train_idx], X[test_idx]
         y_train, y_test = y[train_idx], y[test_idx]
         
-        # Train Random Forest
         model = RandomForestClassifier(
-            n_estimators=100,
-            max_depth=8,
-            min_samples_split=10,
-            min_samples_leaf=5,
-            random_state=42,
-            n_jobs=-1
+            n_estimators=100, max_depth=8,
+            min_samples_split=10, min_samples_leaf=5,
+            random_state=42, n_jobs=-1
         )
-        
         model.fit(X_train, y_train)
         y_pred = model.predict(X_test)
         
+        n_classes = len(np.unique(y_train))
+        average = "binary" if n_classes == 2 else "weighted"
         metrics = {
             "accuracy": accuracy_score(y_test, y_pred),
-            "precision": precision_score(y_test, y_pred, zero_division=0),
-            "recall": recall_score(y_test, y_pred, zero_division=0),
-            "f1": f1_score(y_test, y_pred, zero_division=0),
+            "precision": precision_score(y_test, y_pred, average=average, zero_division=0),
+            "recall": recall_score(y_test, y_pred, average=average, zero_division=0),
+            "f1": f1_score(y_test, y_pred, average=average, zero_division=0),
         }
         
-        # Feature importance
         importance = pd.DataFrame({
             "feature": feature_names,
             "importance": model.feature_importances_
         }).sort_values("importance", ascending=False)
         
-        logger.info(f"{symbol}: Acc={metrics['accuracy']:.2%}, F1={metrics['f1']:.2%}")
+        logger.info(f"{symbol} (fallback RF): Acc={metrics['accuracy']:.2%}, F1={metrics['f1']:.2%}")
         
         return {
             "model": model,
@@ -591,8 +780,15 @@ class FullPipelineTrainer:
             # Add features
             sym_df = self.add_features(sym_df)
             
-            # Create labels
-            sym_df = self.create_labels(sym_df)
+            # Optimize label threshold with Optuna, then create labels
+            if OPTUNA_AVAILABLE and len(sym_df) >= 50:
+                logger.info(f"{symbol}: Optimizing label threshold with Optuna...")
+                optimal_threshold = self.optimize_label_threshold(
+                    sym_df, self.feature_names, n_trials=30, timeout=60
+                )
+                sym_df = self.create_labels(sym_df, threshold=optimal_threshold)
+            else:
+                sym_df = self.create_labels(sym_df)
             
             # Prepare for training
             X, y, feature_names = self.prepare_features(sym_df)

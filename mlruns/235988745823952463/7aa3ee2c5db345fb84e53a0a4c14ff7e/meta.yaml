@@ -1,0 +1,14 @@
+artifact_uri: file:\C:\Users\Yashodhan\OneDrive\Documents\Algo\OptionsTrader\options-trader\mlruns\artifacts/7aa3ee2c5db345fb84e53a0a4c14ff7e/artifacts
+end_time: 1771232669929
+entry_point_name: ''
+experiment_id: '235988745823952463'
+lifecycle_stage: active
+run_id: 7aa3ee2c5db345fb84e53a0a4c14ff7e
+run_name: ensemble_20260216_143349
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1771232629141
+status: 3
+tags: []
+user_id: Yashodhan

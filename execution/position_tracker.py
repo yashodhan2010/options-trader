@@ -50,6 +50,7 @@ class PositionTracker:
         self.persist_positions: bool = BOT_CONFIG.get("persist_positions", True)
         self.callbacks: Dict[str, List[Callable]] = {
             "sl_hit": [],
+            "trailing_sl_hit": [],
             "target_hit": [],
             "position_closed": [],
             "status_update": [],  # New callback for status updates
@@ -386,7 +387,7 @@ class PositionTracker:
                     f"(trail floor: {trail_level:.2f})"
                 )
                 self._trigger_exit(execution_id, "TRAILING_SL_HIT", total_pnl)
-                self._notify("sl_hit", execution_id, total_pnl)
+                self._notify("trailing_sl_hit", execution_id, total_pnl, trail_level)
                 return
         
         # Check target

@@ -964,6 +964,7 @@ class TradingCLI(cmd.Cmd):
         
         try:
             from ml import get_model_trainer, get_data_collector, get_feature_engineer
+            import numpy as np
             
             trainer = get_model_trainer()
             collector = get_data_collector()
@@ -1012,12 +1013,14 @@ class TradingCLI(cmd.Cmd):
                     print(f"[{ul}] Warning: No 'close' column found, skipping...")
                     continue
                 
-                # Create target: 1 if next day close > current close, 0 otherwise
+                # Create ternary target: +1 if return > +0.5%, -1 if < -0.5%, 0 for neutral
                 closes = df[close_col].values
                 # Target for each day in X (X already starts from lookback)
                 # X[i] corresponds to df row (lookback + i)
-                # Target for X[i] is whether df row (lookback + i + 1) went up
-                y_full = (closes[1:] > closes[:-1]).astype(int)  # Direction for each day
+                # Target for X[i] is the return direction for (lookback + i + 1)
+                returns = (closes[1:] - closes[:-1]) / closes[:-1]  # Daily return
+                threshold = 0.005  # 0.5%
+                y_full = np.where(returns > threshold, 1, np.where(returns < -threshold, -1, 0))
                 y = y_full[lookback:]  # Align with X start point
                 
                 # Remove last sample (no future target available)
@@ -1555,11 +1558,13 @@ class TradingCLI(cmd.Cmd):
                         results[symbol] = {"status": "skipped", "reason": "feature extraction failed"}
                         continue
                     
-                    # Create target variable
+                    # Create ternary target: +1 if return > +0.5%, -1 if < -0.5%, 0 for neutral
                     df_cols = [c.lower() for c in df.columns]
                     close_col = 'close' if 'close' in df_cols else df.columns[df_cols.index('close')]
                     closes = df[close_col].values
-                    y_full = (closes[1:] > closes[:-1]).astype(int)
+                    returns = (closes[1:] - closes[:-1]) / closes[:-1]
+                    threshold = 0.005  # 0.5%
+                    y_full = np.where(returns > threshold, 1, np.where(returns < -threshold, -1, 0))
                     y = y_full[lookback:]
                     
                     if len(X) > len(y):

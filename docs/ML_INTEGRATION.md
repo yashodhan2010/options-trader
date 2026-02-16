@@ -30,14 +30,16 @@ The ML module is the **sole source of trading signals**. No rule-based signal ge
 Key features:
 
 - **ML-Only Signals**: All entry signals come from ML predictions
-- **Ensemble Models**: XGBoost (50%), LightGBM (30%), Random Forest (20%)
+- **Ternary Prediction**: BEARISH (0), NEUTRAL (1), BULLISH (2) with Optuna-optimized thresholds
+- **Ensemble Models**: XGBoost + LightGBM + Random Forest with Optuna-tuned weights (data-driven, not hardcoded)
 - **34+ Features**: Price, technicals, Greeks, OI sentiment, volatility, time-based
-- **Optuna Optimization**: 50 trials with walk-forward validation
+- **Optuna Deep Integration**: Hyperparameter tuning (50 trials + MedianPruner), ensemble weight optimization (200 trials), label threshold optimization (30 trials)
+- **Parallel Training**: Concurrent sub-model training via ThreadPoolExecutor
 - **Risk Guardrails**: Stop-loss protection, confidence bounds, circuit breaker
 - **MLflow Tracking**: Full experiment and model versioning
 - **Feedback Loop**: Drift detection and auto-retraining triggers
 - **Model Comparison**: Trading-specific metrics (Sharpe, Profit Factor, Win Rate)
-- **Best Config Training**: Train all symbols with optimal hyperparameters
+- **Full Pipeline Training**: End-to-end pipeline via `ml train-full` CLI command
 
 ### How It Works (ML-Only Mode)
 
@@ -45,15 +47,18 @@ Key features:
 Market Data --> Feature Engineering --> ML Prediction --> Strategy Selection --> Trade Signal
                                               |
                                               v
-                                    Direction: BULLISH/BEARISH/NEUTRAL
+                                    Direction: BULLISH/NEUTRAL/BEARISH (ternary)
                                     Confidence: 0.0 to 1.0
+                                    Threshold: Optuna-optimized per symbol
 ```
 
 The ML system:
-1. Predicts market direction (BULLISH, BEARISH, NEUTRAL) with confidence
-2. Maps direction to appropriate strategy based on IV regime
-3. Generates option legs using strategy execution
-4. Filters trades below minimum confidence threshold
+1. Predicts market direction using **ternary labels** (BEARISH=0, NEUTRAL=1, BULLISH=2)
+2. The NEUTRAL dead-zone threshold is Optuna-optimized per symbol (range: 0.1%–2.0%)
+3. Maps direction to appropriate strategy based on IV regime
+4. Generates option legs using strategy execution
+5. Filters trades below minimum confidence threshold
+6. NEUTRAL predictions are explicitly skipped (no trade)
 
 **No rule-based signals** - if ML model is not loaded, no signals are generated.
 
@@ -70,15 +75,24 @@ signals/
 ml/
 ├── __init__.py              # Module exports
 ├── feature_engineer.py      # 34+ feature extraction
+├── unified_features.py      # Unified feature definitions
 ├── data_collector.py        # Historical data caching
-├── model_trainer.py         # XGBoost/LightGBM/RF + Optuna
+├── model_trainer.py         # XGBoost/LightGBM/RF + Optuna (parallel training)
+├── full_pipeline.py         # End-to-end training pipeline with Optuna
 ├── evaluator.py             # Trading metrics & model comparison
-├── predictor.py             # Ensemble inference
+├── predictor.py             # Ensemble inference (ternary)
 ├── backtester.py            # Historical simulation
 ├── feedback_collector.py    # Outcome logging & drift
+├── feedback_trainer.py      # Feedback-based retraining
+├── feedback_evaluator.py    # Feedback evaluation
 ├── model_registry.py        # Version control & A/B testing
 ├── mlflow_tracker.py        # MLflow integration
 ├── guardrails.py            # Risk management
+├── auto_retrain.py          # Automatic retraining triggers
+├── historical_data_collector.py  # Historical data fetching
+├── historical_trainer.py    # Train on historical data
+├── historical_predictor.py  # Historical predictions
+├── live_feature_collector.py # Real-time feature extraction
 └── paper_trading_runner.py  # Paper trading orchestration
 ```
 
@@ -157,15 +171,32 @@ ML_CONFIG = {
     "min_blended_confidence": 0.55,  # Min confidence to trade
     
     # Training
-    "optuna_trials": 50,  # Hyperparameter trials
+    "optuna_trials": 50,  # Hyperparameter trials per model
     "min_training_samples": 100,  # Min samples for training
     "training_lookback_days": 90,  # Use 3 months of data
+    "parallel_training": True,  # Train XGB/LGB/RF concurrently
     
-    # Ensemble weights
+    # Ensemble weights (Optuna-optimized, not hardcoded)
+    # These are default starting values; actual weights are
+    # determined by Optuna optimization (200 trials, F1-based)
     "ensemble_weights": {
         "xgboost": 0.5,
         "lightgbm": 0.3,
         "random_forest": 0.2,
+    },
+    
+    # Ternary labeling
+    # Threshold defines the NEUTRAL dead-zone (±threshold)
+    # Optimized per symbol via Optuna (30 trials, range: 0.001 to 0.02)
+    "label_threshold": 0.005,  # Default ±0.5%
+    
+    # Optuna integration
+    "optuna": {
+        "n_trials_hyperparams": 50,     # Trials for model hyperparameters
+        "n_trials_weights": 200,        # Trials for ensemble weight optimization
+        "n_trials_threshold": 30,       # Trials for label threshold optimization
+        "pruner": "MedianPruner",       # Early stopping for bad trials
+        "sampler": "TPESampler",        # Bayesian optimization
     },
     
     # Guardrails
@@ -207,6 +238,7 @@ All ML commands are accessed via `ml <command>` in the CLI:
 |---------|-------------|
 | `ml status` | Show ML system status, model info, and recent performance |
 | `ml train [SYMBOL]` | Train model with Optuna optimization (all symbols if omitted) |
+| `ml train-full [START END]` | Full pipeline: data collection → features → ternary labels → Optuna threshold/weights optimization |
 | `ml train-best [CONFIG]` | Train all symbols with best configuration (default: rf_aggressive) |
 | `ml compare SYMBOL` | Compare 12 model configurations with trading metrics |
 | `ml backtest SYMBOL` | Run historical backtest on trained model |
@@ -465,6 +497,28 @@ print(f"Profit Factor: {metrics.profit_factor:.2f}")
 
 ## Training Pipeline
 
+### Full Pipeline Training (Recommended)
+
+The `ml train-full` command runs the complete end-to-end pipeline:
+
+```bash
+# Full pipeline with default dates (3 months lookback)
+ml train-full
+
+# Full pipeline with custom date range
+ml train-full 2025-01-01 2025-12-31
+```
+
+The full pipeline performs:
+1. **Data Collection**: Fetches OHLCV + OI data for all watchlist symbols
+2. **Feature Engineering**: Extracts 34+ normalized features
+3. **Ternary Labeling**: Creates BEARISH/NEUTRAL/BULLISH labels with dead-zone
+4. **Optuna Threshold Optimization**: Finds optimal NEUTRAL dead-zone width per symbol (30 trials)
+5. **Model Training**: Trains XGB/LGB/RF with Optuna hyperparameter tuning (50 trials each, MedianPruner)
+6. **Parallel Sub-Model Training**: XGB/LGB/RF train concurrently via ThreadPoolExecutor
+7. **Ensemble Weight Optimization**: Optuna finds optimal blend weights (200 trials, F1-based)
+8. **Model Saving**: Saves ensemble model with metadata to `data/ml_models/`
+
 ### Initial Training (One-time Setup)
 
 ```python
@@ -714,9 +768,19 @@ print(runs[["run_id", "metrics.accuracy", "metrics.sharpe_ratio"]])
 4. **Drift Detection**: If accuracy drops >10%, retraining is recommended
 5. **Auto-Retraining**: Model is automatically retrained from trade outcomes
 
-### Target Variable: Trade Outcomes
+### Target Variable
 
-Unlike initial training (which uses next-day price direction), **feedback-based retraining uses actual trade P&L** as the target:
+**Initial training** uses ternary price direction labels with an Optuna-optimized threshold:
+
+| Label | Value | Meaning |
+|-------|-------|---------|
+| BEARISH | 0 | Next-day return < -threshold |
+| NEUTRAL | 1 | Next-day return within ±threshold (dead zone) |
+| BULLISH | 2 | Next-day return > +threshold |
+
+The threshold is optimized per symbol (range: 0.1%–2.0%, 30 Optuna trials).
+
+**Feedback-based retraining** uses actual trade P&L as the target:
 
 | Outcome | Target Value | Meaning |
 |---------|--------------|---------|
@@ -935,13 +999,15 @@ mlflow ui --port 5001
 # Training
 ml train                    # Train all symbols with Optuna
 ml train RELIANCE           # Train specific symbol
+ml train-full               # Full pipeline: data + features + Optuna threshold/weights
+ml train-full 2025-01-01 2025-12-31  # Full pipeline with custom dates
 ml train-best               # Train all with rf_aggressive
 ml train-best xgb_balanced  # Train with specific config
 
 # Comparison & Analysis
 ml compare RELIANCE         # Compare 12 model configs
 ml backtest NIFTY           # Run historical backtest
-ml predict NIFTY            # Get ML prediction
+ml predict NIFTY            # Get ML prediction (ternary: BULL/NEUTRAL/BEAR)
 ml features NIFTY           # Show extracted features
 
 # Paper Trading
@@ -952,6 +1018,11 @@ ml paper stop               # End and show summary
 # Status & Monitoring
 ml status                   # ML system status
 ml drift                    # Check for model drift
+
+# Retraining
+ml retrain-status           # Check retrain conditions
+ml retrain                  # Feedback-based retrain
+ml retrain --force          # Force retrain
 ```
 
 ### Python API
@@ -1004,4 +1075,4 @@ summary = runner.end_session()
 
 ---
 
-*Last updated: December 26, 2025*
+*Last updated: February 16, 2026*

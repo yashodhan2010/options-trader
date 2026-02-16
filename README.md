@@ -9,16 +9,17 @@ A comprehensive, modular options trading bot for Indian markets using Zerodha Ki
 ### 🤖 Machine Learning (Primary - ML-Only Mode)
 - **ML-Driven Signals**: All entry signals come from ML predictions
 - **No Rule-Based Signals**: ML is the sole source of trading decisions
-- **Direction Prediction**: BULLISH, BEARISH, or NEUTRAL with confidence
-- **Ensemble Models**: XGBoost, LightGBM, Random Forest
+- **Ternary Prediction**: BULLISH, NEUTRAL, or BEARISH with Optuna-optimized thresholds
+- **Ensemble Models**: XGBoost + LightGBM + Random Forest with Optuna-tuned weights
 - **34+ Features**: Price, technicals, Greeks, OI sentiment, volatility
-- **Optuna Optimization**: Hyperparameter tuning with walk-forward validation
+- **Optuna Deep Integration**: Hyperparameter tuning, ensemble weight optimization, label threshold optimization, MedianPruner for early stopping
+- **Parallel Training**: Concurrent sub-model training via ThreadPoolExecutor
 - **Model Comparison**: Compare 12 configurations with trading-specific metrics
 - **Trading Metrics**: Sharpe Ratio, Profit Factor, Win Rate, Max Drawdown
 - **MLflow Tracking**: Experiment versioning and model registry
 - **Risk Guardrails**: Stop-loss protection, confidence bounds, circuit breaker
 - **Paper Trading Mode**: Simulation with feedback loop
-- **Best Config Training**: Train all symbols with optimal hyperparameters
+- **Full Pipeline Training**: End-to-end pipeline with data collection, feature engineering, labeling, and Optuna optimization
 - See [docs/ML_INTEGRATION.md](docs/ML_INTEGRATION.md) for full guide
 
 ### 📊 Strategy Catalogue
@@ -45,7 +46,8 @@ A comprehensive, modular options trading bot for Indian markets using Zerodha Ki
 ### ⚡ Execution
 - Automated order placement via Kite Connect
 - Stop Loss and Target management
-- Trailing Stop Loss support
+- **High-Watermark Trailing Stop Loss** with activation threshold and profit protection
+- Separate logging for trailing SL vs hard SL exits
 - Position tracking and monitoring
 - Paper trading mode for testing
 - **Real-time WebSocket monitoring** for instant exit signals
@@ -53,11 +55,18 @@ A comprehensive, modular options trading bot for Indian markets using Zerodha Ki
 
 ### 🛡️ Risk Management
 - Configurable stop loss and target percentages
+- **Differentiated targets**: Higher reward for stocks vs indices
 - Daily loss limits
 - Maximum positions limit
 - Position sizing based on risk
 - **Portfolio-level Greeks monitoring**
 - **Periodic status updates** (every 15 minutes, configurable)
+
+### 📊 Statistical Upgrades
+- **RSI Momentum vs Reversion**: Stocks use momentum (RSI trend-following), indices use mean-reversion
+- **Liquidity Guard**: Volume, OI, and bid-ask spread checks per leg before entry
+- **ATR-Based Dynamic Spread Width**: Spread widths adapt to current volatility via ATR
+- **Expiry Selection**: Weekly expiry for indices, monthly expiry for stocks
 
 ### 📋 Stock Watchlist
 - Pre-configured stocks with lot sizes
@@ -101,15 +110,24 @@ options-trader/
 ├── ml/                       # Machine Learning module
 │   ├── __init__.py           # Module exports
 │   ├── feature_engineer.py   # 34+ feature extraction
+│   ├── unified_features.py   # Unified feature definitions
 │   ├── data_collector.py     # Historical data caching
-│   ├── model_trainer.py      # XGBoost/LightGBM/RF + Optuna
+│   ├── model_trainer.py      # XGBoost/LightGBM/RF + Optuna (parallel training)
+│   ├── full_pipeline.py      # End-to-end training pipeline with Optuna
 │   ├── evaluator.py          # Trading metrics & model comparison
-│   ├── predictor.py          # Ensemble inference
+│   ├── predictor.py          # Ensemble inference (ternary: BEAR/NEUTRAL/BULL)
 │   ├── backtester.py         # Historical simulation
 │   ├── feedback_collector.py # Outcome logging & drift
+│   ├── feedback_trainer.py   # Feedback-based retraining
+│   ├── feedback_evaluator.py # Feedback evaluation
 │   ├── model_registry.py     # Version control & A/B testing
 │   ├── mlflow_tracker.py     # MLflow integration
 │   ├── guardrails.py         # Risk management
+│   ├── auto_retrain.py       # Automatic retraining triggers
+│   ├── historical_data_collector.py  # Historical data fetching
+│   ├── historical_trainer.py # Train on historical data
+│   ├── historical_predictor.py # Historical predictions
+│   ├── live_feature_collector.py # Real-time feature extraction
 │   └── paper_trading_runner.py # Paper trading orchestration
 ├── signals/
 │   ├── __init__.py
@@ -246,6 +264,7 @@ Available commands:
 **ML Commands:**
 - `ml status` - Show ML model status and performance
 - `ml train [SYMBOL]` - Train ML model with Optuna optimization
+- `ml train-full [START_DATE END_DATE]` - Full pipeline: data collection + feature engineering + Optuna threshold/weights optimization
 - `ml train-best [CONFIG]` - Train all symbols with best config (e.g., rf_aggressive)
 - `ml compare SYMBOL` - Compare 12 model configurations with trading metrics
 - `ml backtest SYMBOL` - Run historical backtest
@@ -415,7 +434,9 @@ Configure stocks in `config/watchlist.json`:
 
 ### Stop Loss & Target
 - Automatic SL/Target calculation based on strategy
-- Trailing stop loss for profit protection
+- **High-watermark trailing stop loss**: Activates at 30% of target, protects 70% of peak profit
+- Separate `TRAILING_SL_HIT` event (🟡) vs hard `SL_HIT` (🔴) for accurate P&L classification
+- Differentiated targets: stocks get higher reward targets than indices (`is_index` flag)
 - Customizable percentages in config
 
 ### Position Limits

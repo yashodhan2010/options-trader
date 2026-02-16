@@ -409,12 +409,10 @@ Max Profit: ₹55 × 25 = ₹1,375
 
 The bot automatically selects strategies based on:
 
-1. **Market Sentiment** (from OI analysis):
-   - STRONGLY_BULLISH → Long Call, Bull Call Spread
+1. **ML Prediction** (primary - ternary):
    - BULLISH → Long Call, Bull Call Spread, Bull Put Spread, Short Put
    - NEUTRAL → Iron Condor, Short Straddle, Short Strangle, Credit Spreads
    - BEARISH → Long Put, Bear Put Spread, Bear Call Spread, Short Call
-   - STRONGLY_BEARISH → Long Put, Bear Put Spread
 
 2. **IV Regime**:
    - HIGH_IV → Sell strategies (Short Call/Put, Credit Spreads, Iron Condor)
@@ -423,6 +421,15 @@ The bot automatically selects strategies based on:
 
 3. **Support/Resistance** (from max OI strikes):
    - Short strikes placed at max OI levels (natural S/R)
+
+4. **Expiry Selection**:
+   - **Indices** (NIFTY, BANKNIFTY, FINNIFTY): Weekly expiry (faster theta decay, tighter strikes)
+   - **Stocks** (AXISBANK, HDFCBANK, etc.): Monthly expiry (more liquidity, wider availability)
+
+5. **Spread Width** (ATR-based):
+   - Spread width is dynamically set using the 14-period ATR of the underlying
+   - Higher volatility → wider spreads, lower volatility → tighter spreads
+   - Replaces fixed-width spread selection for better risk/reward adaptation
 
 ---
 
@@ -498,4 +505,4 @@ For traders who prefer **collecting premium** (theta decay):
 
 ---
 
-*Last Updated: December 2024*
+*Last Updated: February 2026*

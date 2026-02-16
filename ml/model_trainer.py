@@ -6,8 +6,11 @@ Supports walk-forward validation, ensemble creation, and MLflow tracking.
 """
 
 import json
+import os
 import pickle
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
@@ -36,7 +39,10 @@ except ImportError:
 try:
     import optuna
     from optuna.samplers import TPESampler
+    from optuna.pruners import MedianPruner
     OPTUNA_AVAILABLE = True
+    # Suppress noisy per-trial Optuna logs — we log our own summaries
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
 except ImportError:
     OPTUNA_AVAILABLE = False
     logger.warning("Optuna not installed. Install with: pip install optuna")
@@ -84,10 +90,17 @@ class ModelTrainer:
         self.validation_split = ML_CONFIG.get("validation_split", 0.2)
         self.walk_forward_splits = ML_CONFIG.get("walk_forward_splits", 5)
         
+        # Parallel training config
+        self.parallel_training = ML_CONFIG.get("parallel_training", True)
+        total_cores = os.cpu_count() or 4
+        self.n_cores = total_cores
+        # When training 3 models in parallel, each gets cores/3
+        self.cores_per_model = max(1, total_cores // 3)
+        
         self.scaler = StandardScaler() if SKLEARN_AVAILABLE else None
         self.feature_names: List[str] = []
         
-        logger.info(f"ModelTrainer initialized. Model path: {self.model_path}")
+        logger.info(f"ModelTrainer initialized. Cores: {total_cores}, parallel: {self.parallel_training}, model_path: {self.model_path}")
     
     def train_direction_model(
         self,
@@ -347,7 +360,8 @@ class ModelTrainer:
         y_train: np.ndarray,
         X_val: np.ndarray,
         y_val: np.ndarray,
-        optimize: bool = True
+        optimize: bool = True,
+        n_jobs: int = -1
     ) -> Tuple[Any, Dict[str, float]]:
         """Train XGBoost classifier."""
         if not XGBOOST_AVAILABLE:
@@ -356,7 +370,7 @@ class ModelTrainer:
         n_classes = len(np.unique(y_train))
         
         if optimize and OPTUNA_AVAILABLE:
-            best_params = self._optimize_xgboost(X_train, y_train, n_classes)
+            best_params = self._optimize_xgboost(X_train, y_train, n_classes, n_jobs=n_jobs)
         else:
             best_params = {
                 "max_depth": 6,
@@ -383,6 +397,7 @@ class ModelTrainer:
             eval_metric=eval_metric,
             use_label_encoder=False,
             random_state=42,
+            n_jobs=n_jobs,
             **best_params
         )
         
@@ -405,7 +420,8 @@ class ModelTrainer:
         y_train: np.ndarray,
         X_val: np.ndarray,
         y_val: np.ndarray,
-        optimize: bool = True
+        optimize: bool = True,
+        n_jobs: int = -1
     ) -> Tuple[Any, Dict[str, float]]:
         """Train LightGBM classifier."""
         if not LIGHTGBM_AVAILABLE:
@@ -414,7 +430,7 @@ class ModelTrainer:
         n_classes = len(np.unique(y_train))
         
         if optimize and OPTUNA_AVAILABLE:
-            best_params = self._optimize_lightgbm(X_train, y_train, n_classes)
+            best_params = self._optimize_lightgbm(X_train, y_train, n_classes, n_jobs=n_jobs)
         else:
             best_params = {
                 "max_depth": 6,
@@ -432,6 +448,7 @@ class ModelTrainer:
             objective="multiclass" if n_classes > 2 else "binary",
             random_state=42,
             verbose=-1,
+            n_jobs=n_jobs,
             **best_params
         )
         
@@ -452,7 +469,8 @@ class ModelTrainer:
         y_train: np.ndarray,
         X_val: np.ndarray,
         y_val: np.ndarray,
-        optimize: bool = True
+        optimize: bool = True,
+        n_jobs: int = -1
     ) -> Tuple[Any, Dict[str, float]]:
         """Train Random Forest classifier."""
         if not SKLEARN_AVAILABLE:
@@ -461,7 +479,7 @@ class ModelTrainer:
         n_classes = len(np.unique(y_train))
         
         if optimize and OPTUNA_AVAILABLE:
-            best_params = self._optimize_random_forest(X_train, y_train)
+            best_params = self._optimize_random_forest(X_train, y_train, n_jobs=n_jobs)
         else:
             best_params = {
                 "n_estimators": 100,
@@ -473,7 +491,7 @@ class ModelTrainer:
         
         model = RandomForestClassifier(
             random_state=42,
-            n_jobs=-1,
+            n_jobs=n_jobs,
             **best_params
         )
         
@@ -493,44 +511,107 @@ class ModelTrainer:
         y_val: np.ndarray,
         optimize: bool = True
     ) -> Tuple[Dict[str, Any], Dict[str, float]]:
-        """Train ensemble of XGBoost, LightGBM, and Random Forest."""
+        """Train ensemble of XGBoost, LightGBM, and Random Forest with Optuna-tuned weights.
+        
+        When parallel_training is enabled, trains all 3 sub-models concurrently
+        using ThreadPoolExecutor, allocating cores/3 threads per model.
+        XGB/LGB/RF all release the GIL during native C++ computation,
+        so thread-level parallelism is effective.
+        """
         ensemble = {}
         ensemble_metrics = {}
         
-        # Train individual models
+        # Build list of models to train
+        models_to_train = []
         if XGBOOST_AVAILABLE:
-            logger.info("Training XGBoost for ensemble...")
-            ensemble["xgboost"], xgb_metrics = self._train_xgboost(
-                X_train, y_train, X_val, y_val, optimize
-            )
-            ensemble_metrics["xgboost"] = xgb_metrics
-        
+            models_to_train.append("xgboost")
         if LIGHTGBM_AVAILABLE:
-            logger.info("Training LightGBM for ensemble...")
-            ensemble["lightgbm"], lgb_metrics = self._train_lightgbm(
-                X_train, y_train, X_val, y_val, optimize
-            )
-            ensemble_metrics["lightgbm"] = lgb_metrics
-        
+            models_to_train.append("lightgbm")
         if SKLEARN_AVAILABLE:
-            logger.info("Training Random Forest for ensemble...")
-            ensemble["random_forest"], rf_metrics = self._train_random_forest(
-                X_train, y_train, X_val, y_val, optimize
-            )
-            ensemble_metrics["random_forest"] = rf_metrics
+            models_to_train.append("random_forest")
         
-        # Get ensemble weights from config
-        weights = ML_CONFIG.get("ensemble_weights", {
-            "xgboost": 0.5,
-            "lightgbm": 0.3,
-            "random_forest": 0.2,
-        })
+        if self.parallel_training and len(models_to_train) > 1:
+            # --- PARALLEL TRAINING ---
+            logger.info(f"Training {len(models_to_train)} models in parallel "
+                        f"({self.cores_per_model} cores each, {self.n_cores} total)...")
+            
+            # Temporarily limit per-model cores to avoid oversubscription
+            saved_n_jobs = self.cores_per_model
+            
+            def _train_model(model_name):
+                t0 = time.time()
+                if model_name == "xgboost":
+                    model, metrics = self._train_xgboost(
+                        X_train, y_train, X_val, y_val, optimize,
+                        n_jobs=saved_n_jobs
+                    )
+                elif model_name == "lightgbm":
+                    model, metrics = self._train_lightgbm(
+                        X_train, y_train, X_val, y_val, optimize,
+                        n_jobs=saved_n_jobs
+                    )
+                elif model_name == "random_forest":
+                    model, metrics = self._train_random_forest(
+                        X_train, y_train, X_val, y_val, optimize,
+                        n_jobs=saved_n_jobs
+                    )
+                elapsed = time.time() - t0
+                logger.info(f"  {model_name} done in {elapsed:.1f}s "
+                            f"(acc={metrics.get('accuracy', 0):.1%})")
+                return model_name, model, metrics
+            
+            t_start = time.time()
+            with ThreadPoolExecutor(max_workers=len(models_to_train)) as executor:
+                futures = {executor.submit(_train_model, name): name
+                           for name in models_to_train}
+                for future in as_completed(futures):
+                    name, model, metrics = future.result()
+                    ensemble[name] = model
+                    ensemble_metrics[name] = metrics
+            
+            total_time = time.time() - t_start
+            logger.info(f"All {len(models_to_train)} models trained in {total_time:.1f}s (parallel)")
+        
+        else:
+            # --- SEQUENTIAL TRAINING ---
+            for name in models_to_train:
+                logger.info(f"Training {name} for ensemble...")
+                t0 = time.time()
+                if name == "xgboost":
+                    ensemble[name], m = self._train_xgboost(
+                        X_train, y_train, X_val, y_val, optimize
+                    )
+                elif name == "lightgbm":
+                    ensemble[name], m = self._train_lightgbm(
+                        X_train, y_train, X_val, y_val, optimize
+                    )
+                elif name == "random_forest":
+                    ensemble[name], m = self._train_random_forest(
+                        X_train, y_train, X_val, y_val, optimize
+                    )
+                ensemble_metrics[name] = m
+                logger.info(f"  {name} done in {time.time()-t0:.1f}s")
+        
+        # Optimize ensemble weights with Optuna (or use config defaults)
+        model_names = [n for n in ensemble if n not in ["weights", "scaler"]]
+        n_classes = len(np.unique(y_train))
+        
+        if optimize and OPTUNA_AVAILABLE and len(model_names) >= 2:
+            logger.info("Optimizing ensemble weights with Optuna...")
+            weights = self._optimize_ensemble_weights(
+                ensemble, model_names, X_val, y_val, n_classes
+            )
+        else:
+            weights = ML_CONFIG.get("ensemble_weights", {
+                "xgboost": 0.5,
+                "lightgbm": 0.3,
+                "random_forest": 0.2,
+            })
         
         ensemble["weights"] = weights
         ensemble["scaler"] = self.scaler
         
-        # Calculate ensemble predictions
-        n_classes = len(np.unique(y_train))
+        # Calculate ensemble predictions with optimized weights
         ensemble_probs = np.zeros((len(X_val), n_classes))
         total_weight = 0
         
@@ -552,16 +633,81 @@ class ModelTrainer:
         # Calculate ensemble metrics
         metrics = self._calculate_metrics(y_val, ensemble_pred, n_classes)
         metrics["individual_metrics"] = ensemble_metrics
+        metrics["optimized_weights"] = weights
         
         return ensemble, metrics
+    
+    def _optimize_ensemble_weights(
+        self,
+        ensemble: Dict[str, Any],
+        model_names: List[str],
+        X_val: np.ndarray,
+        y_val: np.ndarray,
+        n_classes: int
+    ) -> Dict[str, float]:
+        """Use Optuna to find optimal ensemble weights.
+        
+        Optimizes blending weights for each sub-model to maximize
+        ensemble accuracy on the validation set.
+        """
+        # Pre-compute all model probabilities (avoid recalculating each trial)
+        model_probs = {}
+        for name in model_names:
+            model = ensemble[name]
+            if hasattr(model, "predict_proba"):
+                model_probs[name] = model.predict_proba(X_val)
+        
+        if len(model_probs) < 2:
+            logger.info("Only one model available, skipping weight optimization")
+            return {name: 1.0 for name in model_probs}
+        
+        def objective(trial):
+            # Suggest raw weights and normalize to sum to 1
+            raw_weights = {}
+            for name in model_probs:
+                raw_weights[name] = trial.suggest_float(f"w_{name}", 0.05, 1.0)
+            
+            total = sum(raw_weights.values())
+            weights = {name: w / total for name, w in raw_weights.items()}
+            
+            # Blend predictions
+            blended = np.zeros((len(X_val), n_classes))
+            for name, w in weights.items():
+                blended += w * model_probs[name]
+            
+            preds = np.argmax(blended, axis=1)
+            
+            # Use F1 (weighted) as objective — better than accuracy for imbalanced classes
+            avg = "binary" if n_classes == 2 else "weighted"
+            return f1_score(y_val, preds, average=avg, zero_division=0)
+        
+        study = optuna.create_study(
+            direction="maximize",
+            sampler=TPESampler(seed=42)
+        )
+        
+        # Weight optimization is fast (no model training), so run many trials
+        study.optimize(objective, n_trials=200, timeout=30, show_progress_bar=False)
+        
+        # Extract and normalize best weights
+        best = study.best_params
+        raw = {name: best[f"w_{name}"] for name in model_probs}
+        total = sum(raw.values())
+        weights = {name: round(w / total, 3) for name, w in raw.items()}
+        
+        logger.info(f"Optimized ensemble weights: {weights} (F1={study.best_value:.4f})")
+        return weights
     
     def _optimize_xgboost(
         self,
         X: np.ndarray,
         y: np.ndarray,
-        n_classes: int
+        n_classes: int,
+        n_jobs: int = -1
     ) -> Dict[str, Any]:
-        """Optuna optimization for XGBoost."""
+        """Optuna optimization for XGBoost with pruning."""
+        use_pruning = ML_CONFIG.get("optuna_pruning", True)
+        
         def objective(trial):
             params = {
                 "max_depth": trial.suggest_int("max_depth", 3, 10),
@@ -579,7 +725,7 @@ class ModelTrainer:
             tscv = TimeSeriesSplit(n_splits=3)
             scores = []
             
-            for train_idx, val_idx in tscv.split(X):
+            for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(X)):
                 X_train, X_val = X[train_idx], X[val_idx]
                 y_train, y_val = y[train_idx], y[val_idx]
                 
@@ -587,37 +733,52 @@ class ModelTrainer:
                     objective="binary:logistic" if n_classes == 2 else "multi:softprob",
                     use_label_encoder=False,
                     random_state=42,
+                    n_jobs=n_jobs,
                     **params
                 )
                 
                 model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
                 y_pred = model.predict(X_val)
                 scores.append(accuracy_score(y_val, y_pred))
+                
+                # Report intermediate score for pruning
+                if use_pruning:
+                    trial.report(np.mean(scores), fold_idx)
+                    if trial.should_prune():
+                        raise optuna.TrialPruned()
             
             return np.mean(scores)
         
+        pruner = MedianPruner(n_startup_trials=5, n_warmup_steps=1) if use_pruning else optuna.pruners.NopPruner()
+        
         study = optuna.create_study(
             direction="maximize",
-            sampler=TPESampler(seed=42)
+            sampler=TPESampler(seed=42),
+            pruner=pruner
         )
         
         study.optimize(
             objective,
             n_trials=self.optuna_trials,
             timeout=self.optuna_timeout,
-            show_progress_bar=True
+            show_progress_bar=not self.parallel_training
         )
         
-        logger.info(f"XGBoost best params: {study.best_params}")
+        n_pruned = len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED])
+        logger.info(f"XGBoost best params: {study.best_params} (pruned {n_pruned}/{len(study.trials)} trials, "
+                    f"best={study.best_value:.4f}, n_jobs={n_jobs})")
         return study.best_params
     
     def _optimize_lightgbm(
         self,
         X: np.ndarray,
         y: np.ndarray,
-        n_classes: int
+        n_classes: int,
+        n_jobs: int = -1
     ) -> Dict[str, Any]:
-        """Optuna optimization for LightGBM."""
+        """Optuna optimization for LightGBM with pruning."""
+        use_pruning = ML_CONFIG.get("optuna_pruning", True)
+        
         def objective(trial):
             params = {
                 "max_depth": trial.suggest_int("max_depth", 3, 10),
@@ -634,7 +795,7 @@ class ModelTrainer:
             tscv = TimeSeriesSplit(n_splits=3)
             scores = []
             
-            for train_idx, val_idx in tscv.split(X):
+            for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(X)):
                 X_train, X_val = X[train_idx], X[val_idx]
                 y_train, y_val = y[train_idx], y[val_idx]
                 
@@ -642,36 +803,51 @@ class ModelTrainer:
                     objective="multiclass" if n_classes > 2 else "binary",
                     random_state=42,
                     verbose=-1,
+                    n_jobs=n_jobs,
                     **params
                 )
                 
                 model.fit(X_train, y_train, eval_set=[(X_val, y_val)])
                 y_pred = model.predict(X_val)
                 scores.append(accuracy_score(y_val, y_pred))
+                
+                # Report intermediate score for pruning
+                if use_pruning:
+                    trial.report(np.mean(scores), fold_idx)
+                    if trial.should_prune():
+                        raise optuna.TrialPruned()
             
             return np.mean(scores)
         
+        pruner = MedianPruner(n_startup_trials=5, n_warmup_steps=1) if use_pruning else optuna.pruners.NopPruner()
+        
         study = optuna.create_study(
             direction="maximize",
-            sampler=TPESampler(seed=42)
+            sampler=TPESampler(seed=42),
+            pruner=pruner
         )
         
         study.optimize(
             objective,
             n_trials=self.optuna_trials,
             timeout=self.optuna_timeout,
-            show_progress_bar=True
+            show_progress_bar=not self.parallel_training
         )
         
-        logger.info(f"LightGBM best params: {study.best_params}")
+        n_pruned = len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED])
+        logger.info(f"LightGBM best params: {study.best_params} (pruned {n_pruned}/{len(study.trials)} trials, "
+                    f"best={study.best_value:.4f}, n_jobs={n_jobs})")
         return study.best_params
     
     def _optimize_random_forest(
         self,
         X: np.ndarray,
-        y: np.ndarray
+        y: np.ndarray,
+        n_jobs: int = -1
     ) -> Dict[str, Any]:
-        """Optuna optimization for Random Forest."""
+        """Optuna optimization for Random Forest with pruning."""
+        use_pruning = ML_CONFIG.get("optuna_pruning", True)
+        
         def objective(trial):
             params = {
                 "n_estimators": trial.suggest_int("n_estimators", 50, 300),
@@ -684,30 +860,40 @@ class ModelTrainer:
             tscv = TimeSeriesSplit(n_splits=3)
             scores = []
             
-            for train_idx, val_idx in tscv.split(X):
+            for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(X)):
                 X_train, X_val = X[train_idx], X[val_idx]
                 y_train, y_val = y[train_idx], y[val_idx]
                 
-                model = RandomForestClassifier(random_state=42, n_jobs=-1, **params)
+                model = RandomForestClassifier(random_state=42, n_jobs=n_jobs, **params)
                 model.fit(X_train, y_train)
                 y_pred = model.predict(X_val)
                 scores.append(accuracy_score(y_val, y_pred))
+                
+                # Report intermediate score for pruning
+                if use_pruning:
+                    trial.report(np.mean(scores), fold_idx)
+                    if trial.should_prune():
+                        raise optuna.TrialPruned()
             
             return np.mean(scores)
         
+        pruner = MedianPruner(n_startup_trials=5, n_warmup_steps=1) if use_pruning else optuna.pruners.NopPruner()
+        
         study = optuna.create_study(
             direction="maximize",
-            sampler=TPESampler(seed=42)
+            sampler=TPESampler(seed=42),
+            pruner=pruner
         )
         
         study.optimize(
             objective,
             n_trials=min(self.optuna_trials, 30),  # RF is slower
             timeout=self.optuna_timeout,
-            show_progress_bar=True
+            show_progress_bar=not self.parallel_training
         )
         
-        logger.info(f"Random Forest best params: {study.best_params}")
+        logger.info(f"Random Forest best params: {study.best_params} (pruned {len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED])}/{len(study.trials)} trials, "
+                    f"best={study.best_value:.4f}, n_jobs={n_jobs})")
         return study.best_params
     
     def _calculate_metrics(

@@ -136,6 +136,9 @@ class StrategySignal:
         }
 
 
+from config.settings import LIQUIDITY_GUARD
+
+
 # Indices vs stocks - used for reward scaling
 INDEX_UNDERLYINGS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"]
 
@@ -240,6 +243,62 @@ class BaseStrategy(ABC):
         """
         if not metrics:
             return False, "No metrics available"
+        
+        return True, ""
+    
+    def check_leg_liquidity(self, option_row: pd.Series) -> tuple[bool, str]:
+        """
+        Check if a single option leg meets minimum liquidity thresholds.
+        
+        Examines volume, open interest, and bid-ask spread width.
+        Thresholds differ for indices (more liquid) vs stocks.
+        
+        Args:
+            option_row: A single row from the options chain DataFrame,
+                        expected to have columns: volume, oi, bid, ask, ltp, symbol.
+            
+        Returns:
+            (True, "") if liquid enough, (False, reason) otherwise.
+        """
+        if not LIQUIDITY_GUARD.get("enabled", True):
+            return True, ""
+        
+        symbol = option_row.get("symbol", "?")
+        idx = self.is_index
+        
+        # ── Volume check ─────────────────────────────────────────────
+        min_vol = LIQUIDITY_GUARD.get(
+            "min_volume_index" if idx else "min_volume_stock", 500
+        )
+        volume = option_row.get("volume", 0) or 0
+        if volume < min_vol:
+            return False, (
+                f"Volume too low on {symbol}: {volume} < {min_vol}"
+            )
+        
+        # ── Open Interest check ──────────────────────────────────────
+        min_oi = LIQUIDITY_GUARD.get(
+            "min_oi_index" if idx else "min_oi_stock", 1000
+        )
+        oi = option_row.get("oi", 0) or 0
+        if oi < min_oi:
+            return False, (
+                f"OI too low on {symbol}: {oi} < {min_oi}"
+            )
+        
+        # ── Bid-Ask spread check ─────────────────────────────────────
+        max_spread_pct = LIQUIDITY_GUARD.get("max_bid_ask_spread_pct", 5.0)
+        bid = option_row.get("bid", 0) or 0
+        ask = option_row.get("ask", 0) or 0
+        
+        if bid > 0 and ask > 0:
+            mid = (bid + ask) / 2
+            spread_pct = ((ask - bid) / mid) * 100 if mid > 0 else 0
+            if spread_pct > max_spread_pct:
+                return False, (
+                    f"Bid-ask spread too wide on {symbol}: "
+                    f"{spread_pct:.1f}% > {max_spread_pct}%"
+                )
         
         return True, ""
     

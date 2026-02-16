@@ -252,12 +252,20 @@ class MLPredictor:
             probs = np.zeros(3)
             probs[int(pred)] = 1.0
         
-        # Get predicted class
-        raw_pred = int(np.argmax(probs))
+        # Handle binary vs multiclass models
+        if len(probs) == 2:
+            # Binary model: class 0 = BEARISH, class 1 = BULLISH (no NEUTRAL)
+            # Map to 3-class probability space for consistent handling
+            mapped_probs = np.array([probs[0], 0.0, probs[1]])  # [BEARISH, NEUTRAL, BULLISH]
+        else:
+            mapped_probs = probs
+        
+        # Get predicted class from mapped probabilities
+        raw_pred = int(np.argmax(mapped_probs))
         direction = self.DIRECTION_MAP.get(raw_pred, "NEUTRAL")
         
         # Calculate confidence from probability distribution
-        confidence = float(np.max(probs))
+        confidence = float(np.max(mapped_probs))
         
         # Apply feedback-based confidence adjustment
         adjusted_confidence = confidence * self.confidence_adjustment
@@ -266,9 +274,9 @@ class MLPredictor:
         
         # Create probability dict
         prob_dict = {
-            "BEARISH": float(probs[0]) if len(probs) > 0 else 0,
-            "NEUTRAL": float(probs[1]) if len(probs) > 1 else 0,
-            "BULLISH": float(probs[2]) if len(probs) > 2 else 0,
+            "BEARISH": float(mapped_probs[0]),
+            "NEUTRAL": float(mapped_probs[1]),
+            "BULLISH": float(mapped_probs[2]),
         }
         
         return MLPrediction(

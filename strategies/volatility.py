@@ -55,9 +55,18 @@ class IronCondorStrategy(BaseStrategy):
         strike_interval = 50 if self.underlying in ["NIFTY", "FINNIFTY"] else 100
         atm_strike = round(spot / strike_interval) * strike_interval
         
-        # Use max OI strikes as short strikes
+        # ATR-based minimum OTM distance for iron condor short strikes
+        historical = metrics.get("historical", {})
+        atr_14 = historical.get("atr_14", strike_interval) if isinstance(historical, dict) else strike_interval
+        min_otm_strikes = max(2, round(atr_14 / strike_interval))
+        
+        # Use max OI strikes as short strikes, but enforce ATR minimum distance
         max_call_strike = oi_data.get("max_call_oi_strike", atm_strike + 2 * strike_interval)
         max_put_strike = oi_data.get("max_put_oi_strike", atm_strike - 2 * strike_interval)
+        
+        # Ensure short strikes are at least min_otm_strikes away from ATM
+        max_call_strike = max(max_call_strike, atm_strike + min_otm_strikes * strike_interval)
+        max_put_strike = min(max_put_strike, atm_strike - min_otm_strikes * strike_interval)
         
         # Define strikes
         sell_call_strike = max_call_strike
@@ -78,6 +87,14 @@ class IronCondorStrategy(BaseStrategy):
         buy_call = buy_call.iloc[0]
         sell_put = sell_put.iloc[0]
         buy_put = buy_put.iloc[0]
+        
+        # Liquidity guard
+        for leg_label, leg_row in [("sell_call", sell_call), ("buy_call", buy_call),
+                                    ("sell_put", sell_put), ("buy_put", buy_put)]:
+            is_liquid, liq_reason = self.check_leg_liquidity(leg_row)
+            if not is_liquid:
+                logger.info(f"Iron Condor {self.underlying} ({leg_label}): {liq_reason}")
+                return None
         
         # Calculate premiums
         call_spread_credit = sell_call["ltp"] - buy_call["ltp"]
@@ -250,6 +267,13 @@ class StraddleStrategy(BaseStrategy):
         call_option = call_option.iloc[0]
         put_option = put_option.iloc[0]
         
+        # Liquidity guard
+        for leg_label, leg_row in [("call", call_option), ("put", put_option)]:
+            is_liquid, liq_reason = self.check_leg_liquidity(leg_row)
+            if not is_liquid:
+                logger.info(f"Straddle {self.underlying} ({leg_label}): {liq_reason}")
+                return None
+        
         total_premium = call_option["ltp"] + put_option["ltp"]
         
         confidence = self._calculate_confidence(oi_data, volatility)
@@ -403,6 +427,13 @@ class StrangleStrategy(BaseStrategy):
         
         call_option = call_option.iloc[0]
         put_option = put_option.iloc[0]
+        
+        # Liquidity guard
+        for leg_label, leg_row in [("call", call_option), ("put", put_option)]:
+            is_liquid, liq_reason = self.check_leg_liquidity(leg_row)
+            if not is_liquid:
+                logger.info(f"Strangle {self.underlying} ({leg_label}): {liq_reason}")
+                return None
         
         total_premium = call_option["ltp"] + put_option["ltp"]
         

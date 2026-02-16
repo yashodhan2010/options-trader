@@ -139,6 +139,7 @@ class NotificationService:
             "ENTRY": "🟢",
             "EXIT": "🔵",
             "SL_HIT": "🔴",
+            "TRAILING_SL_HIT": "🟡",
             "TARGET_HIT": "🎯",
         }
         

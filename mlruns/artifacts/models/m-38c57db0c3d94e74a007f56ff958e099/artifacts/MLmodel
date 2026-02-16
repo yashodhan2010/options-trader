@@ -1,0 +1,14 @@
+artifact_path: file:\C:\Users\Yashodhan\OneDrive\Documents\Algo\OptionsTrader\options-trader\mlruns\artifacts/models/m-38c57db0c3d94e74a007f56ff958e099/artifacts
+flavors:
+  sklearn:
+    code: null
+    pickled_model: model.pkl
+    serialization_format: cloudpickle
+    sklearn_version: 1.7.1
+mlflow_version: 3.3.2
+model_id: m-38c57db0c3d94e74a007f56ff958e099
+model_size_bytes: 833101
+model_uuid: m-38c57db0c3d94e74a007f56ff958e099
+prompts: null
+run_id: 9f1c952ebe8e4dea9b35b4ab78868063
+utc_time_created: '2026-02-16 09:05:49.863410'

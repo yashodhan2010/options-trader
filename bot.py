@@ -65,12 +65,13 @@ class OptionsTradingBot:
     def _register_callbacks(self) -> None:
         """Register callbacks for position events."""
         position_tracker.register_callback("sl_hit", self._on_sl_hit)
+        position_tracker.register_callback("trailing_sl_hit", self._on_trailing_sl_hit)
         position_tracker.register_callback("target_hit", self._on_target_hit)
         position_tracker.register_callback("position_closed", self._on_position_closed)
         position_tracker.register_callback("signal_exit", self._on_signal_exit)
     
     def _on_sl_hit(self, execution_id: str, pnl: float) -> None:
-        """Handle stop loss hit."""
+        """Handle hard stop loss hit (always a loss)."""
         logger.warning(f"[SL HIT] {execution_id}, Loss: Rs.{abs(pnl):.2f}")
         self._send_notification(f"Stop Loss Hit!\nPosition: {execution_id}\nLoss: Rs.{abs(pnl):.2f}")
         
@@ -80,6 +81,28 @@ class OptionsTradingBot:
         trade_logger.info(f"Execution ID: {execution_id}")
         trade_logger.info(f"P&L:          Rs.{pnl:.2f}")
         trade_logger.info(f"Result:       LOSS")
+        trade_logger.info("=" * 80)
+        trade_logger.info("")
+    
+    def _on_trailing_sl_hit(self, execution_id: str, pnl: float, trail_level: float) -> None:
+        """Handle trailing stop loss hit (locks in profits — P&L is typically positive)."""
+        result = "PROFIT" if pnl >= 0 else "LOSS"
+        pnl_label = "Profit" if pnl >= 0 else "Loss"
+        log_fn = logger.info if pnl >= 0 else logger.warning
+        
+        log_fn(f"[TRAILING SL] {execution_id}, {pnl_label}: Rs.{abs(pnl):.2f} (floor: {trail_level:.2f})")
+        self._send_notification(
+            f"Trailing SL Hit!\nPosition: {execution_id}\n"
+            f"{pnl_label}: Rs.{abs(pnl):.2f}\nTrail Floor: Rs.{trail_level:.2f}"
+        )
+        
+        # Log to trade file
+        trade_logger.info("=" * 80)
+        trade_logger.info(f"TRAILING STOP LOSS HIT")
+        trade_logger.info(f"Execution ID: {execution_id}")
+        trade_logger.info(f"P&L:          Rs.{pnl:.2f}")
+        trade_logger.info(f"Trail Floor:  Rs.{trail_level:.2f}")
+        trade_logger.info(f"Result:       {result}")
         trade_logger.info("=" * 80)
         trade_logger.info("")
     

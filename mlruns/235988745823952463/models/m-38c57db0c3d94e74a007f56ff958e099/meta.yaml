@@ -1,0 +1,10 @@
+artifact_location: file:\C:\Users\Yashodhan\OneDrive\Documents\Algo\OptionsTrader\options-trader\mlruns\artifacts/models/m-38c57db0c3d94e74a007f56ff958e099/artifacts
+creation_timestamp: 1771232749623
+experiment_id: '235988745823952463'
+last_updated_timestamp: 1771232753040
+model_id: m-38c57db0c3d94e74a007f56ff958e099
+model_type: null
+name: ensemble_20260216_143512
+source_run_id: 9f1c952ebe8e4dea9b35b4ab78868063
+status: 2
+status_message: null
