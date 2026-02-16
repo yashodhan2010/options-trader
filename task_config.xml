@@ -25,6 +25,7 @@
       <RestartOnIdle>false</RestartOnIdle>
     </IdleSettings>
     <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>
+    <StartWhenAvailable>true</StartWhenAvailable>
   </Settings>
   <Triggers>
     <CalendarTrigger>

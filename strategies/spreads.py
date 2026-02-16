@@ -29,6 +29,7 @@ class BullCallSpreadStrategy(BaseStrategy):
         """Analyze and generate signal for bull call spread."""
         is_valid, reason = self.validate_conditions(metrics)
         if not is_valid:
+            logger.debug(f"Bull Call Spread {self.underlying}: validation failed - {reason}")
             return None
         
         oi_data = metrics.get("oi_data", {})
@@ -36,24 +37,35 @@ class BullCallSpreadStrategy(BaseStrategy):
         spot = metrics.get("spot", 0)
         
         sentiment = oi_data.get("sentiment", "NEUTRAL")
-        if sentiment not in ["BULLISH", "STRONGLY_BULLISH", "NEUTRAL"]:
+        if not self.ml_override and sentiment not in ["BULLISH", "STRONGLY_BULLISH", "NEUTRAL"]:
+            logger.info(f"Bull Call Spread {self.underlying}: skipped - OI sentiment is {sentiment}")
             return None
         
         calls = options_chain[options_chain["option_type"] == "CE"].sort_values("strike")
         if len(calls) < 2:
+            logger.info(f"Bull Call Spread {self.underlying}: skipped - not enough CE options")
             return None
         
         strike_interval = 50 if self.underlying in ["NIFTY", "FINNIFTY"] else 100
         atm_strike = round(spot / strike_interval) * strike_interval
         
         # Buy ATM/slightly ITM, Sell OTM
-        buy_strike = atm_strike
-        sell_strike = atm_strike + (2 * strike_interval)
+        available_strikes = sorted(calls["strike"].unique())
+        buy_strike = min(available_strikes, key=lambda s: abs(s - atm_strike)) if available_strikes else atm_strike
+        sell_candidates = [s for s in available_strikes if s > buy_strike]
+        # Pick the 2nd OTM strike if available, otherwise 1st
+        if len(sell_candidates) >= 2:
+            sell_strike = sell_candidates[1]
+        elif sell_candidates:
+            sell_strike = sell_candidates[0]
+        else:
+            return None
         
         buy_option = calls[calls["strike"] == buy_strike]
         sell_option = calls[calls["strike"] == sell_strike]
         
         if buy_option.empty or sell_option.empty:
+            logger.info(f"Bull Call Spread {self.underlying}: skipped - strikes {buy_strike}/{sell_strike} not found")
             return None
         
         buy_option = buy_option.iloc[0]
@@ -67,9 +79,9 @@ class BullCallSpreadStrategy(BaseStrategy):
         if max_profit <= 0 or net_debit <= 0:
             return None
         
-        # Realistic expected profit: Only 30-40% of max profit is typically achieved
-        # because stock rarely moves all the way to the short strike
-        realistic_profit_pct = 0.35  # Expect to capture 35% of max profit
+        # Realistic expected profit: Stocks have higher margins so target more of the spread
+        # Indices: capture 35% of max profit; Stocks: capture 50%
+        realistic_profit_pct = 0.35 if self.is_index else 0.50
         expected_profit_per_share = max_profit * realistic_profit_pct
         
         # Risk/Reward based on realistic expectation
@@ -77,7 +89,8 @@ class BullCallSpreadStrategy(BaseStrategy):
         
         confidence = self._calculate_confidence(oi_data, volatility, sentiment, net_debit, max_profit)
         
-        if confidence < self.min_confidence:
+        if not self.ml_override and confidence < self.min_confidence:
+            logger.info(f"Bull Call Spread {self.underlying}: skipped - strategy confidence {confidence:.2f} < {self.min_confidence}")
             return None
         
         lot_size = get_lot_size(self.underlying)
@@ -160,7 +173,9 @@ class BullCallSpreadStrategy(BaseStrategy):
         return entry_price * 0.5  # Exit at 50% loss of debit
     
     def calculate_target(self, max_profit: float, **kwargs) -> float:
-        return max_profit * 0.7  # Target 70% of max profit
+        # Indices: 70% of realistic expected; Stocks: 85% (higher margin justifies higher target)
+        target_pct = 0.70 if self.is_index else 0.85
+        return max_profit * target_pct
 
 
 class BearPutSpreadStrategy(BaseStrategy):
@@ -179,6 +194,7 @@ class BearPutSpreadStrategy(BaseStrategy):
         """Analyze and generate signal for bear put spread."""
         is_valid, reason = self.validate_conditions(metrics)
         if not is_valid:
+            logger.debug(f"Bear Put Spread {self.underlying}: validation failed - {reason}")
             return None
         
         oi_data = metrics.get("oi_data", {})
@@ -186,24 +202,33 @@ class BearPutSpreadStrategy(BaseStrategy):
         spot = metrics.get("spot", 0)
         
         sentiment = oi_data.get("sentiment", "NEUTRAL")
-        if sentiment not in ["BEARISH", "STRONGLY_BEARISH", "NEUTRAL"]:
+        if not self.ml_override and sentiment not in ["BEARISH", "STRONGLY_BEARISH", "NEUTRAL"]:
+            logger.info(f"Bear Put Spread {self.underlying}: skipped - OI sentiment is {sentiment}")
             return None
         
         puts = options_chain[options_chain["option_type"] == "PE"].sort_values("strike")
         if len(puts) < 2:
+            logger.info(f"Bear Put Spread {self.underlying}: skipped - not enough PE options")
             return None
         
         strike_interval = 50 if self.underlying in ["NIFTY", "FINNIFTY"] else 100
         atm_strike = round(spot / strike_interval) * strike_interval
         
         # Buy ATM/slightly ITM, Sell 1 strike OTM (tighter spread for better fill & realistic targets)
-        buy_strike = atm_strike
-        sell_strike = atm_strike - strike_interval
+        available_strikes = sorted(puts["strike"].unique())
+        buy_strike = min(available_strikes, key=lambda s: abs(s - atm_strike)) if available_strikes else atm_strike
+        sell_candidates = [s for s in available_strikes if s < buy_strike]
+        sell_strike = sell_candidates[-1] if sell_candidates else None
+        
+        if sell_strike is None:
+            logger.info(f"Bear Put Spread {self.underlying}: skipped - no OTM put strike below {buy_strike}")
+            return None
         
         buy_option = puts[puts["strike"] == buy_strike]
         sell_option = puts[puts["strike"] == sell_strike]
         
         if buy_option.empty or sell_option.empty:
+            logger.info(f"Bear Put Spread {self.underlying}: skipped - strikes {buy_strike}/{sell_strike} not found")
             return None
         
         buy_option = buy_option.iloc[0]
@@ -217,9 +242,9 @@ class BearPutSpreadStrategy(BaseStrategy):
         if max_profit <= 0 or net_debit <= 0:
             return None
         
-        # Realistic expected profit: Only 30-40% of max profit is typically achieved
-        # because stock rarely moves all the way to the short strike
-        realistic_profit_pct = 0.35  # Expect to capture 35% of max profit
+        # Realistic expected profit: Stocks have higher margins so target more of the spread
+        # Indices: capture 35% of max profit; Stocks: capture 50%
+        realistic_profit_pct = 0.35 if self.is_index else 0.50
         expected_profit_per_share = max_profit * realistic_profit_pct
         
         # Risk/Reward based on realistic expectation
@@ -227,7 +252,8 @@ class BearPutSpreadStrategy(BaseStrategy):
         
         confidence = self._calculate_confidence(oi_data, volatility, sentiment, net_debit, max_profit)
         
-        if confidence < self.min_confidence:
+        if not self.ml_override and confidence < self.min_confidence:
+            logger.info(f"Bear Put Spread {self.underlying}: skipped - strategy confidence {confidence:.2f} < {self.min_confidence}")
             return None
         
         lot_size = get_lot_size(self.underlying)
@@ -309,7 +335,9 @@ class BearPutSpreadStrategy(BaseStrategy):
         return entry_price * 0.5
     
     def calculate_target(self, max_profit: float, **kwargs) -> float:
-        return max_profit * 0.7
+        # Indices: 70% of realistic expected; Stocks: 85%
+        target_pct = 0.70 if self.is_index else 0.85
+        return max_profit * target_pct
 
 
 class BearCallSpreadStrategy(BaseStrategy):
@@ -330,6 +358,7 @@ class BearCallSpreadStrategy(BaseStrategy):
         """Analyze and generate signal for bear call spread (credit)."""
         is_valid, reason = self.validate_conditions(metrics)
         if not is_valid:
+            logger.debug(f"Bear Call Spread {self.underlying}: validation failed - {reason}")
             return None
         
         oi_data = metrics.get("oi_data", {})
@@ -338,7 +367,8 @@ class BearCallSpreadStrategy(BaseStrategy):
         
         sentiment = oi_data.get("sentiment", "NEUTRAL")
         # Best for bearish or neutral sentiment (we want price to stay below short strike)
-        if sentiment in ["BULLISH", "STRONGLY_BULLISH"]:
+        if not self.ml_override and sentiment in ["BULLISH", "STRONGLY_BULLISH"]:
+            logger.info(f"Bear Call Spread {self.underlying}: skipped - OI sentiment is {sentiment}")
             return None
         
         # Credit spreads work in any IV regime - higher IV gives better premiums
@@ -346,6 +376,7 @@ class BearCallSpreadStrategy(BaseStrategy):
         
         calls = options_chain[options_chain["option_type"] == "CE"].sort_values("strike")
         if len(calls) < 2:
+            logger.info(f"Bear Call Spread {self.underlying}: skipped - not enough CE options")
             return None
         
         strike_interval = 50 if self.underlying in ["NIFTY", "FINNIFTY"] else 100
@@ -354,6 +385,10 @@ class BearCallSpreadStrategy(BaseStrategy):
         # Use max call OI as resistance - sell at or near this level
         max_call_oi_strike = oi_data.get("max_call_oi_strike", atm_strike + 2 * strike_interval)
         
+        # Validate max_call_oi_strike is reasonable (within 10 intervals of ATM)
+        if max_call_oi_strike is None or abs(max_call_oi_strike - atm_strike) > 10 * strike_interval:
+            max_call_oi_strike = atm_strike + 2 * strike_interval
+        
         # Ensure sell strike is at least 1 interval OTM for safety
         min_sell_strike = atm_strike + strike_interval
         sell_strike = max(max_call_oi_strike, min_sell_strike)
@@ -361,10 +396,17 @@ class BearCallSpreadStrategy(BaseStrategy):
         # SELL lower strike call (at resistance), BUY higher strike call (hedge)
         buy_strike = sell_strike + strike_interval
         
+        # Find nearest available strikes in the chain
+        available_strikes = sorted(calls["strike"].unique())
+        sell_strike = min(available_strikes, key=lambda s: abs(s - sell_strike)) if available_strikes else sell_strike
+        buy_candidates = [s for s in available_strikes if s > sell_strike]
+        buy_strike = buy_candidates[0] if buy_candidates else sell_strike + strike_interval
+        
         sell_option = calls[calls["strike"] == sell_strike]
         buy_option = calls[calls["strike"] == buy_strike]
         
         if sell_option.empty or buy_option.empty:
+            logger.info(f"Bear Call Spread {self.underlying}: skipped - strikes {sell_strike}/{buy_strike} not found in chain")
             return None
         
         sell_option = sell_option.iloc[0]
@@ -376,6 +418,7 @@ class BearCallSpreadStrategy(BaseStrategy):
         max_loss = spread_width - net_credit
         
         if net_credit <= 0 or max_loss <= 0:
+            logger.info(f"Bear Call Spread {self.underlying}: skipped - unfavorable credit ({net_credit:.2f})")
             return None
         
         # Risk/Reward for credit spreads
@@ -383,7 +426,8 @@ class BearCallSpreadStrategy(BaseStrategy):
         
         confidence = self._calculate_confidence(oi_data, volatility, sentiment, net_credit, max_loss)
         
-        if confidence < self.min_confidence:
+        if not self.ml_override and confidence < self.min_confidence:
+            logger.info(f"Bear Call Spread {self.underlying}: skipped - strategy confidence {confidence:.2f} < {self.min_confidence}")
             return None
         
         lot_size = get_lot_size(self.underlying)
@@ -478,8 +522,9 @@ class BearCallSpreadStrategy(BaseStrategy):
         return entry_credit
     
     def calculate_target(self, entry_credit: float, **kwargs) -> float:
-        # Target 50% of max profit (credit received)
-        return entry_credit * 0.5
+        # Indices: 50% of credit; Stocks: 65% (higher margin justifies higher target)
+        target_pct = 0.50 if self.is_index else 0.65
+        return entry_credit * target_pct
 
 
 class BullPutSpreadStrategy(BaseStrategy):
@@ -500,6 +545,7 @@ class BullPutSpreadStrategy(BaseStrategy):
         """Analyze and generate signal for bull put spread (credit)."""
         is_valid, reason = self.validate_conditions(metrics)
         if not is_valid:
+            logger.debug(f"Bull Put Spread {self.underlying}: validation failed - {reason}")
             return None
         
         oi_data = metrics.get("oi_data", {})
@@ -508,7 +554,8 @@ class BullPutSpreadStrategy(BaseStrategy):
         
         sentiment = oi_data.get("sentiment", "NEUTRAL")
         # Best for bullish or neutral sentiment (we want price to stay above short strike)
-        if sentiment in ["BEARISH", "STRONGLY_BEARISH"]:
+        if not self.ml_override and sentiment in ["BEARISH", "STRONGLY_BEARISH"]:
+            logger.info(f"Bull Put Spread {self.underlying}: skipped - OI sentiment is {sentiment}")
             return None
         
         # Credit spreads work in any IV regime - higher IV gives better premiums
@@ -516,6 +563,7 @@ class BullPutSpreadStrategy(BaseStrategy):
         
         puts = options_chain[options_chain["option_type"] == "PE"].sort_values("strike")
         if len(puts) < 2:
+            logger.info(f"Bull Put Spread {self.underlying}: skipped - not enough PE options")
             return None
         
         strike_interval = 50 if self.underlying in ["NIFTY", "FINNIFTY"] else 100
@@ -524,6 +572,10 @@ class BullPutSpreadStrategy(BaseStrategy):
         # Use max put OI as support - sell at or near this level
         max_put_oi_strike = oi_data.get("max_put_oi_strike", atm_strike - 2 * strike_interval)
         
+        # Validate max_put_oi_strike is reasonable (within 10 intervals of ATM)
+        if max_put_oi_strike is None or max_put_oi_strike <= 0 or abs(max_put_oi_strike - atm_strike) > 10 * strike_interval:
+            max_put_oi_strike = atm_strike - 2 * strike_interval
+        
         # Ensure sell strike is at least 1 interval OTM for safety
         max_sell_strike = atm_strike - strike_interval
         sell_strike = min(max_put_oi_strike, max_sell_strike)
@@ -531,10 +583,17 @@ class BullPutSpreadStrategy(BaseStrategy):
         # SELL higher strike put (at support), BUY lower strike put (hedge)
         buy_strike = sell_strike - strike_interval
         
+        # Find nearest available strikes in the chain
+        available_strikes = sorted(puts["strike"].unique())
+        sell_strike = min(available_strikes, key=lambda s: abs(s - sell_strike)) if available_strikes else sell_strike
+        buy_candidates = [s for s in available_strikes if s < sell_strike]
+        buy_strike = buy_candidates[-1] if buy_candidates else sell_strike - strike_interval
+        
         sell_option = puts[puts["strike"] == sell_strike]
         buy_option = puts[puts["strike"] == buy_strike]
         
         if sell_option.empty or buy_option.empty:
+            logger.info(f"Bull Put Spread {self.underlying}: skipped - strikes {sell_strike}/{buy_strike} not found in chain")
             return None
         
         sell_option = sell_option.iloc[0]
@@ -546,6 +605,7 @@ class BullPutSpreadStrategy(BaseStrategy):
         max_loss = spread_width - net_credit
         
         if net_credit <= 0 or max_loss <= 0:
+            logger.info(f"Bull Put Spread {self.underlying}: skipped - unfavorable credit ({net_credit:.2f})")
             return None
         
         # Risk/Reward for credit spreads
@@ -553,7 +613,8 @@ class BullPutSpreadStrategy(BaseStrategy):
         
         confidence = self._calculate_confidence(oi_data, volatility, sentiment, net_credit, max_loss)
         
-        if confidence < self.min_confidence:
+        if not self.ml_override and confidence < self.min_confidence:
+            logger.info(f"Bull Put Spread {self.underlying}: skipped - strategy confidence {confidence:.2f} < {self.min_confidence}")
             return None
         
         lot_size = get_lot_size(self.underlying)
@@ -648,5 +709,6 @@ class BullPutSpreadStrategy(BaseStrategy):
         return entry_credit
     
     def calculate_target(self, entry_credit: float, **kwargs) -> float:
-        # Target 50% of max profit (credit received)
-        return entry_credit * 0.5
+        # Indices: 50% of credit; Stocks: 65% (higher margin justifies higher target)
+        target_pct = 0.50 if self.is_index else 0.65
+        return entry_credit * target_pct

@@ -136,6 +136,10 @@ class StrategySignal:
         }
 
 
+# Indices vs stocks - used for reward scaling
+INDEX_UNDERLYINGS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"]
+
+
 class BaseStrategy(ABC):
     """
     Abstract base class for all trading strategies.
@@ -147,6 +151,12 @@ class BaseStrategy(ABC):
         self.description: str = ""
         self.strategy_type: StrategyType = None
         self.min_confidence: float = 0.6
+        self.ml_override: bool = False  # When True, skip OI sentiment & confidence gates
+    
+    @property
+    def is_index(self) -> bool:
+        """Whether this underlying is an index (vs a stock)."""
+        return self.underlying in INDEX_UNDERLYINGS
         
     @abstractmethod
     def analyze(self, options_chain: pd.DataFrame, metrics: Dict[str, Any]) -> Optional[StrategySignal]:

@@ -40,10 +40,10 @@ class IronCondorStrategy(BaseStrategy):
         iv_regime = volatility.get("volatility_regime", "NORMAL")
         
         # Best for neutral sentiment and high IV
-        if sentiment in ["STRONGLY_BULLISH", "STRONGLY_BEARISH"]:
+        if not self.ml_override and sentiment in ["STRONGLY_BULLISH", "STRONGLY_BEARISH"]:
             return None
         
-        if iv_regime in ["LOW_IV", "IV_DEPRESSED"]:
+        if not self.ml_override and iv_regime in ["LOW_IV", "IV_DEPRESSED"]:
             return None
         
         calls = options_chain[options_chain["option_type"] == "CE"].sort_values("strike")
@@ -93,7 +93,7 @@ class IronCondorStrategy(BaseStrategy):
         
         confidence = self._calculate_confidence(oi_data, volatility, sentiment, net_credit, max_loss)
         
-        if confidence < self.min_confidence:
+        if not self.ml_override and confidence < self.min_confidence:
             return None
         
         lot_size = get_lot_size(self.underlying)
@@ -189,7 +189,9 @@ class IronCondorStrategy(BaseStrategy):
         return entry_credit
     
     def calculate_target(self, entry_credit: float, **kwargs) -> float:
-        return entry_credit * 0.5  # Target 50% of max profit
+        # Indices: 50% of credit; Stocks: 65%
+        target_pct = 0.50 if self.is_index else 0.65
+        return entry_credit * target_pct
 
 
 class StraddleStrategy(BaseStrategy):
@@ -225,12 +227,13 @@ class StraddleStrategy(BaseStrategy):
         
         # Long straddle: prefer low IV (expect volatility expansion)
         # Short straddle: prefer high IV (expect volatility contraction)
-        if self.is_short:
-            if iv_regime in ["LOW_IV", "IV_DEPRESSED"]:
-                return None
-        else:
-            if iv_regime in ["HIGH_IV", "IV_ELEVATED"]:
-                return None
+        if not self.ml_override:
+            if self.is_short:
+                if iv_regime in ["LOW_IV", "IV_DEPRESSED"]:
+                    return None
+            else:
+                if iv_regime in ["HIGH_IV", "IV_ELEVATED"]:
+                    return None
         
         strike_interval = 50 if self.underlying in ["NIFTY", "FINNIFTY"] else 100
         atm_strike = round(spot / strike_interval) * strike_interval
@@ -251,7 +254,7 @@ class StraddleStrategy(BaseStrategy):
         
         confidence = self._calculate_confidence(oi_data, volatility)
         
-        if confidence < self.min_confidence:
+        if not self.ml_override and confidence < self.min_confidence:
             return None
         
         lot_size = get_lot_size(self.underlying)
@@ -332,8 +335,11 @@ class StraddleStrategy(BaseStrategy):
     
     def calculate_target(self, entry_price: float, **kwargs) -> float:
         if self.is_short:
-            return entry_price * 0.5  # 50% of credit
-        return entry_price  # 100% profit for long
+            # Indices: 50% of credit; Stocks: 65%
+            target_pct = 0.50 if self.is_index else 0.65
+            return entry_price * target_pct
+        # Long straddle: target 100% profit (big move expected)
+        return entry_price
 
 
 class StrangleStrategy(BaseStrategy):
@@ -367,12 +373,13 @@ class StrangleStrategy(BaseStrategy):
         
         iv_regime = volatility.get("volatility_regime", "NORMAL")
         
-        if self.is_short:
-            if iv_regime in ["LOW_IV", "IV_DEPRESSED"]:
-                return None
-        else:
-            if iv_regime in ["HIGH_IV", "IV_ELEVATED"]:
-                return None
+        if not self.ml_override:
+            if self.is_short:
+                if iv_regime in ["LOW_IV", "IV_DEPRESSED"]:
+                    return None
+            else:
+                if iv_regime in ["HIGH_IV", "IV_ELEVATED"]:
+                    return None
         
         strike_interval = 50 if self.underlying in ["NIFTY", "FINNIFTY"] else 100
         atm_strike = round(spot / strike_interval) * strike_interval
@@ -401,7 +408,7 @@ class StrangleStrategy(BaseStrategy):
         
         confidence = self._calculate_confidence(oi_data, volatility)
         
-        if confidence < self.min_confidence:
+        if not self.ml_override and confidence < self.min_confidence:
             return None
         
         lot_size = get_lot_size(self.underlying)
@@ -483,5 +490,8 @@ class StrangleStrategy(BaseStrategy):
     
     def calculate_target(self, entry_price: float, **kwargs) -> float:
         if self.is_short:
-            return entry_price * 0.5
+            # Indices: 50% of credit; Stocks: 65%
+            target_pct = 0.50 if self.is_index else 0.65
+            return entry_price * target_pct
+        # Long strangle: target 100% profit
         return entry_price

@@ -292,19 +292,39 @@ class MLSignalGenerator:
         for strategy_type in strategy_types:
             strategy = catalogue.get_strategy(strategy_type)
             if not strategy:
+                logger.info(f"  Strategy {strategy_type.value} not found in catalogue for {underlying}")
                 continue
             
             try:
+                # ML is driving the signal - skip strategy-level OI sentiment
+                # and confidence gates (ML already validated direction & confidence)
+                strategy.ml_override = True
+                
                 # Analyze with strategy
                 signal = strategy.analyze(options_chain, market_data)
+                
+                # Reset override
+                strategy.ml_override = False
                 
                 if signal:
                     # Override confidence with ML confidence
                     ml_signal = self._create_ml_signal(signal, prediction)
                     signals.append(ml_signal)
+                    logger.info(
+                        f"  Signal generated: {strategy_type.value} for {underlying} "
+                        f"(ML confidence: {prediction.confidence:.1%})"
+                    )
+                else:
+                    logger.info(
+                        f"  Strategy {strategy_type.value} returned no signal for {underlying} "
+                        f"(strategy conditions not met)"
+                    )
                     
             except Exception as e:
                 logger.error(f"Strategy {strategy_type.value} failed: {e}")
+                import traceback
+                traceback.print_exc()
+                strategy.ml_override = False
         
         return signals
     

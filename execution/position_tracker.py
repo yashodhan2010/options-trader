@@ -44,7 +44,9 @@ class PositionTracker:
         self.poll_interval: int = BOT_CONFIG.get("position_poll_interval", 5)  # From config
         self.status_interval: int = BOT_CONFIG.get("position_status_interval", 900)  # 15 minutes
         self.trailing_sl_enabled: bool = TRADING_CONFIG.get("trailing_sl_enabled", True)
-        self.trailing_sl_percent: float = TRADING_CONFIG.get("trailing_sl_percent", 10)
+        self.trailing_sl_percent: float = TRADING_CONFIG.get("trailing_sl_percent", 30)
+        self.trailing_sl_activation_pct: float = TRADING_CONFIG.get("trailing_sl_activation_pct", 0.3)
+        self.trailing_stop_levels: Dict[str, float] = {}  # execution_id -> trail floor (profit to lock in)
         self.persist_positions: bool = BOT_CONFIG.get("persist_positions", True)
         self.callbacks: Dict[str, List[Callable]] = {
             "sl_hit": [],
@@ -368,12 +370,24 @@ class PositionTracker:
             "current_prices": current_prices,
         }
         
-        # Check stop loss
+        # Check stop loss (initial hard SL)
         if total_pnl <= -signal.stop_loss:
             logger.warning(f"Stop loss hit for {execution_id}! P&L: {total_pnl:.2f}")
             self._trigger_exit(execution_id, "SL_HIT", total_pnl)
             self._notify("sl_hit", execution_id, total_pnl)
             return
+        
+        # Check trailing stop loss - locks in profits
+        if self.trailing_sl_enabled and execution_id in self.trailing_stop_levels:
+            trail_level = self.trailing_stop_levels[execution_id]
+            if trail_level > 0 and total_pnl <= trail_level:
+                logger.info(
+                    f"Trailing SL hit for {execution_id}! P&L: {total_pnl:.2f} "
+                    f"(trail floor: {trail_level:.2f})"
+                )
+                self._trigger_exit(execution_id, "TRAILING_SL_HIT", total_pnl)
+                self._notify("sl_hit", execution_id, total_pnl)
+                return
         
         # Check target
         if total_pnl >= signal.target:
@@ -382,7 +396,7 @@ class PositionTracker:
             self._notify("target_hit", execution_id, total_pnl)
             return
         
-        # Trailing stop loss
+        # Update trailing stop loss (ratchet upward as profits grow)
         if self.trailing_sl_enabled and total_pnl > 0:
             self._update_trailing_sl(execution_id, execution, total_pnl)
         
@@ -588,24 +602,37 @@ class PositionTracker:
         current_pnl: float,
     ) -> None:
         """
-        Update trailing stop loss if applicable.
+        Update trailing stop loss to lock in profits as the trade moves favorably.
+        
+        Only activates after profit exceeds activation_pct of target (default 30%).
+        Trails at trailing_sl_percent below peak profit (default 30% — protects 70%).
         
         Args:
             execution_id: Execution ID
             execution: TradeExecution object
-            current_pnl: Current P&L
+            current_pnl: Current P&L (positive)
         """
         signal = execution.signal
         
-        # Calculate trailing SL based on profit
-        trailing_amount = current_pnl * (self.trailing_sl_percent / 100)
-        new_sl = max(current_pnl - trailing_amount, 0)
+        # Only start trailing after reaching activation threshold
+        activation_threshold = signal.target * self.trailing_sl_activation_pct
+        if current_pnl < activation_threshold:
+            return
         
-        # Only update if new SL is better (higher)
-        if new_sl > signal.stop_loss:
-            old_sl = signal.stop_loss
-            signal.stop_loss = new_sl
-            logger.debug(f"Trailing SL updated for {execution_id}: {old_sl:.2f} -> {new_sl:.2f}")
+        # Calculate trail floor: protect (100 - trailing_sl_percent)% of current profit
+        # e.g., with 30% trail: at P&L 1000 → trail floor = 700 (protect 70%)
+        protection_pct = (100 - self.trailing_sl_percent) / 100
+        new_trail_level = current_pnl * protection_pct
+        
+        # Only ratchet upward - never lower the trail floor
+        current_trail = self.trailing_stop_levels.get(execution_id, 0)
+        if new_trail_level > current_trail:
+            self.trailing_stop_levels[execution_id] = new_trail_level
+            logger.info(
+                f"Trailing SL updated for {execution_id}: "
+                f"lock in Rs.{new_trail_level:.2f} (P&L: {current_pnl:.2f}, "
+                f"protect {protection_pct:.0%})"
+            )
     
     def _check_greeks_exit(
         self,
@@ -750,9 +777,11 @@ class PositionTracker:
         if success:
             self._notify("position_closed", execution_id, pnl, reason)
             
-            # Clean up metrics
+            # Clean up metrics and trailing state
             if execution_id in self.position_metrics:
                 del self.position_metrics[execution_id]
+            if execution_id in self.trailing_stop_levels:
+                del self.trailing_stop_levels[execution_id]
     
     def register_callback(self, event: str, callback: Callable) -> None:
         """
@@ -840,18 +869,60 @@ class PositionTracker:
         
         active_positions = order_manager.get_active_positions()
         
+        if not active_positions:
+            logger.info("No active positions to close")
+            return
+        
+        total_pnl = 0
+        
         for position in active_positions:
             execution_id = position["execution_id"]
+            execution = order_manager.active_executions.get(execution_id)
             metrics = self.position_metrics.get(execution_id, {})
             pnl = metrics.get("current_pnl", 0)
             
+            # Log full trade details before closing
+            if execution:
+                signal = execution.signal
+                entry_time = execution.entry_time
+                time_str = "Unknown"
+                if entry_time:
+                    duration = datetime.now() - entry_time
+                    time_str = self._format_duration(duration.total_seconds())
+                
+                result = "PROFIT" if pnl >= 0 else "LOSS"
+                
+                trade_logger.info("=" * 80)
+                trade_logger.info(f"TRADE CLOSED")
+                trade_logger.info("=" * 80)
+                trade_logger.info(f"Execution ID: {execution_id}")
+                trade_logger.info(f"Strategy:     {signal.strategy_type.value}")
+                trade_logger.info(f"Underlying:   {signal.underlying}")
+                trade_logger.info(f"Reason:       {reason}")
+                trade_logger.info(f"Duration:     {time_str}")
+                trade_logger.info(f"Mode:         {'PAPER' if order_manager.is_paper_trading else 'LIVE'}")
+                trade_logger.info("-" * 40)
+                trade_logger.info("LEGS:")
+                for leg in signal.legs:
+                    leg_pnl = leg.pnl() if hasattr(leg, 'pnl') else 0
+                    trade_logger.info(
+                        f"  {leg.direction.value:4} | {leg.symbol} | "
+                        f"Qty: {leg.quantity} | Entry: Rs.{leg.entry_price:.2f} | "
+                        f"Exit: Rs.{leg.current_price or leg.entry_price:.2f} | "
+                        f"P&L: Rs.{leg_pnl:.2f}"
+                    )
+                trade_logger.info("-" * 40)
+                trade_logger.info(f"P&L:          Rs.{pnl:.2f}")
+                trade_logger.info(f"Result:       {result}")
+                trade_logger.info("=" * 80)
+                trade_logger.info("")
+            
             order_manager.close_position(execution_id)
             self._notify("position_closed", execution_id, pnl, reason)
-            
-            trade_logger.info(f"EXIT | {execution_id} | P&L: {pnl:.2f} | Reason: {reason} (Force Close)")
+            total_pnl += pnl
         
         self.position_metrics.clear()
-        logger.info("All positions closed")
+        logger.info(f"All {len(active_positions)} positions closed. Total P&L: Rs.{total_pnl:.2f}")
     
     # ========== Periodic Status Updates ==========
     
@@ -873,14 +944,16 @@ class PositionTracker:
         """Generate and broadcast status update for all active positions."""
         active_positions = order_manager.get_active_positions()
         
-        if not active_positions:
-            return
-        
         self.last_status_update = datetime.now()
         
         logger.info("=" * 60)
         logger.info(f"[STATUS] POSITION STATUS UPDATE - {self.last_status_update.strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info("=" * 60)
+        
+        if not active_positions:
+            logger.info("[STATUS] No open positions")
+            logger.info("=" * 60)
+            return
         
         total_unrealized_pnl = 0
         

@@ -4,11 +4,15 @@ Full Historical Training Pipeline
 Downloads NSE F&O bhavcopy for all symbols in watchlist,
 calculates features including Greeks proxies, and trains per-symbol models.
 
+For symbols not available in NSE bhavcopy (e.g. SENSEX on BSE),
+automatically falls back to Kite Historical API for OHLCV data.
+
 Features:
 1. Downloads historical data for all watchlist symbols + indices
-2. Calculates UNIFIED features (compatible with live prediction)
-3. Trains individual models per symbol
-4. Monthly update pipeline for continuous learning
+2. Falls back to Kite API for symbols without bhavcopy data
+3. Calculates UNIFIED features (compatible with live prediction)
+4. Trains individual models per symbol
+5. Monthly update pipeline for continuous learning
 
 IMPORTANT: Uses UnifiedFeatureDefinition to ensure historical models
 work with live data from FeatureEngineer.
@@ -208,6 +212,44 @@ class FullPipelineTrainer:
         
         return symbols
     
+    def _fetch_kite_ohlcv(self, symbol: str, days: int = 365) -> pd.DataFrame:
+        """
+        Fetch historical OHLCV from Kite API for symbols without bhavcopy data.
+        
+        Used as a fallback for BSE symbols (e.g. SENSEX) that don't appear
+        in NSE F&O bhavcopy archives.
+        """
+        from data.data_fetcher import data_fetcher
+        from config.settings import UNDERLYING_ASSETS
+        
+        asset_cfg = UNDERLYING_ASSETS.get(symbol, {})
+        exchange = asset_cfg.get("exchange", "NSE")
+        
+        logger.info(f"Fetching {days} days of Kite data for {symbol} (exchange={exchange})")
+        
+        df = data_fetcher.get_historical_data(
+            symbol=symbol, interval="day", days=days, exchange=exchange
+        )
+        
+        if df.empty:
+            return pd.DataFrame()
+        
+        # Ensure required columns
+        for col in ("open", "high", "low", "close", "volume"):
+            if col not in df.columns:
+                df[col] = 0.0
+        
+        # Reset index (Kite returns date as index)
+        if df.index.name == "date" or isinstance(df.index, pd.DatetimeIndex):
+            df = df.reset_index()
+        
+        if "date" in df.columns:
+            df = df.sort_values("date").reset_index(drop=True)
+        
+        df["symbol"] = symbol
+        logger.info(f"Kite fallback: {len(df)} candles for {symbol}")
+        return df
+
     def download_all_historical(
         self,
         start_date: date = date(2024, 1, 1),
@@ -486,10 +528,20 @@ class FullPipelineTrainer:
         self,
         start_date: date = date(2024, 1, 1),
         end_date: date = date(2024, 5, 31),
-        force_download: bool = False
+        force_download: bool = False,
+        kite_fallback_days: int = 365
     ) -> Dict:
         """
         Run complete training pipeline for all symbols.
+        
+        For symbols not found in NSE bhavcopy (e.g. BSE symbols like SENSEX),
+        automatically falls back to Kite Historical API.
+        
+        Args:
+            start_date: Bhavcopy start date
+            end_date: Bhavcopy end date
+            force_download: Force re-download of bhavcopy
+            kite_fallback_days: Days of Kite history for fallback symbols
         """
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
@@ -509,9 +561,11 @@ class FullPipelineTrainer:
         else:
             fo_df = self.download_all_historical(start_date, end_date)
         
+        # Note: fo_df can be empty if bhavcopy download fails,
+        # but Kite fallback may still work for some symbols
         if fo_df.empty:
-            logger.error("No data available!")
-            return None
+            logger.warning("No bhavcopy data available, will try Kite fallback for all symbols")
+            fo_df = pd.DataFrame()  # ensure it's a valid empty DF
         
         # Step 2: Process and train each symbol
         results = {}
@@ -522,12 +576,17 @@ class FullPipelineTrainer:
             logger.info(f"Processing: {symbol}")
             logger.info(f"{'='*40}")
             
-            # Process symbol data
-            sym_df = self.process_symbol_data(fo_df, symbol)
+            # Process symbol data from bhavcopy
+            sym_df = self.process_symbol_data(fo_df, symbol) if not fo_df.empty else pd.DataFrame()
             
+            # Kite API fallback for symbols not in bhavcopy (e.g. SENSEX/BSE)
             if sym_df.empty or len(sym_df) < 20:
-                logger.warning(f"{symbol}: Insufficient data, skipping")
-                continue
+                logger.info(f"{symbol}: No bhavcopy data, trying Kite API fallback...")
+                sym_df = self._fetch_kite_ohlcv(symbol, days=kite_fallback_days)
+                if sym_df.empty or len(sym_df) < 20:
+                    logger.warning(f"{symbol}: Insufficient data from both sources, skipping")
+                    continue
+                logger.info(f"{symbol}: Using {len(sym_df)} candles from Kite API")
             
             # Add features
             sym_df = self.add_features(sym_df)

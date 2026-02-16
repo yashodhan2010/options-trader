@@ -39,7 +39,8 @@ TRADING_CONFIG = {
     "default_sl_percent": 30,  # Stop loss percentage
     "default_target_percent": 50,  # Target percentage
     "trailing_sl_enabled": True,
-    "trailing_sl_percent": 10,
+    "trailing_sl_percent": 30,        # Trail at 30% below peak profit (protect 70%)
+    "trailing_sl_activation_pct": 0.3,  # Start trailing after 30% of target reached
 }
 
 # Market Hours Configuration
@@ -55,7 +56,7 @@ MARKET_HOURS = {
     "end": "15:30",                     # Alias for market_close
     "pre_open_start": "09:00",          # Pre-open session start
     "pre_open_end": "09:08",            # Pre-open session end
-    "no_trade_before": "11:00",         # No trades before 11 AM (morning noise)
+    "no_trade_before": "10:00",         # No trades before 10 AM (morning noise)
     "no_trade_after": "14:00",          # No new trades after 2 PM
     
     # Auto-exit settings

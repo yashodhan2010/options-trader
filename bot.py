@@ -330,13 +330,22 @@ class OptionsTradingBot:
                         logger.info("[CARRY] Positions will be carried overnight")
                 
                 # Trading logic
+                # NOTE: Exit monitoring (SL/Target/Signal-based) runs in background threads
+                # via position_tracker regardless of trading window. Exits can trigger anytime
+                # the market is open. The trading window only gates NEW entry signals.
                 if is_trading_allowed():
                     logger.info(f"[SCAN] Scanning for trading signals... (Loop #{loop_count})")
+                    # Show position summary before scanning
+                    self._log_position_summary()
                     self._scan_and_trade()
                 elif is_market_open():
-                    # Market is open but we're outside trading window
-                    # Still monitor existing positions
-                    logger.info(f"[WAIT] Waiting for trading window to start... Monitoring positions only.")
+                    # Market is open but outside trading window for NEW entries
+                    # Exit monitoring is active via position_tracker background threads
+                    active_count = len(order_manager.get_active_positions())
+                    if active_count > 0:
+                        logger.info(f"[MONITOR] {active_count} open position(s) being monitored for exits (SL/Target/Signal)")
+                    else:
+                        logger.info(f"[WAIT] No new entries until trading window opens. No open positions.")
                 else:
                     # Market is closed
                     # Check if we should auto-exit the bot
@@ -369,6 +378,34 @@ class OptionsTradingBot:
         
         self.stop()
     
+    def _log_position_summary(self) -> None:
+        """Log a brief summary of open positions and P&L at each scan."""
+        active_positions = order_manager.get_active_positions()
+        if not active_positions:
+            return
+        
+        total_pnl = 0
+        position_lines = []
+        for pos in active_positions:
+            execution_id = pos["execution_id"]
+            execution = order_manager.active_executions.get(execution_id)
+            if not execution:
+                continue
+            
+            metrics = position_tracker.position_metrics.get(execution_id, {})
+            current_pnl = metrics.get("current_pnl", 0)
+            total_pnl += current_pnl
+            
+            signal = execution.signal
+            pnl_indicator = "+" if current_pnl >= 0 else ""
+            position_lines.append(
+                f"      {signal.strategy_type.value} {signal.underlying}: {pnl_indicator}Rs.{current_pnl:,.2f}"
+            )
+        
+        logger.info(f"   [OPEN POSITIONS] {len(active_positions)} position(s), Total P&L: {'+'if total_pnl >= 0 else ''}Rs.{total_pnl:,.2f}")
+        for line in position_lines:
+            logger.info(line)
+
     def _scan_and_trade(self) -> None:
         """Scan for signals and execute trades if auto-trade is enabled."""
         # Check if we can take more positions
@@ -504,12 +541,15 @@ class OptionsTradingBot:
         - Directional (Long Call/Put): Require high RR (>= 1.5)
         - Credit strategies (Iron Condor, Short options): Require high confidence (>= 75%)
         - Volatility plays (Straddle/Strangle): Require moderate confidence (>= 70%)
+        
+        Paper trading uses relaxed thresholds to test more signals.
         """
         from strategies.base_strategy import StrategyType
         
         strategy_type = signal.strategy_type
         confidence = signal.confidence
         rr = signal.risk_reward_ratio
+        is_paper = self.paper_trading
         
         # Define criteria per strategy category
         # Directional strategies - need good RR since we're buying premium
@@ -540,30 +580,36 @@ class OptionsTradingBot:
         ]
         
         # Apply criteria based on strategy type
+        # Paper mode uses relaxed thresholds to test more signals
         if strategy_type in directional_strategies:
-            # Directional: Need confidence >= 70% AND RR >= 1.5
-            meets_criteria = confidence >= 0.70 and rr >= 1.5
-            criteria_desc = f"Conf: {confidence:.0%} >= 70%, RR: {rr:.2f} >= 1.5"
+            min_conf = 0.52 if is_paper else 0.70
+            min_rr = 0.5 if is_paper else 1.5
+            meets_criteria = confidence >= min_conf and rr >= min_rr
+            criteria_desc = f"Conf: {confidence:.0%} >= {min_conf:.0%}, RR: {rr:.2f} >= {min_rr}"
             
         elif strategy_type in credit_strategies:
-            # Credit: Need confidence >= 75% AND RR >= 0.3 (lower RR acceptable)
-            meets_criteria = confidence >= 0.75 and rr >= 0.3
-            criteria_desc = f"Conf: {confidence:.0%} >= 75%, RR: {rr:.2f} >= 0.3"
+            min_conf = 0.52 if is_paper else 0.75
+            min_rr = 0.1 if is_paper else 0.3
+            meets_criteria = confidence >= min_conf and rr >= min_rr
+            criteria_desc = f"Conf: {confidence:.0%} >= {min_conf:.0%}, RR: {rr:.2f} >= {min_rr}"
             
         elif strategy_type in spread_strategies:
-            # Spreads: Need confidence >= 70% AND RR >= 1.0
-            meets_criteria = confidence >= 0.70 and rr >= 1.0
-            criteria_desc = f"Conf: {confidence:.0%} >= 70%, RR: {rr:.2f} >= 1.0"
+            min_conf = 0.52 if is_paper else 0.70
+            min_rr = 0.3 if is_paper else 1.0
+            meets_criteria = confidence >= min_conf and rr >= min_rr
+            criteria_desc = f"Conf: {confidence:.0%} >= {min_conf:.0%}, RR: {rr:.2f} >= {min_rr}"
             
         elif strategy_type in volatility_strategies:
-            # Volatility: Need confidence >= 70% AND RR >= 0.8
-            meets_criteria = confidence >= 0.70 and rr >= 0.8
-            criteria_desc = f"Conf: {confidence:.0%} >= 70%, RR: {rr:.2f} >= 0.8"
+            min_conf = 0.52 if is_paper else 0.70
+            min_rr = 0.3 if is_paper else 0.8
+            meets_criteria = confidence >= min_conf and rr >= min_rr
+            criteria_desc = f"Conf: {confidence:.0%} >= {min_conf:.0%}, RR: {rr:.2f} >= {min_rr}"
             
         else:
-            # Default: Standard criteria
-            meets_criteria = confidence >= 0.70 and rr >= 1.5
-            criteria_desc = f"Conf: {confidence:.0%} >= 70%, RR: {rr:.2f} >= 1.5"
+            min_conf = 0.52 if is_paper else 0.70
+            min_rr = 0.5 if is_paper else 1.5
+            meets_criteria = confidence >= min_conf and rr >= min_rr
+            criteria_desc = f"Conf: {confidence:.0%} >= {min_conf:.0%}, RR: {rr:.2f} >= {min_rr}"
         
         if meets_criteria:
             logger.info(f"   [CRITERIA] {strategy_type.value}: PASSED ({criteria_desc})")

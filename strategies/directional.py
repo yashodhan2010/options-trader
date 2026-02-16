@@ -39,12 +39,12 @@ class LongCallStrategy(BaseStrategy):
         spot = metrics.get("spot", 0)
         
         sentiment = oi_data.get("sentiment", "NEUTRAL")
-        if sentiment not in ["BULLISH", "STRONGLY_BULLISH"]:
+        if not self.ml_override and sentiment not in ["BULLISH", "STRONGLY_BULLISH"]:
             return None
         
         # Prefer low IV for buying options
         iv_regime = volatility.get("volatility_regime", "NORMAL")
-        if iv_regime == "HIGH_IV":
+        if not self.ml_override and iv_regime == "HIGH_IV":
             logger.debug("High IV - not ideal for long call")
             return None
         
@@ -76,7 +76,7 @@ class LongCallStrategy(BaseStrategy):
         # Calculate confidence based on multiple factors including historical
         confidence = self._calculate_confidence(oi_data, volatility, sentiment, historical)
         
-        if confidence < self.min_confidence:
+        if not self.ml_override and confidence < self.min_confidence:
             return None
         
         # Create option leg
@@ -214,7 +214,7 @@ class LongCallStrategy(BaseStrategy):
         return entry_price * (sl_percent / 100)
     
     def calculate_target(self, entry_price: float, **kwargs) -> float:
-        """Calculate target based on IV regime - higher targets when IV is low (vol expansion expected)."""
+        """Calculate target based on IV regime. Stocks get higher targets than indices."""
         iv_regime = kwargs.get("iv_regime", "NORMAL")
         if iv_regime in ["LOW_IV", "IV_DEPRESSED"]:
             target_percent = 60  # Higher target when vol expansion expected
@@ -222,6 +222,9 @@ class LongCallStrategy(BaseStrategy):
             target_percent = 35  # Lower target in high IV (premium already inflated)
         else:
             target_percent = TRADING_CONFIG.get("default_target_percent", 50)
+        # Stocks: scale up target by 40% (higher margin = higher reward expectation)
+        if not self.is_index:
+            target_percent = int(target_percent * 1.4)
         return entry_price * (target_percent / 100)
 
 
@@ -248,12 +251,12 @@ class LongPutStrategy(BaseStrategy):
         spot = metrics.get("spot", 0)
         
         sentiment = oi_data.get("sentiment", "NEUTRAL")
-        if sentiment not in ["BEARISH", "STRONGLY_BEARISH"]:
+        if not self.ml_override and sentiment not in ["BEARISH", "STRONGLY_BEARISH"]:
             return None
         
         # Prefer low IV for buying options
         iv_regime = volatility.get("volatility_regime", "NORMAL")
-        if iv_regime == "HIGH_IV":
+        if not self.ml_override and iv_regime == "HIGH_IV":
             return None
         
         puts = options_chain[options_chain["option_type"] == "PE"]
@@ -277,7 +280,7 @@ class LongPutStrategy(BaseStrategy):
         
         confidence = self._calculate_confidence(oi_data, volatility, sentiment)
         
-        if confidence < self.min_confidence:
+        if not self.ml_override and confidence < self.min_confidence:
             return None
         
         lot_size = get_lot_size(self.underlying)
@@ -353,7 +356,7 @@ class LongPutStrategy(BaseStrategy):
         return entry_price * (sl_percent / 100)
     
     def calculate_target(self, entry_price: float, **kwargs) -> float:
-        """Calculate target based on IV regime."""
+        """Calculate target based on IV regime. Stocks get higher targets than indices."""
         iv_regime = kwargs.get("iv_regime", "NORMAL")
         if iv_regime in ["LOW_IV", "IV_DEPRESSED"]:
             target_percent = 60
@@ -361,6 +364,9 @@ class LongPutStrategy(BaseStrategy):
             target_percent = 35
         else:
             target_percent = TRADING_CONFIG.get("default_target_percent", 50)
+        # Stocks: scale up target by 40%
+        if not self.is_index:
+            target_percent = int(target_percent * 1.4)
         return entry_price * (target_percent / 100)
 
 
@@ -389,12 +395,12 @@ class ShortCallStrategy(BaseStrategy):
         spot = metrics.get("spot", 0)
         
         sentiment = oi_data.get("sentiment", "NEUTRAL")
-        if sentiment in ["BULLISH", "STRONGLY_BULLISH"]:
+        if not self.ml_override and sentiment in ["BULLISH", "STRONGLY_BULLISH"]:
             return None
         
         # Prefer high IV for selling options
         iv_regime = volatility.get("volatility_regime", "NORMAL")
-        if iv_regime in ["LOW_IV", "IV_DEPRESSED"]:
+        if not self.ml_override and iv_regime in ["LOW_IV", "IV_DEPRESSED"]:
             return None
         
         calls = options_chain[options_chain["option_type"] == "CE"]
@@ -416,7 +422,7 @@ class ShortCallStrategy(BaseStrategy):
         
         confidence = self._calculate_confidence(oi_data, volatility, sentiment)
         
-        if confidence < self.min_confidence:
+        if not self.ml_override and confidence < self.min_confidence:
             return None
         
         lot_size = get_lot_size(self.underlying)
@@ -478,8 +484,9 @@ class ShortCallStrategy(BaseStrategy):
         return entry_price * 2  # Exit if premium doubles
     
     def calculate_target(self, entry_price: float, **kwargs) -> float:
-        # Target is percentage of premium decay
-        return entry_price * 0.5  # Target 50% premium decay
+        # Target percentage of premium decay; stocks get higher target
+        target_pct = 0.50 if self.is_index else 0.65
+        return entry_price * target_pct
 
 
 class ShortPutStrategy(BaseStrategy):
@@ -506,11 +513,11 @@ class ShortPutStrategy(BaseStrategy):
         spot = metrics.get("spot", 0)
         
         sentiment = oi_data.get("sentiment", "NEUTRAL")
-        if sentiment in ["BEARISH", "STRONGLY_BEARISH"]:
+        if not self.ml_override and sentiment in ["BEARISH", "STRONGLY_BEARISH"]:
             return None
         
         iv_regime = volatility.get("volatility_regime", "NORMAL")
-        if iv_regime in ["LOW_IV", "IV_DEPRESSED"]:
+        if not self.ml_override and iv_regime in ["LOW_IV", "IV_DEPRESSED"]:
             return None
         
         puts = options_chain[options_chain["option_type"] == "PE"]
@@ -532,7 +539,7 @@ class ShortPutStrategy(BaseStrategy):
         
         confidence = self._calculate_confidence(oi_data, volatility, sentiment)
         
-        if confidence < self.min_confidence:
+        if not self.ml_override and confidence < self.min_confidence:
             return None
         
         lot_size = get_lot_size(self.underlying)
@@ -593,4 +600,6 @@ class ShortPutStrategy(BaseStrategy):
         return entry_price * 2
     
     def calculate_target(self, entry_price: float, **kwargs) -> float:
-        return entry_price * 0.5
+        # Target percentage of premium decay; stocks get higher target
+        target_pct = 0.50 if self.is_index else 0.65
+        return entry_price * target_pct

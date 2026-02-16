@@ -141,20 +141,6 @@ class TradingCLI(cmd.Cmd):
         print(f"\n[INFO] {status['status_message']}")
         print(f"{'='*60}")
 
-    def do_exit_all(self, arg):
-        """Exit all active positions immediately"""
-        if not is_authenticated():
-            print("Not logged in! Please login first.")
-            return
-            
-        confirm = input("Are you sure you want to exit ALL positions? (yes/no): ")
-        if confirm.lower() == 'yes':
-            print("Exiting all positions...")
-            position_tracker.force_close_all(reason="Manual CLI exit")
-            print("All positions exit command sent.")
-        else:
-            print("Operation cancelled.")
-
     def do_spot(self, arg):
         """Get spot price. Usage: spot [NIFTY|BANKNIFTY|FINNIFTY]"""
         underlying = arg.strip().upper() or "NIFTY"
@@ -335,6 +321,9 @@ class TradingCLI(cmd.Cmd):
     
     def do_close(self, arg):
         """Close a position. Usage: close <execution_id> or close all"""
+        if not order_manager.is_paper_trading and not is_authenticated():
+            print("Not logged in! Please login first.")
+            return
         if arg.strip().lower() == 'all':
             confirm = input("Close ALL positions? (y/n): ").strip().lower()
             if confirm == 'y':
@@ -654,6 +643,85 @@ class TradingCLI(cmd.Cmd):
                 print(f"   Worst Loss: Rs.{min(t.get('pnl', 0) for t in losers):,.2f}")
         
         print(f"{'='*60}")
+    
+    def do_trades(self, arg):
+        """Show past trade history with P&L. Usage: trades [N] or trades all"""
+        from core.database import database
+        
+        # Parse argument: number of trades to show, default 10
+        arg = arg.strip().lower()
+        show_all = arg == 'all'
+        try:
+            limit = int(arg) if arg and not show_all else 10
+        except ValueError:
+            limit = 10
+        
+        trades = database.get_trades(status="CLOSED")
+        
+        if not trades:
+            print("No closed trades found in database.")
+            return
+        
+        if not show_all:
+            trades = trades[:limit]
+        
+        total_pnl = 0
+        wins = 0
+        losses = 0
+        
+        print(f"\n{'='*80}")
+        print(f"TRADE HISTORY (showing {'all' if show_all else f'last {len(trades)}'} of {len(database.get_trades(status='CLOSED'))} closed trades)")
+        print(f"{'='*80}")
+        
+        for t in trades:
+            pnl = t.get('realized_pnl', 0) or t.get('pnl', 0) or 0
+            total_pnl += pnl
+            result = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "FLAT"
+            if pnl > 0:
+                wins += 1
+            elif pnl < 0:
+                losses += 1
+            
+            pnl_color = "+" if pnl >= 0 else ""
+            
+            exec_id = t.get('execution_id', 'N/A')
+            underlying = t.get('underlying', 'N/A')
+            strategy = t.get('strategy_type', t.get('strategy', 'N/A'))
+            entry = t.get('entry_time', 'N/A')
+            exit_t = t.get('exit_time', 'N/A')
+            
+            # Format entry/exit times for readability
+            if entry and entry != 'N/A':
+                try:
+                    entry_dt = datetime.fromisoformat(str(entry))
+                    entry = entry_dt.strftime('%Y-%m-%d %H:%M')
+                except:
+                    pass
+            if exit_t and exit_t != 'N/A':
+                try:
+                    exit_dt = datetime.fromisoformat(str(exit_t))
+                    exit_t = exit_dt.strftime('%Y-%m-%d %H:%M')
+                except:
+                    pass
+            
+            print(f"\n  [{result:4}] {strategy} | {underlying}")
+            print(f"         P&L: {pnl_color}Rs.{pnl:,.2f}")
+            print(f"         Entry: {entry} -> Exit: {exit_t}")
+            print(f"         ID: {exec_id}")
+        
+        # Summary
+        win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
+        print(f"\n{'='*80}")
+        print(f"SUMMARY")
+        print(f"  Total P&L:  {'+'if total_pnl>=0 else ''}Rs.{total_pnl:,.2f}")
+        print(f"  Win Rate:   {win_rate:.1f}% ({wins}W / {losses}L)")
+        if wins > 0:
+            avg_win = sum(t.get('realized_pnl', 0) or t.get('pnl', 0) or 0 for t in trades if (t.get('realized_pnl', 0) or t.get('pnl', 0) or 0) > 0) / wins
+            print(f"  Avg Win:    +Rs.{avg_win:,.2f}")
+        if losses > 0:
+            avg_loss = sum(t.get('realized_pnl', 0) or t.get('pnl', 0) or 0 for t in trades if (t.get('realized_pnl', 0) or t.get('pnl', 0) or 0) < 0) / losses
+            print(f"  Avg Loss:   Rs.{avg_loss:,.2f}")
+        print(f"{'='*80}")
     
     def do_history(self, arg):
         """Show historical analysis for an underlying. Usage: history <UNDERLYING>"""
