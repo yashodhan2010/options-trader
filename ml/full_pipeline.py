@@ -22,6 +22,7 @@ import pandas as pd
 import numpy as np
 import json
 import joblib
+import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Dict, Tuple
@@ -35,6 +36,7 @@ from core.logger import logger
 from ml.unified_features import (
     UnifiedFeatureDefinition,
     HistoricalFeatureAdapter,
+    LiveFeatureAdapter,
     get_unified_feature_names
 )
 
@@ -258,6 +260,115 @@ class FullPipelineTrainer:
         df["symbol"] = symbol
         logger.info(f"Kite fallback: {len(df)} candles for {symbol}")
         return df
+
+    def _load_live_snapshots_for_symbol(
+        self,
+        symbol: str,
+        threshold: float = 0.005
+    ) -> pd.DataFrame:
+        """
+        Load daily saved live snapshots from the database for a specific symbol.
+        
+        Converts them to a DataFrame with unified feature columns + ternary labels,
+        compatible with the bhavcopy-derived data so they can be concatenated.
+        
+        Args:
+            symbol: Symbol name (e.g. 'NIFTY', 'BANKNIFTY')
+            threshold: Label threshold for ternary classification (matches Optuna-optimized value)
+            
+        Returns:
+            DataFrame with unified feature columns, 'label', 'close', 'future_return', 'source'
+        """
+        db_path = Path("data/trading_bot.db")
+        if not db_path.exists():
+            return pd.DataFrame()
+        
+        try:
+            conn = sqlite3.connect(str(db_path))
+            
+            # Check table exists
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ml_feature_snapshots'")
+            if not cursor.fetchone():
+                conn.close()
+                return pd.DataFrame()
+            
+            # Load labeled snapshots for this symbol
+            query = """
+                SELECT underlying, snapshot_time, spot_price, features_json,
+                       future_return_1d, label_direction
+                FROM ml_feature_snapshots
+                WHERE underlying = ?
+                  AND label_direction IS NOT NULL
+                  AND future_return_1d IS NOT NULL
+                ORDER BY snapshot_time
+            """
+            df = pd.read_sql_query(query, conn, params=(symbol,))
+            conn.close()
+            
+            if df.empty:
+                return pd.DataFrame()
+            
+            # Deduplicate: keep 1 snapshot per day (closest to market open)
+            df["snapshot_time"] = pd.to_datetime(df["snapshot_time"], format="mixed", utc=True)
+            df["date_only"] = df["snapshot_time"].dt.date
+            df = df.sort_values("snapshot_time")
+            df = df.drop_duplicates(subset=["underlying", "date_only"], keep="first")
+            
+            # Parse features JSON and map to unified names
+            adapter = LiveFeatureAdapter()
+            unified_names = get_unified_feature_names()
+            
+            rows = []
+            for _, row in df.iterrows():
+                try:
+                    live_features = json.loads(row["features_json"])
+                    unified = adapter.adapt(live_features)
+                    
+                    record = {name: unified.get(name, 0.0) for name in unified_names}
+                    record["symbol"] = row["underlying"]
+                    record["date"] = str(row["date_only"])
+                    record["close"] = row["spot_price"]
+                    record["future_return"] = row["future_return_1d"]
+                    record["source"] = "live_snapshot"
+                    
+                    # Ternary label using same threshold as bhavcopy data
+                    ret = row["future_return_1d"]
+                    if ret > threshold:
+                        record["label"] = 2.0  # BULLISH
+                    elif ret < -threshold:
+                        record["label"] = 0.0  # BEARISH
+                    else:
+                        record["label"] = 1.0  # NEUTRAL
+                    
+                    # Replace NaN/inf
+                    for name in unified_names:
+                        v = record[name]
+                        if pd.isna(v) or np.isinf(v):
+                            record[name] = 0.0
+                    
+                    rows.append(record)
+                except Exception as e:
+                    logger.debug(f"Skipping snapshot for {symbol}: {e}")
+                    continue
+            
+            if not rows:
+                return pd.DataFrame()
+            
+            result = pd.DataFrame(rows)
+            
+            # Log distribution
+            n_bull = (result["label"] == 2.0).sum()
+            n_bear = (result["label"] == 0.0).sum()
+            n_neut = (result["label"] == 1.0).sum()
+            logger.info(f"{symbol}: Loaded {len(result)} live snapshots "
+                       f"(BULL={n_bull}, NEUT={n_neut}, BEAR={n_bear})")
+            
+            return result
+            
+        except Exception as e:
+            logger.warning(f"Could not load live snapshots for {symbol}: {e}")
+            return pd.DataFrame()
 
     def download_all_historical(
         self,
@@ -787,7 +898,19 @@ class FullPipelineTrainer:
                 )
                 sym_df = self.create_labels(sym_df, threshold=optimal_threshold)
             else:
+                optimal_threshold = 0.005
                 sym_df = self.create_labels(sym_df)
+            
+            # Merge live snapshots from database (collected daily by the bot)
+            n_hist = len(sym_df)
+            snap_df = self._load_live_snapshots_for_symbol(symbol, threshold=optimal_threshold)
+            if not snap_df.empty:
+                # Ensure snapshot columns align with bhavcopy DataFrame
+                # Both have unified feature columns + label + close + future_return
+                sym_df["source"] = "historical"
+                sym_df = pd.concat([sym_df, snap_df], ignore_index=True)
+                logger.info(f"{symbol}: Merged {n_hist} historical + {len(snap_df)} live snapshots "
+                           f"= {len(sym_df)} total samples")
             
             # Prepare for training
             X, y, feature_names = self.prepare_features(sym_df)
@@ -830,12 +953,16 @@ class FullPipelineTrainer:
             f1_val = m.get('f1', m.get('f1_score', 0))
             logger.info(f"{symbol:12} | Acc: {m['accuracy']:.1%} | F1: {f1_val:.1%} | Samples: {res['n_samples']}")
         
-        # Save results summary
+        # Save results summary (strip non-serializable objects like LabelEncoder)
+        def _jsonable_metrics(m):
+            return {k: v for k, v in m.items()
+                    if isinstance(v, (int, float, str, bool, list, dict, type(None)))}
+        
         summary = {
             "timestamp": timestamp,
             "date_range": (str(start_date), str(end_date)),
             "symbols": list(results.keys()),
-            "metrics": {s: r["metrics"] for s, r in results.items()},
+            "metrics": {s: _jsonable_metrics(r["metrics"]) for s, r in results.items()},
             "feature_names": feature_names if results else []
         }
         

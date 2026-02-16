@@ -360,11 +360,18 @@ class ModelComparator:
                     if len(np.unique(y_train)) < 2 or len(np.unique(y_test)) < 2:
                         continue
                     
-                    # Train
-                    model.fit(X_train, y_train)
+                    # LabelEncoder remaps non-sequential labels (e.g. {0,2}) to {0,1}
+                    # Required for XGBoost 3.x which needs sequential labels
+                    from sklearn.preprocessing import LabelEncoder
+                    le = LabelEncoder()
+                    y_train_enc = le.fit_transform(y_train.astype(int))
                     
-                    # Predict
-                    y_pred = model.predict(X_test)
+                    # Train
+                    model.fit(X_train, y_train_enc)
+                    
+                    # Predict and inverse_transform back to original labels
+                    y_pred_enc = model.predict(X_test)
+                    y_pred = le.inverse_transform(y_pred_enc)
                     y_prob = model.predict_proba(X_test) if hasattr(model, 'predict_proba') else None
                     
                     # Get prices for this fold
@@ -477,7 +484,9 @@ class ModelComparator:
     def _create_model(self, config: Dict):
         """Create model instance from configuration.
         
-        Uses multi:softprob/multiclass objectives for ternary labels {0,1,2}.
+        Does NOT hardcode objective or num_class — lets sklearn wrappers
+        auto-detect from the data. Labels are remapped to sequential by
+        LabelEncoder in the CV loop so XGBoost 3.x is happy.
         """
         import xgboost as xgb
         import lightgbm as lgb
@@ -488,8 +497,6 @@ class ModelComparator:
         
         if model_type == 'xgboost':
             return xgb.XGBClassifier(
-                objective='multi:softprob',
-                num_class=3,
                 eval_metric='mlogloss',
                 verbosity=0,
                 **params
@@ -497,8 +504,6 @@ class ModelComparator:
         
         elif model_type == 'lightgbm':
             return lgb.LGBMClassifier(
-                objective='multiclass',
-                num_class=3,
                 verbosity=-1,
                 **params
             )
@@ -516,15 +521,11 @@ class ModelComparator:
             
             estimators = [
                 ('xgb', xgb.XGBClassifier(
-                    objective='multi:softprob',
-                    num_class=3,
                     verbosity=0,
                     max_depth=5,
                     n_estimators=100
                 )),
                 ('lgb', lgb.LGBMClassifier(
-                    objective='multiclass',
-                    num_class=3,
                     verbosity=-1,
                     max_depth=5,
                     n_estimators=100

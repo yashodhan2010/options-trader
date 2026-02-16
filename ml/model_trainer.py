@@ -54,7 +54,7 @@ try:
         accuracy_score, precision_score, recall_score, f1_score,
         roc_auc_score, confusion_matrix, classification_report
     )
-    from sklearn.preprocessing import StandardScaler
+    from sklearn.preprocessing import StandardScaler, LabelEncoder
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
@@ -299,17 +299,21 @@ class ModelTrainer:
                     raise ImportError("XGBoost not available")
                 
                 xgb_params = params.copy()
-                xgb_params["objective"] = "multi:softmax"  # Always multiclass for ternary labels
-                xgb_params["num_class"] = 3  # Always 3 for ternary scheme {0,1,2}
                 xgb_params["random_state"] = 42
                 xgb_params["n_jobs"] = -1
                 
-                # Remove None values
+                # Remove None values and hardcoded objective/num_class
+                xgb_params.pop("objective", None)
+                xgb_params.pop("num_class", None)
                 xgb_params = {k: v for k, v in xgb_params.items() if v is not None}
                 
+                # LabelEncoder for non-sequential labels (XGBoost 3.x requirement)
+                le = LabelEncoder()
+                y_train_enc = le.fit_transform(y_train.astype(int))
+                
                 model = xgb.XGBClassifier(**xgb_params)
-                model.fit(X_train, y_train, verbose=False)
-                y_pred = model.predict(X_val)
+                model.fit(X_train, y_train_enc, verbose=False)
+                y_pred = le.inverse_transform(model.predict(X_val))
                 metrics = self._calculate_metrics(y_val, y_pred, n_classes)
                 
             elif model_type == "lightgbm":
@@ -317,18 +321,22 @@ class ModelTrainer:
                     raise ImportError("LightGBM not available")
                 
                 lgb_params = params.copy()
-                lgb_params["objective"] = "multiclass"  # Always multiclass for ternary labels
-                lgb_params["num_class"] = 3  # Always 3 for ternary scheme {0,1,2}
                 lgb_params["random_state"] = 42
                 lgb_params["n_jobs"] = -1
                 lgb_params["verbose"] = -1
                 
-                # Remove None values
+                # Remove None values and hardcoded objective/num_class
+                lgb_params.pop("objective", None)
+                lgb_params.pop("num_class", None)
                 lgb_params = {k: v for k, v in lgb_params.items() if v is not None}
                 
+                # LabelEncoder for non-sequential labels
+                le = LabelEncoder()
+                y_train_enc = le.fit_transform(y_train.astype(int))
+                
                 model = lgb.LGBMClassifier(**lgb_params)
-                model.fit(X_train, y_train)
-                y_pred = model.predict(X_val)
+                model.fit(X_train, y_train_enc)
+                y_pred = le.inverse_transform(model.predict(X_val))
                 metrics = self._calculate_metrics(y_val, y_pred, n_classes)
                 
             else:
@@ -390,11 +398,12 @@ class ModelTrainer:
                 "reg_lambda": 1,
             }
         
-        # Always multiclass — ternary labels {0,1,2} can have splits like {0,2}
-        # where binary:logistic would fail because label 2 is not valid for binary
+        # LabelEncoder remaps non-sequential labels (e.g. {0,2}) to {0,1}
+        # XGBoost 3.x requires sequential labels starting from 0
+        le = LabelEncoder()
+        y_train_enc = le.fit_transform(y_train.astype(int))
+        
         model = xgb.XGBClassifier(
-            objective="multi:softprob",
-            num_class=3,
             eval_metric="mlogloss",
             random_state=42,
             n_jobs=n_jobs,
@@ -402,12 +411,13 @@ class ModelTrainer:
         )
         
         model.fit(
-            X_train, y_train.astype(int),
+            X_train, y_train_enc,
             verbose=False
         )
         
-        # Calculate metrics
-        y_pred = model.predict(X_val)
+        # Calculate metrics — inverse_transform predictions back to original labels
+        y_pred_enc = model.predict(X_val)
+        y_pred = le.inverse_transform(y_pred_enc)
         metrics = self._calculate_metrics(y_val, y_pred, n_classes)
         metrics["best_params"] = best_params
         
@@ -443,9 +453,11 @@ class ModelTrainer:
                 "reg_lambda": 1,
             }
         
+        # LabelEncoder remaps non-sequential labels (e.g. {0,2}) to {0,1}
+        le = LabelEncoder()
+        y_train_enc = le.fit_transform(y_train.astype(int))
+        
         model = lgb.LGBMClassifier(
-            objective="multiclass",  # Always multiclass — ternary labels {0,1,2} can have {0,2} splits
-            num_class=3,
             random_state=42,
             verbose=-1,
             n_jobs=n_jobs,
@@ -453,11 +465,11 @@ class ModelTrainer:
         )
         
         model.fit(
-            X_train, y_train.astype(int),
-            # Don't pass eval_set — val may have labels unseen in train
+            X_train, y_train_enc,
         )
         
-        y_pred = model.predict(X_val)
+        y_pred_enc = model.predict(X_val)
+        y_pred = le.inverse_transform(y_pred_enc)
         metrics = self._calculate_metrics(y_val, y_pred, n_classes)
         metrics["best_params"] = best_params
         
@@ -612,6 +624,9 @@ class ModelTrainer:
         ensemble["scaler"] = self.scaler
         
         # Calculate ensemble predictions with optimized weights
+        # Sub-models may return different number of probability columns
+        # (e.g., 2 for binary, 3 for multiclass) if LabelEncoder remapped classes.
+        # Pad to n_classes columns for consistent blending.
         ensemble_probs = np.zeros((len(X_val), n_classes))
         total_weight = 0
         
@@ -622,6 +637,13 @@ class ModelTrainer:
             weight = weights.get(name, 0.33)
             if hasattr(model, "predict_proba"):
                 probs = model.predict_proba(X_val)
+                # Pad or align probability columns to n_classes
+                if probs.shape[1] < n_classes:
+                    padded = np.zeros((len(X_val), n_classes))
+                    padded[:, :probs.shape[1]] = probs
+                    probs = padded
+                elif probs.shape[1] > n_classes:
+                    probs = probs[:, :n_classes]
                 ensemble_probs += weight * probs
                 total_weight += weight
         
@@ -651,11 +673,19 @@ class ModelTrainer:
         ensemble accuracy on the validation set.
         """
         # Pre-compute all model probabilities (avoid recalculating each trial)
+        # Pad to n_classes columns for consistent blending
         model_probs = {}
         for name in model_names:
             model = ensemble[name]
             if hasattr(model, "predict_proba"):
-                model_probs[name] = model.predict_proba(X_val)
+                probs = model.predict_proba(X_val)
+                if probs.shape[1] < n_classes:
+                    padded = np.zeros((len(X_val), n_classes))
+                    padded[:, :probs.shape[1]] = probs
+                    probs = padded
+                elif probs.shape[1] > n_classes:
+                    probs = probs[:, :n_classes]
+                model_probs[name] = probs
         
         if len(model_probs) < 2:
             logger.info("Only one model available, skipping weight optimization")
@@ -731,16 +761,20 @@ class ModelTrainer:
                 X_train, X_val = X[train_idx], X[val_idx]
                 y_train, y_val = y[train_idx].astype(int), y[val_idx].astype(int)
                 
+                # LabelEncoder remaps non-sequential labels (e.g. {0,2}) to {0,1}
+                # XGBoost 3.x requires sequential labels starting from 0
+                le = LabelEncoder()
+                y_train_enc = le.fit_transform(y_train)
+                
                 model = xgb.XGBClassifier(
-                    objective="multi:softprob",  # Always multiclass for ternary labels
-                    num_class=3,
                     random_state=42,
                     n_jobs=n_jobs,
                     **params
                 )
                 
-                model.fit(X_train, y_train, verbose=False)
-                y_pred = model.predict(X_val)
+                model.fit(X_train, y_train_enc, verbose=False)
+                y_pred_enc = model.predict(X_val)
+                y_pred = le.inverse_transform(y_pred_enc)
                 scores.append(accuracy_score(y_val, y_pred))
                 
                 # Report intermediate score for pruning
@@ -801,18 +835,20 @@ class ModelTrainer:
                 X_train, X_val = X[train_idx], X[val_idx]
                 y_train, y_val = y[train_idx].astype(int), y[val_idx].astype(int)
                 
+                # LabelEncoder remaps non-sequential labels (e.g. {0,2}) to {0,1}
+                le = LabelEncoder()
+                y_train_enc = le.fit_transform(y_train)
+                
                 model = lgb.LGBMClassifier(
-                    objective="multiclass",  # Always multiclass for ternary labels
-                    num_class=3,
                     random_state=42,
                     verbose=-1,
                     n_jobs=n_jobs,
                     **params
                 )
                 
-                # Don't pass eval_set — val may have classes unseen in train fold
-                model.fit(X_train, y_train)
-                y_pred = model.predict(X_val)
+                model.fit(X_train, y_train_enc)
+                y_pred_enc = model.predict(X_val)
+                y_pred = le.inverse_transform(y_pred_enc)
                 scores.append(accuracy_score(y_val, y_pred))
                 
                 # Report intermediate score for pruning
