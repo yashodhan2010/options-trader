@@ -431,12 +431,11 @@ class FullPipelineTrainer:
     def create_labels(self, df: pd.DataFrame, horizon: int = 1, threshold: float = None) -> pd.DataFrame:
         """Create prediction labels with ternary threshold.
         
-        Labels:
-            +1 (BULLISH): future_return > +threshold
-            -1 (BEARISH): future_return < -threshold
-             0 (NEUTRAL): within dead zone (noise)
+        Labels (matching DIRECTION_MAP directly):
+            0 (BEARISH):  future_return < -threshold
+            1 (NEUTRAL):  within dead zone (noise)
+            2 (BULLISH):  future_return > +threshold
         
-        After label shift in model_trainer: -1,0,1 → 0,1,2
         Maps to DIRECTION_MAP: {0: BEARISH, 1: NEUTRAL, 2: BULLISH}
         
         Args:
@@ -453,12 +452,13 @@ class FullPipelineTrainer:
         df["future_return"] = df["close"].shift(-horizon) / df["close"] - 1
         
         # Ternary label with dead zone to filter noise
+        # 0=BEARISH, 1=NEUTRAL, 2=BULLISH — matches DIRECTION_MAP directly
         if threshold is None:
             threshold = 0.005  # 0.5% default
         
         df["label"] = np.where(
-            df["future_return"] > threshold, 1.0,
-            np.where(df["future_return"] < -threshold, -1.0, 0.0)
+            df["future_return"] > threshold, 2.0,
+            np.where(df["future_return"] < -threshold, 0.0, 1.0)
         )
         
         # Drop rows without labels
@@ -467,9 +467,9 @@ class FullPipelineTrainer:
         # Log label distribution
         label_counts = df["label"].value_counts().to_dict()
         logger.info(f"Label distribution (threshold={threshold:.4f}): "
-                    f"BEARISH(-1)={label_counts.get(-1.0, 0)}, "
-                    f"NEUTRAL(0)={label_counts.get(0.0, 0)}, "
-                    f"BULLISH(+1)={label_counts.get(1.0, 0)}")
+                    f"BEARISH(0)={label_counts.get(0.0, 0)}, "
+                    f"NEUTRAL(1)={label_counts.get(1.0, 0)}, "
+                    f"BULLISH(2)={label_counts.get(2.0, 0)}")
         
         return df
     
@@ -521,12 +521,9 @@ class FullPipelineTrainer:
         def objective(trial):
             threshold = trial.suggest_float("threshold", 0.001, 0.02, log=True)
             
-            # Create labels with this threshold
-            y = np.where(returns > threshold, 1.0,
-                        np.where(returns < -threshold, -1.0, 0.0))
-            
-            # Shift to non-negative: -1,0,1 → 0,1,2
-            y_adj = y + 1
+            # Create labels with this threshold: 0=BEARISH, 1=NEUTRAL, 2=BULLISH
+            y_adj = np.where(returns > threshold, 2.0,
+                        np.where(returns < -threshold, 0.0, 1.0))
             
             # Check we have at least 2 classes with enough samples
             unique, counts = np.unique(y_adj, return_counts=True)
@@ -549,8 +546,9 @@ class FullPipelineTrainer:
                 model.fit(X_train, y_train)
                 y_pred = model.predict(X_val)
                 
-                n_classes = len(np.unique(y_train))
-                avg = "binary" if n_classes == 2 else "weighted"
+                # Detect n_classes from actual val data to avoid binary/multiclass mismatch
+                actual_n = len(set(np.unique(y_val)) | set(np.unique(y_pred)))
+                avg = "weighted"  # Always weighted — ternary labels can have 2-class splits like {0,2}
                 scores.append(f1_score(y_val, y_pred, average=avg, zero_division=0))
             
             return np.mean(scores)
@@ -688,8 +686,9 @@ class FullPipelineTrainer:
         model.fit(X_train, y_train)
         y_pred = model.predict(X_test)
         
-        n_classes = len(np.unique(y_train))
-        average = "binary" if n_classes == 2 else "weighted"
+        # Detect n_classes from actual test data to avoid binary/multiclass mismatch
+        actual_n_classes = len(set(np.unique(y_test)) | set(np.unique(y_pred)))
+        average = "weighted"  # Always weighted — ternary labels {0,1,2} can produce {0,2} splits
         metrics = {
             "accuracy": accuracy_score(y_test, y_pred),
             "precision": precision_score(y_test, y_pred, average=average, zero_division=0),
@@ -828,7 +827,8 @@ class FullPipelineTrainer:
         
         for symbol, res in results.items():
             m = res["metrics"]
-            logger.info(f"{symbol:12} | Acc: {m['accuracy']:.1%} | F1: {m['f1']:.1%} | Samples: {res['n_samples']}")
+            f1_val = m.get('f1', m.get('f1_score', 0))
+            logger.info(f"{symbol:12} | Acc: {m['accuracy']:.1%} | F1: {f1_val:.1%} | Samples: {res['n_samples']}")
         
         # Save results summary
         summary = {

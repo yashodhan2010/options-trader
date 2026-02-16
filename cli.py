@@ -1013,14 +1013,15 @@ class TradingCLI(cmd.Cmd):
                     print(f"[{ul}] Warning: No 'close' column found, skipping...")
                     continue
                 
-                # Create ternary target: +1 if return > +0.5%, -1 if < -0.5%, 0 for neutral
+                # Create ternary target: 2=BULLISH if return > threshold, 0=BEARISH if < -threshold, 1=NEUTRAL
                 closes = df[close_col].values
                 # Target for each day in X (X already starts from lookback)
                 # X[i] corresponds to df row (lookback + i)
                 # Target for X[i] is the return direction for (lookback + i + 1)
                 returns = (closes[1:] - closes[:-1]) / closes[:-1]  # Daily return
                 threshold = 0.005  # 0.5%
-                y_full = np.where(returns > threshold, 1, np.where(returns < -threshold, -1, 0))
+                # Map: BEARISH=0, NEUTRAL=1, BULLISH=2 (matches DIRECTION_MAP)
+                y_full = np.where(returns > threshold, 2, np.where(returns < -threshold, 0, 1))
                 y = y_full[lookback:]  # Align with X start point
                 
                 # Remove last sample (no future target available)
@@ -1339,11 +1340,14 @@ class TradingCLI(cmd.Cmd):
                 print(f"[ERROR] Could not extract features")
                 return
             
-            # Create target variable
+            # Create ternary target: 2=BULLISH, 0=BEARISH, 1=NEUTRAL (matches DIRECTION_MAP)
+            import numpy as np
             df_cols = [c.lower() for c in df.columns]
             close_col = 'close' if 'close' in df_cols else df.columns[df_cols.index('close')]
             closes = df[close_col].values
-            y_full = (closes[1:] > closes[:-1]).astype(int)
+            returns = (closes[1:] - closes[:-1]) / closes[:-1]
+            threshold = 0.005  # 0.5%
+            y_full = np.where(returns > threshold, 2, np.where(returns < -threshold, 0, 1))
             y = y_full[lookback:]
             
             if len(X) > len(y):
@@ -1558,13 +1562,13 @@ class TradingCLI(cmd.Cmd):
                         results[symbol] = {"status": "skipped", "reason": "feature extraction failed"}
                         continue
                     
-                    # Create ternary target: +1 if return > +0.5%, -1 if < -0.5%, 0 for neutral
+                    # Create ternary target: 2=BULLISH, 0=BEARISH, 1=NEUTRAL (matches DIRECTION_MAP)
                     df_cols = [c.lower() for c in df.columns]
                     close_col = 'close' if 'close' in df_cols else df.columns[df_cols.index('close')]
                     closes = df[close_col].values
                     returns = (closes[1:] - closes[:-1]) / closes[:-1]
                     threshold = 0.005  # 0.5%
-                    y_full = np.where(returns > threshold, 1, np.where(returns < -threshold, -1, 0))
+                    y_full = np.where(returns > threshold, 2, np.where(returns < -threshold, 0, 1))
                     y = y_full[lookback:]
                     
                     if len(X) > len(y):
@@ -2366,7 +2370,7 @@ class TradingCLI(cmd.Cmd):
                 
                 import numpy as np
                 avg_acc = np.mean([r["metrics"]["accuracy"] for r in results.values()])
-                avg_f1 = np.mean([r["metrics"]["f1"] for r in results.values()])
+                avg_f1 = np.mean([r["metrics"].get("f1", r["metrics"].get("f1_score", 0)) for r in results.values()])
                 
                 print(f"Average Accuracy: {avg_acc:.1%}")
                 print(f"Average F1 Score: {avg_f1:.1%}")

@@ -256,11 +256,13 @@ def train_combined():
         model.fit(X_train, y_train)
         y_pred = model.predict(X_test)
         
+        n_classes = len(set(y_test) | set(y_pred))
+        avg = "weighted"  # Always weighted — ternary labels {0,1,2} can produce {0,2} splits where pos_label=1 fails
         metrics = {
             "accuracy": float(accuracy_score(y_test, y_pred)),
-            "precision": float(precision_score(y_test, y_pred, zero_division=0)),
-            "recall": float(recall_score(y_test, y_pred, zero_division=0)),
-            "f1": float(f1_score(y_test, y_pred, zero_division=0)),
+            "precision": float(precision_score(y_test, y_pred, average=avg, zero_division=0)),
+            "recall": float(recall_score(y_test, y_pred, average=avg, zero_division=0)),
+            "f1": float(f1_score(y_test, y_pred, average=avg, zero_division=0)),
         }
         
         # Feature importance (top 10)

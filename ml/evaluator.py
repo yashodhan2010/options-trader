@@ -110,15 +110,22 @@ class TradingEvaluator:
             prices: Price series for return simulation
         """
         # Standard ML metrics
+        n_classes = len(set(y_true) | set(y_pred))
+        avg = "weighted"  # Always weighted — ternary labels {0,1,2} can produce {0,2} splits
         accuracy = accuracy_score(y_true, y_pred)
-        precision = precision_score(y_true, y_pred, zero_division=0)
-        recall = recall_score(y_true, y_pred, zero_division=0)
-        f1 = f1_score(y_true, y_pred, zero_division=0)
+        precision = precision_score(y_true, y_pred, average=avg, zero_division=0)
+        recall = recall_score(y_true, y_pred, average=avg, zero_division=0)
+        f1 = f1_score(y_true, y_pred, average=avg, zero_division=0)
         
         # AUC-ROC (needs probabilities)
         if y_prob is not None and len(np.unique(y_true)) > 1:
             try:
-                auc_roc = roc_auc_score(y_true, y_prob)
+                # Always use multi-class OVR — handles both 2 and 3 class cases
+                # with the full probability matrix
+                if y_prob.ndim == 2:
+                    auc_roc = roc_auc_score(y_true, y_prob, multi_class='ovr', average='weighted')
+                else:
+                    auc_roc = roc_auc_score(y_true, y_prob)
             except:
                 auc_roc = 0.5
         else:
@@ -358,7 +365,7 @@ class ModelComparator:
                     
                     # Predict
                     y_pred = model.predict(X_test)
-                    y_prob = model.predict_proba(X_test)[:, 1] if hasattr(model, 'predict_proba') else None
+                    y_prob = model.predict_proba(X_test) if hasattr(model, 'predict_proba') else None
                     
                     # Get prices for this fold
                     fold_prices = prices[test_idx] if prices is not None else None
@@ -468,7 +475,10 @@ class ModelComparator:
         ]
     
     def _create_model(self, config: Dict):
-        """Create model instance from configuration"""
+        """Create model instance from configuration.
+        
+        Uses multi:softprob/multiclass objectives for ternary labels {0,1,2}.
+        """
         import xgboost as xgb
         import lightgbm as lgb
         from sklearn.ensemble import RandomForestClassifier, VotingClassifier
@@ -478,16 +488,17 @@ class ModelComparator:
         
         if model_type == 'xgboost':
             return xgb.XGBClassifier(
-                objective='binary:logistic',
-                eval_metric='logloss',
-                use_label_encoder=False,
+                objective='multi:softprob',
+                num_class=3,
+                eval_metric='mlogloss',
                 verbosity=0,
                 **params
             )
         
         elif model_type == 'lightgbm':
             return lgb.LGBMClassifier(
-                objective='binary',
+                objective='multiclass',
+                num_class=3,
                 verbosity=-1,
                 **params
             )
@@ -505,14 +516,15 @@ class ModelComparator:
             
             estimators = [
                 ('xgb', xgb.XGBClassifier(
-                    objective='binary:logistic',
-                    use_label_encoder=False,
+                    objective='multi:softprob',
+                    num_class=3,
                     verbosity=0,
                     max_depth=5,
                     n_estimators=100
                 )),
                 ('lgb', lgb.LGBMClassifier(
-                    objective='binary',
+                    objective='multiclass',
+                    num_class=3,
                     verbosity=-1,
                     max_depth=5,
                     n_estimators=100

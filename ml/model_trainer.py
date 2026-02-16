@@ -115,7 +115,7 @@ class ModelTrainer:
         
         Args:
             X: Feature matrix (n_samples, n_features)
-            y: Target labels (1=bullish, 0=neutral, -1=bearish) or binary
+            y: Target labels (0=bearish, 1=neutral, 2=bullish) matching DIRECTION_MAP
             feature_names: List of feature names
             model_type: 'xgboost', 'lightgbm', 'rf', or 'ensemble'
             optimize: Whether to use Optuna optimization
@@ -140,10 +140,15 @@ class ModelTrainer:
         else:
             X_scaled = X
         
-        # Convert labels if needed (ensure non-negative for some classifiers)
+        # Safety net: ensure non-negative labels for classifiers
+        # Labels should already be {0,1,2} from create_labels()
         y_adjusted = y.copy()
         if y.min() < 0:
-            y_adjusted = y + 1  # Convert -1,0,1 to 0,1,2
+            y_adjusted = y + 1  # Legacy fallback: -1,0,1 → 0,1,2
+        
+        # Cast to int — float labels (0.0, 1.0, 2.0) cause LabelEncoder issues
+        # in LightGBM when a CV fold doesn't see all classes
+        y_adjusted = y_adjusted.astype(int)
         
         # Check class balance - need at least 2 classes with some samples each
         unique_classes, class_counts = np.unique(y_adjusted, return_counts=True)
@@ -263,10 +268,11 @@ class ModelTrainer:
         else:
             X_scaled = X
         
-        # Convert labels if needed
+        # Safety net: ensure non-negative labels
         y_adjusted = y.copy()
         if y.min() < 0:
-            y_adjusted = y + 1
+            y_adjusted = y + 1  # Legacy fallback
+        y_adjusted = y_adjusted.astype(int)  # Avoid float label issues in LightGBM
         
         # Split data
         split_idx = int(len(X) * (1 - self.validation_split))
@@ -293,8 +299,8 @@ class ModelTrainer:
                     raise ImportError("XGBoost not available")
                 
                 xgb_params = params.copy()
-                xgb_params["objective"] = "multi:softmax" if n_classes > 2 else "binary:logistic"
-                xgb_params["num_class"] = n_classes if n_classes > 2 else None
+                xgb_params["objective"] = "multi:softmax"  # Always multiclass for ternary labels
+                xgb_params["num_class"] = 3  # Always 3 for ternary scheme {0,1,2}
                 xgb_params["random_state"] = 42
                 xgb_params["n_jobs"] = -1
                 
@@ -302,7 +308,7 @@ class ModelTrainer:
                 xgb_params = {k: v for k, v in xgb_params.items() if v is not None}
                 
                 model = xgb.XGBClassifier(**xgb_params)
-                model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+                model.fit(X_train, y_train, verbose=False)
                 y_pred = model.predict(X_val)
                 metrics = self._calculate_metrics(y_val, y_pred, n_classes)
                 
@@ -311,8 +317,8 @@ class ModelTrainer:
                     raise ImportError("LightGBM not available")
                 
                 lgb_params = params.copy()
-                lgb_params["objective"] = "multiclass" if n_classes > 2 else "binary"
-                lgb_params["num_class"] = n_classes if n_classes > 2 else None
+                lgb_params["objective"] = "multiclass"  # Always multiclass for ternary labels
+                lgb_params["num_class"] = 3  # Always 3 for ternary scheme {0,1,2}
                 lgb_params["random_state"] = 42
                 lgb_params["n_jobs"] = -1
                 lgb_params["verbose"] = -1
@@ -321,7 +327,7 @@ class ModelTrainer:
                 lgb_params = {k: v for k, v in lgb_params.items() if v is not None}
                 
                 model = lgb.LGBMClassifier(**lgb_params)
-                model.fit(X_train, y_train, eval_set=[(X_val, y_val)])
+                model.fit(X_train, y_train)
                 y_pred = model.predict(X_val)
                 metrics = self._calculate_metrics(y_val, y_pred, n_classes)
                 
@@ -384,26 +390,19 @@ class ModelTrainer:
                 "reg_lambda": 1,
             }
         
-        # Determine objective
-        if n_classes == 2:
-            objective = "binary:logistic"
-            eval_metric = "logloss"
-        else:
-            objective = "multi:softprob"
-            eval_metric = "mlogloss"
-        
+        # Always multiclass — ternary labels {0,1,2} can have splits like {0,2}
+        # where binary:logistic would fail because label 2 is not valid for binary
         model = xgb.XGBClassifier(
-            objective=objective,
-            eval_metric=eval_metric,
-            use_label_encoder=False,
+            objective="multi:softprob",
+            num_class=3,
+            eval_metric="mlogloss",
             random_state=42,
             n_jobs=n_jobs,
             **best_params
         )
         
         model.fit(
-            X_train, y_train,
-            eval_set=[(X_val, y_val)],
+            X_train, y_train.astype(int),
             verbose=False
         )
         
@@ -445,7 +444,8 @@ class ModelTrainer:
             }
         
         model = lgb.LGBMClassifier(
-            objective="multiclass" if n_classes > 2 else "binary",
+            objective="multiclass",  # Always multiclass — ternary labels {0,1,2} can have {0,2} splits
+            num_class=3,
             random_state=42,
             verbose=-1,
             n_jobs=n_jobs,
@@ -453,8 +453,8 @@ class ModelTrainer:
         )
         
         model.fit(
-            X_train, y_train,
-            eval_set=[(X_val, y_val)],
+            X_train, y_train.astype(int),
+            # Don't pass eval_set — val may have labels unseen in train
         )
         
         y_pred = model.predict(X_val)
@@ -678,7 +678,9 @@ class ModelTrainer:
             preds = np.argmax(blended, axis=1)
             
             # Use F1 (weighted) as objective — better than accuracy for imbalanced classes
-            avg = "binary" if n_classes == 2 else "weighted"
+            # Detect n_classes from actual data to avoid binary/multiclass mismatch
+            actual_n = len(set(np.unique(y_val)) | set(np.unique(preds)))
+            avg = "weighted"  # Always weighted — ternary labels can have 2-class splits like {0,2}
             return f1_score(y_val, preds, average=avg, zero_division=0)
         
         study = optuna.create_study(
@@ -727,17 +729,17 @@ class ModelTrainer:
             
             for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(X)):
                 X_train, X_val = X[train_idx], X[val_idx]
-                y_train, y_val = y[train_idx], y[val_idx]
+                y_train, y_val = y[train_idx].astype(int), y[val_idx].astype(int)
                 
                 model = xgb.XGBClassifier(
-                    objective="binary:logistic" if n_classes == 2 else "multi:softprob",
-                    use_label_encoder=False,
+                    objective="multi:softprob",  # Always multiclass for ternary labels
+                    num_class=3,
                     random_state=42,
                     n_jobs=n_jobs,
                     **params
                 )
                 
-                model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+                model.fit(X_train, y_train, verbose=False)
                 y_pred = model.predict(X_val)
                 scores.append(accuracy_score(y_val, y_pred))
                 
@@ -797,17 +799,19 @@ class ModelTrainer:
             
             for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(X)):
                 X_train, X_val = X[train_idx], X[val_idx]
-                y_train, y_val = y[train_idx], y[val_idx]
+                y_train, y_val = y[train_idx].astype(int), y[val_idx].astype(int)
                 
                 model = lgb.LGBMClassifier(
-                    objective="multiclass" if n_classes > 2 else "binary",
+                    objective="multiclass",  # Always multiclass for ternary labels
+                    num_class=3,
                     random_state=42,
                     verbose=-1,
                     n_jobs=n_jobs,
                     **params
                 )
                 
-                model.fit(X_train, y_train, eval_set=[(X_val, y_val)])
+                # Don't pass eval_set — val may have classes unseen in train fold
+                model.fit(X_train, y_train)
                 y_pred = model.predict(X_val)
                 scores.append(accuracy_score(y_val, y_pred))
                 
@@ -900,14 +904,25 @@ class ModelTrainer:
         self,
         y_true: np.ndarray,
         y_pred: np.ndarray,
-        n_classes: int
+        n_classes: int = None
     ) -> Dict[str, float]:
-        """Calculate classification metrics."""
+        """Calculate classification metrics.
+        
+        Always recomputes n_classes from actual y_true/y_pred to avoid
+        'Target is multiclass but average=binary' errors when train/val
+        class distributions differ.
+        """
+        # Safety: always detect from actual data, not caller's n_classes
+        actual_n_classes = len(set(np.unique(y_true)) | set(np.unique(y_pred)))
+        if n_classes is not None and actual_n_classes != n_classes:
+            logger.debug(f"n_classes mismatch: caller said {n_classes}, actual {actual_n_classes}. Using actual.")
+        n_classes = actual_n_classes
+        
         metrics = {
             "accuracy": accuracy_score(y_true, y_pred),
         }
         
-        average = "binary" if n_classes == 2 else "weighted"
+        average = "weighted"  # Always weighted — ternary labels {0,1,2} can produce {0,2} splits
         
         try:
             metrics["precision"] = precision_score(y_true, y_pred, average=average, zero_division=0)

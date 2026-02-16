@@ -241,10 +241,10 @@ class HistoricalTrainer:
             # Future return
             sym_df["future_return"] = sym_df["close"].shift(-horizon) / sym_df["close"] - 1
             
-            # Classification: 1=bullish, 0=neutral, -1=bearish
-            sym_df["label"] = 0
-            sym_df.loc[sym_df["future_return"] > threshold, "label"] = 1
-            sym_df.loc[sym_df["future_return"] < -threshold, "label"] = -1
+            # Classification: 0=BEARISH, 1=NEUTRAL, 2=BULLISH (matches DIRECTION_MAP)
+            sym_df["label"] = 1  # Default NEUTRAL
+            sym_df.loc[sym_df["future_return"] > threshold, "label"] = 2   # BULLISH
+            sym_df.loc[sym_df["future_return"] < -threshold, "label"] = 0  # BEARISH
             
             # Binary classification (for simplicity)
             sym_df["label_binary"] = (sym_df["future_return"] > 0).astype(float)
@@ -356,11 +356,13 @@ class HistoricalTrainer:
         # Evaluate
         y_pred = model.predict(X_test)
         
+        n_classes = len(set(y_test) | set(y_pred))
+        avg = "weighted"  # Always weighted — ternary labels {0,1,2} can produce {0,2} splits
         metrics = {
             "accuracy": accuracy_score(y_test, y_pred),
-            "precision": precision_score(y_test, y_pred, zero_division=0),
-            "recall": recall_score(y_test, y_pred, zero_division=0),
-            "f1": f1_score(y_test, y_pred, zero_division=0),
+            "precision": precision_score(y_test, y_pred, average=avg, zero_division=0),
+            "recall": recall_score(y_test, y_pred, average=avg, zero_division=0),
+            "f1": f1_score(y_test, y_pred, average=avg, zero_division=0),
         }
         
         logger.info(f"Model Performance:")
