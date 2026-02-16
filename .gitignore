@@ -53,3 +53,13 @@ Thumbs.db
 
 # Jupyter
 .ipynb_checkpoints/
+
+# MLflow tracking data
+mlruns/
+
+# ML model artifacts (generated, large binary files)
+data/ml_models/
+
+# Bhavcopy cache
+data/bhavcopy_cache/
+data/nse_cache/
