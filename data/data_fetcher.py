@@ -5,6 +5,8 @@ Enhanced with Greeks and IV calculations using QuantLib.
 from datetime import datetime, timedelta, date
 from typing import Optional, List, Dict, Any, Tuple
 import pandas as pd
+import threading
+import time
 from collections import defaultdict
 
 from auth.kite_auth import get_kite, is_authenticated
@@ -28,6 +30,11 @@ class DataFetcher:
         self._instruments_cache: Dict[str, List[dict]] = {}
         self._cache_timestamp: Optional[datetime] = None
         self._options_chain_cache: Dict[str, pd.DataFrame] = {}
+        
+        # API rate limiter: Kite allows ~3 req/sec for most endpoints
+        self._rate_limit_lock = threading.Lock()
+        self._api_call_times: list = []  # Timestamps of recent API calls
+        self._max_calls_per_second = 3  # Kite Connect limit
     
     def _ensure_connected(self) -> bool:
         """Ensure Kite connection is established."""
@@ -102,11 +109,28 @@ class DataFetcher:
                     symbol = underlying
                     exchange = "NSE"
             
+            self._throttle_api_call()
             quote = self.kite.quote(f"{exchange}:{symbol}")
             return quote[f"{exchange}:{symbol}"]["last_price"]
         except Exception as e:
             logger.error(f"Failed to get spot price for {underlying}: {e}")
             return None
+    
+    def _throttle_api_call(self) -> None:
+        """Rate-limit API calls to stay within Kite's 3 req/sec limit."""
+        with self._rate_limit_lock:
+            now = time.monotonic()
+            # Remove timestamps older than 1 second
+            self._api_call_times = [t for t in self._api_call_times if now - t < 1.0]
+            
+            if len(self._api_call_times) >= self._max_calls_per_second:
+                # Wait until the oldest call in the window expires
+                sleep_time = 1.0 - (now - self._api_call_times[0]) + 0.05  # 50ms buffer
+                if sleep_time > 0:
+                    logger.debug(f"[RATE_LIMIT] Throttling API call for {sleep_time:.3f}s")
+                    time.sleep(sleep_time)
+            
+            self._api_call_times.append(time.monotonic())
     
     def get_ltp(self, symbol: str, exchange: str = "NFO") -> Optional[float]:
         """
@@ -127,11 +151,52 @@ class DataFetcher:
             if exchange == "NFO" and symbol.startswith("SENSEX"):
                 exchange = "BFO"
             
+            self._throttle_api_call()
             quote = self.kite.ltp(f"{exchange}:{symbol}")
             return quote[f"{exchange}:{symbol}"]["last_price"]
         except Exception as e:
             logger.error(f"Failed to get LTP for {symbol}: {e}")
             return None
+    
+    def get_ltp_batch(self, symbols: List[str], exchange: str = "NFO") -> Dict[str, Optional[float]]:
+        """
+        Get LTP for multiple symbols in a SINGLE API call.
+        Kite's ltp() supports up to ~500 instruments per call.
+        
+        Args:
+            symbols: List of trading symbols
+            exchange: Default exchange (auto-detected for SENSEX → BFO)
+            
+        Returns:
+            Dict mapping symbol → last_price (None if unavailable)
+        """
+        result: Dict[str, Optional[float]] = {s: None for s in symbols}
+        
+        if not symbols or not self._ensure_connected():
+            return result
+        
+        try:
+            # Build exchange-qualified keys, auto-detect BFO for SENSEX
+            qualified = []
+            for sym in symbols:
+                ex = exchange
+                if ex == "NFO" and sym.startswith("SENSEX"):
+                    ex = "BFO"
+                qualified.append(f"{ex}:{sym}")
+            
+            # Kite allows batching in a single ltp() call
+            self._throttle_api_call()
+            quotes = self.kite.ltp(*qualified)
+            
+            for sym, qkey in zip(symbols, qualified):
+                if qkey in quotes:
+                    result[sym] = quotes[qkey].get("last_price")
+            
+            logger.debug(f"[BATCH_LTP] Fetched {len(quotes)}/{len(symbols)} prices in 1 API call")
+        except Exception as e:
+            logger.error(f"Failed batch LTP for {len(symbols)} symbols: {e}")
+        
+        return result
     
     def get_quote(self, symbol: str, exchange: str = "NFO") -> Optional[dict]:
         """
@@ -152,6 +217,7 @@ class DataFetcher:
             if exchange == "NFO" and symbol.startswith("SENSEX"):
                 exchange = "BFO"
             
+            self._throttle_api_call()
             quote = self.kite.quote(f"{exchange}:{symbol}")
             return quote[f"{exchange}:{symbol}"]
         except Exception as e:
@@ -342,6 +408,7 @@ class DataFetcher:
             if not symbols:
                 return pd.DataFrame()
             
+            self._throttle_api_call()
             quotes = self.kite.quote(symbols)
             
             # Build options chain DataFrame
@@ -763,6 +830,7 @@ class DataFetcher:
             from_date = datetime.now() - timedelta(days=days)
             to_date = datetime.now()
             
+            self._throttle_api_call()
             data = self.kite.historical_data(
                 instrument_token,
                 from_date,
@@ -1086,6 +1154,207 @@ class DataFetcher:
         
         # Cap the boost
         return max(-0.2, min(0.2, boost))
+
+    # ========== INTRADAY ANALYSIS (5-minute candles) ==========
+
+    def get_intraday_analysis(self, underlying: str) -> Dict[str, Any]:
+        """
+        Intraday analysis using 5-minute candles for entry timing.
+
+        Computes:
+        - VWAP and price position relative to VWAP
+        - Intraday micro-trend (EMA 9/21 on 5-min candles)
+        - 5-min RSI for overbought/oversold micro-timing
+        - Intraday momentum (last 5 candles vs previous 5)
+        - Candle quality (body-to-wick ratio of recent candles)
+
+        Args:
+            underlying: The underlying asset
+
+        Returns:
+            Dictionary with intraday metrics, empty dict on failure
+        """
+        # Determine symbol / exchange for the underlying
+        asset_config = UNDERLYING_ASSETS.get(underlying, {})
+        if asset_config and "instrument_token" in asset_config:
+            symbol = underlying
+        elif asset_config:
+            symbol = asset_config.get("symbol", underlying)
+        else:
+            symbol = underlying
+        hist_exchange = asset_config.get("exchange", "NSE") if asset_config else "NSE"
+
+        # Fetch 5-minute candles for today + yesterday (need prior data for pre-market indicators)
+        intraday = self.get_historical_data(symbol, "5minute", days=2, exchange=hist_exchange)
+
+        if intraday.empty or len(intraday) < 10:
+            logger.debug(f"Insufficient intraday data for {underlying} ({len(intraday)} candles)")
+            return {}
+
+        try:
+            result: Dict[str, Any] = {}
+            latest = intraday.iloc[-1]
+            price = latest["close"]
+            result["intraday_price"] = round(price, 2)
+
+            # ---------- VWAP ----------
+            # VWAP = cumulative(TP * volume) / cumulative(volume)
+            # Reset per day: filter to today's candles only
+            today = datetime.now().date()
+            today_mask = intraday.index.date == today  # type: ignore[attr-defined]
+            today_df = intraday[today_mask].copy()
+
+            if len(today_df) >= 2:
+                tp = (today_df["high"] + today_df["low"] + today_df["close"]) / 3
+                cum_tp_vol = (tp * today_df["volume"]).cumsum()
+                cum_vol = today_df["volume"].cumsum()
+                vwap = (cum_tp_vol / cum_vol.replace(0, float("nan"))).iloc[-1]
+                if pd.notna(vwap) and vwap > 0:
+                    result["vwap"] = round(vwap, 2)
+                    result["price_vs_vwap_pct"] = round(((price - vwap) / vwap) * 100, 3)
+                    result["above_vwap"] = price > vwap
+                else:
+                    result["vwap"] = None
+                    result["price_vs_vwap_pct"] = 0
+                    result["above_vwap"] = None
+            else:
+                result["vwap"] = None
+                result["price_vs_vwap_pct"] = 0
+                result["above_vwap"] = None
+
+            # ---------- Micro-trend: EMA 9 / 21 on 5-min close ----------
+            intraday["ema_9"] = intraday["close"].ewm(span=9, adjust=False).mean()
+            intraday["ema_21"] = intraday["close"].ewm(span=21, adjust=False).mean()
+
+            ema_9 = intraday["ema_9"].iloc[-1]
+            ema_21 = intraday["ema_21"].iloc[-1]
+            result["ema_9"] = round(ema_9, 2)
+            result["ema_21"] = round(ema_21, 2)
+
+            if price > ema_9 > ema_21:
+                micro_trend = "UP"
+                micro_score = 1.0
+            elif price < ema_9 < ema_21:
+                micro_trend = "DOWN"
+                micro_score = -1.0
+            elif price > ema_21:
+                micro_trend = "WEAK_UP"
+                micro_score = 0.3
+            elif price < ema_21:
+                micro_trend = "WEAK_DOWN"
+                micro_score = -0.3
+            else:
+                micro_trend = "FLAT"
+                micro_score = 0.0
+
+            result["micro_trend"] = micro_trend
+            result["micro_trend_score"] = micro_score
+
+            # ---------- 5-min RSI (14-period) ----------
+            returns = intraday["close"].pct_change()
+            gains = returns.clip(lower=0)
+            losses = (-returns).clip(lower=0)
+            avg_gain = gains.rolling(14).mean().iloc[-1]
+            avg_loss = losses.rolling(14).mean().iloc[-1]
+
+            if avg_loss > 0:
+                rs = avg_gain / avg_loss
+                rsi_5m = 100 - (100 / (1 + rs))
+            else:
+                rsi_5m = 100.0
+
+            result["rsi_5m"] = round(rsi_5m, 2)
+            if rsi_5m > 75:
+                result["rsi_5m_signal"] = "OVERBOUGHT"
+            elif rsi_5m < 25:
+                result["rsi_5m_signal"] = "OVERSOLD"
+            else:
+                result["rsi_5m_signal"] = "NEUTRAL"
+
+            # ---------- Intraday momentum (last 5 vs previous 5 candles) ----------
+            if len(intraday) >= 10:
+                recent_5_ret = (intraday["close"].iloc[-1] / intraday["close"].iloc[-6] - 1) * 100
+                prev_5_ret = (intraday["close"].iloc[-6] / intraday["close"].iloc[-11] - 1) * 100
+                result["recent_5c_return_pct"] = round(recent_5_ret, 3)
+                result["prev_5c_return_pct"] = round(prev_5_ret, 3)
+                result["momentum_accelerating"] = recent_5_ret > prev_5_ret
+            else:
+                result["recent_5c_return_pct"] = 0
+                result["prev_5c_return_pct"] = 0
+                result["momentum_accelerating"] = False
+
+            # ---------- Candle quality (average body-to-range ratio) ----------
+            last_5 = intraday.tail(5)
+            body = (last_5["close"] - last_5["open"]).abs()
+            candle_range = last_5["high"] - last_5["low"]
+            body_ratio = (body / candle_range.replace(0, float("nan"))).mean()
+            result["avg_body_ratio"] = round(body_ratio, 3) if pd.notna(body_ratio) else 0.5
+
+            # ---------- Intraday high/low range ----------
+            if len(today_df) >= 2:
+                result["intraday_high"] = round(today_df["high"].max(), 2)
+                result["intraday_low"] = round(today_df["low"].min(), 2)
+                day_range = result["intraday_high"] - result["intraday_low"]
+                if day_range > 0:
+                    result["intraday_range_position"] = round(
+                        (price - result["intraday_low"]) / day_range, 3
+                    )
+                else:
+                    result["intraday_range_position"] = 0.5
+            else:
+                result["intraday_high"] = price
+                result["intraday_low"] = price
+                result["intraday_range_position"] = 0.5
+
+            # ---------- Overall intraday timing signal ----------
+            # Bullish: above VWAP + micro UP + RSI not overbought
+            # Bearish: below VWAP + micro DOWN + RSI not oversold
+            bullish_score = 0
+            bearish_score = 0
+
+            if result.get("above_vwap"):
+                bullish_score += 1
+            elif result.get("above_vwap") is False:
+                bearish_score += 1
+
+            if micro_trend in ("UP", "WEAK_UP"):
+                bullish_score += 1
+            elif micro_trend in ("DOWN", "WEAK_DOWN"):
+                bearish_score += 1
+
+            if result["rsi_5m_signal"] == "OVERBOUGHT":
+                bullish_score -= 1   # Caution against buying
+            elif result["rsi_5m_signal"] == "OVERSOLD":
+                bearish_score -= 1   # Caution against selling
+
+            if result.get("momentum_accelerating"):
+                # Momentum direction matters
+                if result.get("recent_5c_return_pct", 0) > 0:
+                    bullish_score += 1
+                else:
+                    bearish_score += 1
+
+            if bullish_score >= 2:
+                result["intraday_bias"] = "BULLISH"
+            elif bearish_score >= 2:
+                result["intraday_bias"] = "BEARISH"
+            else:
+                result["intraday_bias"] = "NEUTRAL"
+
+            result["intraday_bull_score"] = bullish_score
+            result["intraday_bear_score"] = bearish_score
+
+            logger.debug(
+                f"Intraday {underlying}: bias={result['intraday_bias']} "
+                f"VWAP={'above' if result.get('above_vwap') else 'below'} "
+                f"micro={micro_trend} RSI5m={rsi_5m:.0f}"
+            )
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Error in intraday analysis for {underlying}: {e}")
+            return {}
 
 
 # Singleton instance

@@ -277,6 +277,40 @@ class MLSignalGenerator:
             )
             return []
         
+        # ========== INTRADAY TIMING FILTER ==========
+        # Daily ML gives direction (swing map), intraday candles gate entry timing.
+        # Only enter when 5-min price action aligns or is neutral.
+        intraday = data_fetcher.get_intraday_analysis(underlying)
+        intraday_bias = intraday.get("intraday_bias", "NEUTRAL") if intraday else "NEUTRAL"
+        
+        if prediction.direction == "BULLISH" and intraday_bias == "BEARISH":
+            logger.info(
+                f"Intraday timing mismatch for {underlying}: ML=BULLISH but intraday=BEARISH "
+                f"(VWAP={'above' if intraday.get('above_vwap') else 'below'}, "
+                f"micro={intraday.get('micro_trend')}, RSI5m={intraday.get('rsi_5m', '?')}) "
+                f"- waiting for better entry"
+            )
+            return []
+        elif prediction.direction == "BEARISH" and intraday_bias == "BULLISH":
+            logger.info(
+                f"Intraday timing mismatch for {underlying}: ML=BEARISH but intraday=BULLISH "
+                f"(VWAP={'above' if intraday.get('above_vwap') else 'below'}, "
+                f"micro={intraday.get('micro_trend')}, RSI5m={intraday.get('rsi_5m', '?')}) "
+                f"- waiting for better entry"
+            )
+            return []
+        else:
+            if intraday:
+                logger.info(
+                    f"Intraday timing OK for {underlying}: ML={prediction.direction}, "
+                    f"intraday={intraday_bias} "
+                    f"(VWAP={'above' if intraday.get('above_vwap') else 'below'}, "
+                    f"micro={intraday.get('micro_trend')}, RSI5m={intraday.get('rsi_5m', '?')})"
+                )
+        
+        # Store intraday data in market_data for strategies to use
+        market_data["intraday"] = intraday
+        
         # Determine strategy based on ML direction + RSI context
         rsi = historical.get("rsi", 50) if isinstance(historical, dict) else 50
         rsi_signal = historical.get("rsi_signal", "NEUTRAL") if isinstance(historical, dict) else "NEUTRAL"

@@ -578,6 +578,50 @@ print(f"ML Accuracy: {stats['accuracy']:.1%}")
 
 MIT License - see LICENSE file for details
 
+## Deployment Roadmap (Planned)
+
+Three-phase capital scaling plan. No code changes yet — to be implemented starting week of 2026-02-23.
+
+### Phase 1 — Testing & Validation (₹2-3L)
+- **Goal**: Validate edge, understand bot behaviour. Not for profit targets.
+- **Capital**: ₹2.5L | **Max positions**: 3 | **Daily loss limit**: ₹5K
+- **Strategy mix**: Index directional (60%), Stock spreads (40%), No naked sells
+- **Allowed**: Long calls/puts, debit spreads, credit spreads (defined risk only)
+- **Blocked**: Naked sells, straddles, strangles, iron condors
+- **Duration**: ~2-3 months
+
+### Phase 2 — Scaling (₹10L)
+- **Goal**: Scale proven strategies, introduce limited cash-secured puts.
+- **Capital**: ₹10L | **Max positions**: 6 | **Daily loss limit**: ₹20K
+- **Strategy mix**: Index scalping (60%), Stock spreads (30%), Cash-secured puts (10%)
+- **Unlocked**: Iron condors, short puts (cash-secured only)
+- **Still blocked**: Naked calls, straddles, strangles
+- **Duration**: Months 3-5
+
+### Phase 3 — Full Deployment (₹25L)
+- **Goal**: ₹1L/month target (4% monthly return).
+- **Capital**: ₹25L | **Max positions**: 10 | **Daily loss limit**: ₹50K
+- **Strategy mix**: Index scalping (60%), Stock spreads (30%), High-conviction sells (10%)
+- **Unlocked**: Covered calls, far-OTM strangles
+- **Still blocked**: ATM straddles (both-side naked risk)
+
+### Aggressiveness Mode (TODO: ML-Driven)
+The bot should **auto-select** passive/moderate/aggressive mode based on:
+- Recent win rate and drawdown history
+- Current market regime (trending vs range-bound)
+- VIX level and volatility regime
+- Capital utilization and available margin
+
+Each mode adjusts: max positions, daily loss limits, SL/target percentages, and strategy allocation weights. This will be an ML-driven decision, not manually configured.
+
+### Monthly Target Realism Check
+
+| Phase | Capital | Target | Monthly % | Feasibility |
+|-------|---------|--------|-----------|-------------|
+| 1 | ₹2.5L | Validate | — | Learning phase |
+| 2 | ₹10L | ₹50K | 5% | Aggressive but possible |
+| 3 | ₹25L | ₹1L | 4% | Achievable with proven edge |
+
 ## Contributing
 
 1. Fork the repository

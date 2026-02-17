@@ -41,7 +41,9 @@ class PositionTracker:
         self.is_running: bool = False
         self.monitor_thread: Optional[threading.Thread] = None
         self.status_thread: Optional[threading.Thread] = None
-        self.poll_interval: int = BOT_CONFIG.get("position_poll_interval", 5)  # From config
+        # Poll interval: 1s when WebSocket is primary (just a safety net),
+        # 1s from config by default since WS handles real-time price updates.
+        self.poll_interval: int = BOT_CONFIG.get("position_poll_interval", 1)  # Fast fallback
         self.status_interval: int = BOT_CONFIG.get("position_status_interval", 900)  # 15 minutes
         self.trailing_sl_enabled: bool = TRADING_CONFIG.get("trailing_sl_enabled", True)
         self.trailing_sl_percent: float = TRADING_CONFIG.get("trailing_sl_percent", 30)
@@ -255,60 +257,78 @@ class PositionTracker:
                 time.sleep(self.poll_interval)
     
     def _check_all_positions(self) -> None:
-        """Check all active positions for SL/Target (Polling mode)."""
+        """
+        Check all active positions for SL/Target (Polling mode).
+        Uses BATCHED LTP fetch — all leg symbols across all positions
+        are fetched in a single API call to avoid rate limit issues.
+        """
         active_positions = order_manager.get_active_positions()
         
-        for position in active_positions:
-            try:
-                self._check_position_polling(position)
-            except Exception as e:
-                logger.error(f"Error checking position {position['execution_id']}: {e}")
-    
-    def _check_position_polling(self, position: Dict) -> None:
-        """
-        Check a single position for SL/Target hit (Polling mode).
-        Fetches latest prices via API.
-        
-        Args:
-            position: Position dictionary
-        """
-        execution_id = position["execution_id"]
-        execution = order_manager.active_executions.get(execution_id)
-        
-        if not execution:
+        if not active_positions:
             return
         
+        # Phase 1: Collect all symbols across all positions for batch fetch
+        all_symbols = []
+        position_executions = []  # [(execution_id, execution), ...]
+        
+        for position in active_positions:
+            execution_id = position["execution_id"]
+            execution = order_manager.active_executions.get(execution_id)
+            if not execution:
+                continue
+            position_executions.append((execution_id, execution))
+            for leg in execution.signal.legs:
+                if leg.symbol not in all_symbols:
+                    all_symbols.append(leg.symbol)
+        
+        # Phase 2: Single batched API call for ALL leg prices
+        if all_symbols:
+            batch_prices = data_fetcher.get_ltp_batch(all_symbols)
+        else:
+            batch_prices = {}
+        
+        # Phase 3: Distribute prices and check each position
+        for execution_id, execution in position_executions:
+            try:
+                self._check_position_with_prices(execution_id, execution, batch_prices)
+            except Exception as e:
+                logger.error(f"Error checking position {execution_id}: {e}")
+    
+    def _check_position_with_prices(self, execution_id: str, execution, batch_prices: Dict[str, Optional[float]]) -> None:
+        """
+        Check a single position for SL/Target hit using pre-fetched prices.
+        No individual API calls — uses batch_prices from a single LTP call.
+        
+        Args:
+            execution_id: Execution ID
+            execution: TradeExecution object
+            batch_prices: Dict mapping symbol → price from batched LTP call
+        """
         signal = execution.signal
         
-        # Get current prices for all legs via API
         current_prices = {}
         total_pnl = 0
         
         for leg in signal.legs:
-            current_price = data_fetcher.get_ltp(leg.symbol)
+            current_price = batch_prices.get(leg.symbol)
             
-            # In paper trading mode, if API returns no price, simulate with entry price
             if current_price:
                 current_prices[leg.symbol] = current_price
                 leg.current_price = current_price
             elif self.paper_trading:
-                # Use entry price with small random fluctuation for paper trading
                 import random
-                # Simulate price within +/- 2% of entry price
                 fluctuation = random.uniform(-0.02, 0.02)
                 simulated_price = leg.entry_price * (1 + fluctuation)
                 current_prices[leg.symbol] = simulated_price
                 leg.current_price = simulated_price
                 logger.debug(f"[PAPER] Simulated price for {leg.symbol}: Rs.{simulated_price:.2f}")
             else:
-                # Fallback to entry price if no current price available
                 if leg.entry_price:
                     current_prices[leg.symbol] = leg.entry_price
                     leg.current_price = leg.entry_price
             
             total_pnl += leg.pnl()
         
-        # Store metrics and check SL/Target
         self._update_metrics_and_check(execution_id, execution, total_pnl, current_prices)
     
     def _check_position_realtime(self, execution_id: str, execution) -> None:

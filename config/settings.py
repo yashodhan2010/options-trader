@@ -90,11 +90,11 @@ MARKET_HOURS = {
 
 # Bot Scan Configuration
 BOT_CONFIG = {
-    "signal_scan_interval": 900,        # Seconds between signal scans (15 minutes for better data)
-    "position_poll_interval": 5,        # Seconds between position checks (exit monitoring)
+    "signal_scan_interval": 300,        # Seconds between signal scans (5 min: daily ML + intraday timing)
+    "position_poll_interval": 5,        # Seconds between batched position checks (WS is primary; this is fallback)
     "position_status_interval": 900,    # Seconds between status updates (15 minutes = 900s)
     "max_signals_per_scan": 3,          # Maximum signals to generate per scan
-    "min_signal_gap_minutes": 15,       # Minimum gap between signals for same underlying
+    "min_signal_gap_minutes": 5,        # Minimum gap between signals for same underlying
     "use_websocket": True,              # Use WebSocket for real-time exit monitoring
     "persist_positions": True,          # Save positions to database for overnight recovery
     

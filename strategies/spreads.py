@@ -49,13 +49,22 @@ class BullCallSpreadStrategy(BaseStrategy):
         strike_interval = 50 if self.underlying in ["NIFTY", "FINNIFTY"] else 100
         atm_strike = round(spot / strike_interval) * strike_interval
         
+        # Buy ATM/slightly ITM, Sell OTM (ATR-based spread width)
+        available_strikes = sorted(calls["strike"].unique())
+        
+        # Derive actual strike interval from the chain (NSE uses 5/10/25/50/100)
+        if len(available_strikes) >= 2:
+            chain_diffs = [available_strikes[i+1] - available_strikes[i] for i in range(len(available_strikes)-1)]
+            actual_interval = min(chain_diffs)
+        else:
+            actual_interval = strike_interval
+        
         # ATR-based spread width: span at least 1 ATR so the spread covers normal movement
         historical = metrics.get("historical", {})
-        atr_14 = historical.get("atr_14", strike_interval) if isinstance(historical, dict) else strike_interval
-        min_spread_strikes = max(1, round(atr_14 / strike_interval))
+        atr_14 = historical.get("atr_14", actual_interval * 5) if isinstance(historical, dict) else actual_interval * 5
+        min_spread_strikes = max(2, round(atr_14 / actual_interval))
         
-        # Buy ATM/slightly ITM, Sell OTM (at least min_spread_strikes away)
-        available_strikes = sorted(calls["strike"].unique())
+        logger.debug(f"Bull Call Spread {self.underlying}: chain_interval={actual_interval}, ATR={atr_14:.1f}, min_spread_strikes={min_spread_strikes}")
         buy_strike = min(available_strikes, key=lambda s: abs(s - atm_strike)) if available_strikes else atm_strike
         sell_candidates = [s for s in available_strikes if s > buy_strike]
         # Pick the strike at least min_spread_strikes away (ATR-based)
@@ -226,13 +235,22 @@ class BearPutSpreadStrategy(BaseStrategy):
         strike_interval = 50 if self.underlying in ["NIFTY", "FINNIFTY"] else 100
         atm_strike = round(spot / strike_interval) * strike_interval
         
+        # Buy ATM/slightly ITM, Sell OTM (ATR-based spread width)
+        available_strikes = sorted(puts["strike"].unique())
+        
+        # Derive actual strike interval from the chain (NSE uses 5/10/25/50/100)
+        if len(available_strikes) >= 2:
+            chain_diffs = [available_strikes[i+1] - available_strikes[i] for i in range(len(available_strikes)-1)]
+            actual_interval = min(chain_diffs)
+        else:
+            actual_interval = strike_interval
+        
         # ATR-based spread width: span at least 1 ATR so the spread covers normal movement
         historical = metrics.get("historical", {})
-        atr_14 = historical.get("atr_14", strike_interval) if isinstance(historical, dict) else strike_interval
-        min_spread_strikes = max(1, round(atr_14 / strike_interval))
+        atr_14 = historical.get("atr_14", actual_interval * 5) if isinstance(historical, dict) else actual_interval * 5
+        min_spread_strikes = max(2, round(atr_14 / actual_interval))
         
-        # Buy ATM/slightly ITM, Sell OTM (at least min_spread_strikes away)
-        available_strikes = sorted(puts["strike"].unique())
+        logger.debug(f"Bear Put Spread {self.underlying}: chain_interval={actual_interval}, ATR={atr_14:.1f}, min_spread_strikes={min_spread_strikes}")
         buy_strike = min(available_strikes, key=lambda s: abs(s - atm_strike)) if available_strikes else atm_strike
         sell_candidates = [s for s in available_strikes if s < buy_strike]
         # Pick the strike at least min_spread_strikes away below buy_strike
@@ -412,10 +430,18 @@ class BearCallSpreadStrategy(BaseStrategy):
         strike_interval = 50 if self.underlying in ["NIFTY", "FINNIFTY"] else 100
         atm_strike = round(spot / strike_interval) * strike_interval
         
+        # Derive actual strike interval from the chain (NSE uses 5/10/25/50/100)
+        available_strikes = sorted(calls["strike"].unique())
+        if len(available_strikes) >= 2:
+            chain_diffs = [available_strikes[i+1] - available_strikes[i] for i in range(len(available_strikes)-1)]
+            actual_interval = min(chain_diffs)
+        else:
+            actual_interval = strike_interval
+        
         # ATR-based minimum OTM distance for credit spreads
         historical = metrics.get("historical", {})
-        atr_14 = historical.get("atr_14", strike_interval) if isinstance(historical, dict) else strike_interval
-        min_otm_strikes = max(1, round(atr_14 / strike_interval))
+        atr_14 = historical.get("atr_14", actual_interval * 5) if isinstance(historical, dict) else actual_interval * 5
+        min_otm_strikes = max(2, round(atr_14 / actual_interval))
         
         # Use max call OI as resistance - sell at or near this level
         max_call_oi_strike = oi_data.get("max_call_oi_strike", atm_strike + 2 * strike_interval)
@@ -425,17 +451,24 @@ class BearCallSpreadStrategy(BaseStrategy):
             max_call_oi_strike = atm_strike + 2 * strike_interval
         
         # Ensure sell strike is at least min_otm_strikes away from ATM (ATR-based safety)
-        min_sell_strike = atm_strike + min_otm_strikes * strike_interval
+        min_sell_strike = atm_strike + min_otm_strikes * actual_interval
         sell_strike = max(max_call_oi_strike, min_sell_strike)
         
         # SELL lower strike call (at resistance), BUY higher strike call (hedge)
-        buy_strike = sell_strike + strike_interval
+        # Hedge width: at least 2 strikes or half ATR for meaningful risk cap
+        min_hedge_strikes = max(2, min_otm_strikes // 2)
         
         # Find nearest available strikes in the chain
-        available_strikes = sorted(calls["strike"].unique())
         sell_strike = min(available_strikes, key=lambda s: abs(s - sell_strike)) if available_strikes else sell_strike
         buy_candidates = [s for s in available_strikes if s > sell_strike]
-        buy_strike = buy_candidates[0] if buy_candidates else sell_strike + strike_interval
+        if len(buy_candidates) >= min_hedge_strikes:
+            buy_strike = buy_candidates[min_hedge_strikes - 1]
+        elif buy_candidates:
+            buy_strike = buy_candidates[-1]
+        else:
+            buy_strike = sell_strike + actual_interval
+        
+        logger.debug(f"Bear Call Spread {self.underlying}: chain_interval={actual_interval}, ATR={atr_14:.1f}, OTM={min_otm_strikes} strikes, hedge={min_hedge_strikes} strikes")
         
         sell_option = calls[calls["strike"] == sell_strike]
         buy_option = calls[calls["strike"] == buy_strike]
@@ -611,10 +644,18 @@ class BullPutSpreadStrategy(BaseStrategy):
         strike_interval = 50 if self.underlying in ["NIFTY", "FINNIFTY"] else 100
         atm_strike = round(spot / strike_interval) * strike_interval
         
+        # Derive actual strike interval from the chain (NSE uses 5/10/25/50/100)
+        available_strikes = sorted(puts["strike"].unique())
+        if len(available_strikes) >= 2:
+            chain_diffs = [available_strikes[i+1] - available_strikes[i] for i in range(len(available_strikes)-1)]
+            actual_interval = min(chain_diffs)
+        else:
+            actual_interval = strike_interval
+        
         # ATR-based minimum OTM distance for credit spreads
         historical = metrics.get("historical", {})
-        atr_14 = historical.get("atr_14", strike_interval) if isinstance(historical, dict) else strike_interval
-        min_otm_strikes = max(1, round(atr_14 / strike_interval))
+        atr_14 = historical.get("atr_14", actual_interval * 5) if isinstance(historical, dict) else actual_interval * 5
+        min_otm_strikes = max(2, round(atr_14 / actual_interval))
         
         # Use max put OI as support - sell at or near this level
         max_put_oi_strike = oi_data.get("max_put_oi_strike", atm_strike - 2 * strike_interval)
@@ -624,17 +665,24 @@ class BullPutSpreadStrategy(BaseStrategy):
             max_put_oi_strike = atm_strike - 2 * strike_interval
         
         # Ensure sell strike is at least min_otm_strikes away from ATM (ATR-based safety)
-        max_sell_strike = atm_strike - min_otm_strikes * strike_interval
+        max_sell_strike = atm_strike - min_otm_strikes * actual_interval
         sell_strike = min(max_put_oi_strike, max_sell_strike)
         
         # SELL higher strike put (at support), BUY lower strike put (hedge)
-        buy_strike = sell_strike - strike_interval
+        # Hedge width: at least 2 strikes or half ATR for meaningful risk cap
+        min_hedge_strikes = max(2, min_otm_strikes // 2)
         
         # Find nearest available strikes in the chain
-        available_strikes = sorted(puts["strike"].unique())
         sell_strike = min(available_strikes, key=lambda s: abs(s - sell_strike)) if available_strikes else sell_strike
         buy_candidates = [s for s in available_strikes if s < sell_strike]
-        buy_strike = buy_candidates[-1] if buy_candidates else sell_strike - strike_interval
+        if len(buy_candidates) >= min_hedge_strikes:
+            buy_strike = buy_candidates[-min_hedge_strikes]
+        elif buy_candidates:
+            buy_strike = buy_candidates[0]
+        else:
+            buy_strike = sell_strike - actual_interval
+        
+        logger.debug(f"Bull Put Spread {self.underlying}: chain_interval={actual_interval}, ATR={atr_14:.1f}, OTM={min_otm_strikes} strikes, hedge={min_hedge_strikes} strikes")
         
         sell_option = puts[puts["strike"] == sell_strike]
         buy_option = puts[puts["strike"] == buy_strike]
