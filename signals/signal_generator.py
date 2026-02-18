@@ -254,7 +254,7 @@ class SignalGenerator:
         # Get options chain
         options_chain = data_fetcher.get_options_chain(
             underlying,
-            num_strikes=STRATEGY_CONFIG.get("otm_offset", 1) + 5,
+            num_strikes=15,  # 15 strikes each side: enough depth for credit spread OTM + hedge
         )
         
         if options_chain.empty:

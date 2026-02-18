@@ -35,7 +35,7 @@ from ml.evaluator import TradingEvaluator, ModelComparator, TradingMetrics
 from ml.auto_retrain import AutoRetrainer, get_auto_retrainer
 from ml.live_feature_collector import LiveFeatureCollector, get_collector as get_live_collector
 from ml.historical_data_collector import HistoricalDataCollector, get_historical_collector
-from ml.full_pipeline import FullPipelineTrainer, MonthlyUpdatePipeline, GreeksCalculator
+from ml.full_pipeline import SimplifiedPipelineTrainer, run_full_pipeline
 from ml.historical_predictor import HistoricalModelPredictor, get_historical_predictor
 from ml.unified_features import (
     UnifiedFeatureDefinition,
@@ -56,13 +56,13 @@ __all__ = [
     "AutoRetrainer",
     "LiveFeatureCollector",
     "HistoricalDataCollector",
-    "FullPipelineTrainer",
-    "MonthlyUpdatePipeline",
-    "GreeksCalculator",
+    "SimplifiedPipelineTrainer",
     "HistoricalModelPredictor",
     "UnifiedFeatureDefinition",
     "HistoricalFeatureAdapter",
     "LiveFeatureAdapter",
+    # Training functions
+    "run_full_pipeline",
     # Singleton getters
     "get_feature_engineer",
     "get_predictor",

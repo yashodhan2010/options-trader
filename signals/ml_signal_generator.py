@@ -217,7 +217,7 @@ class MLSignalGenerator:
         # Get options chain
         options_chain = data_fetcher.get_options_chain(
             underlying,
-            num_strikes=STRATEGY_CONFIG.get("otm_offset", 1) + 5,
+            num_strikes=15,  # 15 strikes each side: enough depth for credit spread OTM + hedge
         )
         
         if options_chain.empty:
@@ -404,10 +404,11 @@ class MLSignalGenerator:
                 conn.close()
                 return True
             
-            # Get recent labels for this underlying (last 5 trading days)
+            # Get recent labels for this underlying (last 5 trading days, max 10 days old)
             cursor.execute("""
                 SELECT label_direction FROM ml_feature_snapshots 
                 WHERE underlying = ? AND label_direction IS NOT NULL AND label_direction != 'NEUTRAL'
+                  AND snapshot_time >= datetime('now', '-10 days')
                 ORDER BY snapshot_time DESC LIMIT 5
             """, (underlying,))
             
@@ -415,7 +416,7 @@ class MLSignalGenerator:
             conn.close()
             
             if len(rows) < 3:
-                return True  # Not enough history, allow the trade
+                return True  # Not enough recent history, allow the trade
             
             labels = [r[0] for r in rows]
             

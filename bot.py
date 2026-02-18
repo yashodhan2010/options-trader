@@ -252,6 +252,9 @@ class OptionsTradingBot:
         # Start live ML feature collection (background thread)
         self._start_live_feature_collection()
         
+        # Label any unlabeled snapshots from previous sessions
+        self._label_pending_snapshots()
+        
         # Start position tracker (WebSocket or polling mode)
         # Pass paper_trading flag to bypass market hour checks
         position_tracker.start_monitoring(
@@ -693,6 +696,16 @@ class OptionsTradingBot:
             collector.stop()
         except Exception:
             pass
+    
+    def _label_pending_snapshots(self) -> None:
+        """Label any unlabeled feature snapshots using historical close prices."""
+        try:
+            from ml.live_feature_collector import label_snapshots
+            count = label_snapshots(lookback_hours=4)
+            if count > 0:
+                logger.info(f"Auto-labeled {count} pending ML feature snapshots")
+        except Exception as e:
+            logger.warning(f"Could not label pending snapshots: {e}")
     
     def stop(self) -> None:
         """Stop the trading bot."""

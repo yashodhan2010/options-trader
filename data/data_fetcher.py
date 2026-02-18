@@ -384,10 +384,12 @@ class DataFetcher:
             # Get ATM strike - determine strike interval based on underlying
             strike_interval = get_strike_interval(underlying)
             if underlying not in UNDERLYING_ASSETS:
-                # For stocks, determine from available strikes
+                # For stocks, derive interval from the near-ATM chain (not deep-OTM wide gaps)
                 strikes = sorted(set(o["strike"] for o in options))
                 if len(strikes) >= 2:
-                    strike_interval = strikes[1] - strikes[0]
+                    # Use minimum gap (near-ATM interval) for tighter, more accurate filtering
+                    diffs = [strikes[i+1] - strikes[i] for i in range(len(strikes)-1)]
+                    strike_interval = min(diffs) if diffs else 50
                 else:
                     strike_interval = 50  # Default
             
@@ -402,8 +404,8 @@ class DataFetcher:
                 if min_strike <= o["strike"] <= max_strike
             ]
             
-            # Get quotes for all options
-            symbols = [f"NFO:{o['tradingsymbol']}" for o in options]
+            # Get quotes for all options (use correct exchange: BFO for SENSEX, NFO otherwise)
+            symbols = [f"{options_exchange}:{o['tradingsymbol']}" for o in options]
             
             if not symbols:
                 return pd.DataFrame()
@@ -414,7 +416,7 @@ class DataFetcher:
             # Build options chain DataFrame
             chain_data = []
             for opt in options:
-                symbol = f"NFO:{opt['tradingsymbol']}"
+                symbol = f"{options_exchange}:{opt['tradingsymbol']}"
                 quote = quotes.get(symbol, {})
                 
                 chain_data.append({

@@ -440,13 +440,15 @@ def get_collector() -> LiveFeatureCollector:
 
 def label_snapshots(lookback_hours: int = 4) -> int:
     """
-    Label past snapshots with actual future returns.
+    Label past snapshots with actual next-day close returns.
     
-    Should be run periodically (e.g., daily) to label collected snapshots
-    with actual price movements for supervised learning.
+    Uses historical OHLC data to find the close price on the next trading day
+    after each snapshot, giving an accurate 1-day forward return label.
+    Runs automatically at bot startup and can also be triggered via CLI.
     
     Args:
-        lookback_hours: Hours to look back for labeling
+        lookback_hours: Minimum hours after snapshot before labeling (ensures
+                        at least one full trading session has elapsed)
         
     Returns:
         Number of snapshots labeled
@@ -465,50 +467,86 @@ def label_snapshots(lookback_hours: int = 4) -> int:
             FROM ml_feature_snapshots 
             WHERE labeled_at IS NULL 
             AND snapshot_time < ?
+            ORDER BY underlying, snapshot_time
         """, (cutoff_time,))
         
         snapshots = cursor.fetchall()
         
+        if not snapshots:
+            logger.info("No unlabeled snapshots to process")
+            return 0
+        
+        logger.info(f"Labeling {len(snapshots)} unlabeled snapshots using historical close prices...")
+        
+        # Cache historical data per underlying to avoid redundant API calls.
+        # key: underlying → DataFrame of daily OHLC
+        _hist_cache: dict = {}
+        
         for snap_id, underlying, snap_time, spot_price in snapshots:
             try:
-                # Get price at 1h, 4h, 1d after snapshot
                 snap_dt = datetime.fromisoformat(snap_time) if isinstance(snap_time, str) else snap_time
+                # Strip timezone info for comparison with history index
+                if hasattr(snap_dt, 'tzinfo') and snap_dt.tzinfo is not None:
+                    snap_dt = snap_dt.replace(tzinfo=None)
+                snap_date = snap_dt.date() if hasattr(snap_dt, 'date') else snap_dt
                 
-                # For now, use current price as proxy (in production, would need historical lookup)
-                current_price = data_fetcher.get_spot_price(underlying)
+                # Fetch & cache historical daily data for this underlying
+                if underlying not in _hist_cache:
+                    from config.settings import UNDERLYING_ASSETS
+                    asset_cfg = UNDERLYING_ASSETS.get(underlying, {})
+                    hist_exchange = asset_cfg.get("exchange", "NSE")
+                    hist_df = data_fetcher.get_historical_data(
+                        symbol=underlying, interval="day", days=60, exchange=hist_exchange
+                    )
+                    _hist_cache[underlying] = hist_df
                 
-                if current_price and spot_price:
-                    # Calculate return
-                    return_pct = (current_price / spot_price - 1) * 100
-                    
-                    # Determine direction
-                    if return_pct > 0.5:
-                        direction = "UP"
-                    elif return_pct < -0.5:
-                        direction = "DOWN"
-                    else:
-                        direction = "NEUTRAL"
-                    
-                    # Determine magnitude
-                    abs_return = abs(return_pct)
-                    if abs_return > 2.0:
-                        magnitude = "LARGE"
-                    elif abs_return > 1.0:
-                        magnitude = "MEDIUM"
-                    else:
-                        magnitude = "SMALL"
-                    
-                    # Update snapshot
-                    cursor.execute("""
-                        UPDATE ml_feature_snapshots 
-                        SET future_return_1d = ?, 
-                            label_direction = ?, 
-                            label_magnitude = ?,
-                            labeled_at = ?
-                        WHERE id = ?
-                    """, (return_pct, direction, magnitude, datetime.now(), snap_id))
-                    
-                    labeled_count += 1
+                hist_df = _hist_cache[underlying]
+                if hist_df is None or hist_df.empty:
+                    continue
+                
+                # Find the close price on the next trading day after the snapshot
+                # hist_df index is datetime; we want the first row whose date > snap_date
+                future_rows = hist_df[hist_df.index.normalize() > str(snap_date)]
+                if future_rows.empty:
+                    # Next trading day hasn't happened yet — skip, will be labeled later
+                    continue
+                
+                next_day_close = future_rows.iloc[0]["close"]
+                
+                if not next_day_close or not spot_price:
+                    continue
+                
+                # Calculate 1-day return
+                return_pct = (next_day_close / spot_price - 1) * 100
+                
+                # Determine direction
+                if return_pct > 0.5:
+                    direction = "UP"
+                elif return_pct < -0.5:
+                    direction = "DOWN"
+                else:
+                    direction = "NEUTRAL"
+                
+                # Determine magnitude
+                abs_return = abs(return_pct)
+                if abs_return > 2.0:
+                    magnitude = "LARGE"
+                elif abs_return > 1.0:
+                    magnitude = "MEDIUM"
+                else:
+                    magnitude = "SMALL"
+                
+                # Update snapshot
+                cursor.execute("""
+                    UPDATE ml_feature_snapshots 
+                    SET future_return_1d = ?, 
+                        label_direction = ?, 
+                        label_magnitude = ?,
+                        labeled_at = ?
+                    WHERE id = ?
+                """, (return_pct, direction, magnitude, datetime.now(), snap_id))
+                
+                labeled_count += 1
                     
             except Exception as e:
                 logger.error(f"Error labeling snapshot {snap_id}: {e}")
@@ -516,7 +554,7 @@ def label_snapshots(lookback_hours: int = 4) -> int:
         conn.commit()
         conn.close()
         
-        logger.info(f"Labeled {labeled_count} snapshots")
+        logger.info(f"Labeled {labeled_count}/{len(snapshots)} snapshots")
         
     except Exception as e:
         logger.error(f"Error in labeling: {e}")
