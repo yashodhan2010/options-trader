@@ -42,10 +42,17 @@ class Database:
                 entry_time TIMESTAMP,
                 exit_time TIMESTAMP,
                 status TEXT,
+                exit_reason TEXT,
                 realized_pnl REAL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Backward-compatible migration for existing databases
+        cursor.execute("PRAGMA table_info(trades)")
+        trade_columns = [row[1] for row in cursor.fetchall()]
+        if "exit_reason" not in trade_columns:
+            cursor.execute("ALTER TABLE trades ADD COLUMN exit_reason TEXT")
         
         # Orders table
         cursor.execute("""
@@ -361,6 +368,7 @@ class Database:
         status: Optional[str] = None,
         exit_time: Optional[datetime] = None,
         realized_pnl: Optional[float] = None,
+        exit_reason: Optional[str] = None,
     ) -> bool:
         """
         Update an existing trade.
@@ -392,6 +400,10 @@ class Database:
             if realized_pnl is not None:
                 updates.append("realized_pnl = ?")
                 params.append(realized_pnl)
+
+            if exit_reason:
+                updates.append("exit_reason = ?")
+                params.append(exit_reason)
             
             if updates:
                 params.append(execution_id)
@@ -406,6 +418,30 @@ class Database:
         except Exception as e:
             logger.error(f"Failed to update trade: {e}")
             return False
+
+    def get_trade_by_execution_id(self, execution_id: str) -> Optional[Dict]:
+        """Get a trade row by execution ID."""
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM trades WHERE execution_id = ? LIMIT 1", (execution_id,))
+            row = cursor.fetchone()
+            conn.close()
+
+            if not row:
+                return None
+
+            trade = dict(row)
+            if trade.get("signal_data"):
+                try:
+                    trade["signal_data"] = json.loads(trade["signal_data"])
+                except Exception:
+                    pass
+
+            return trade
+        except Exception as e:
+            logger.error(f"Failed to get trade by execution ID: {e}")
+            return None
     
     def save_order(self, order_data: Dict) -> bool:
         """

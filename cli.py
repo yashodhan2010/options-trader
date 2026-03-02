@@ -810,9 +810,10 @@ class TradingCLI(cmd.Cmd):
             ml label               - Label collected snapshots with outcomes
             ml historical [status|date|range|fill|kite] - Download NSE bhavcopy historical data
             ml backfill [DAYS]     - Backfill last N days of historical data (uses jugaad-data)
-            ml train-full          - Train all symbols using NSE bhavcopy with 59 features
-            ml train-monthly       - Run monthly update pipeline (download + train)
+            ml train-full          - Train all symbols using live feature snapshots
+            ml train-monthly       - Monthly retrain pipeline (skips if recent)
             ml models              - Show trained per-symbol models and metrics
+            ml entropy [SYMBOL]    - Show rolling direction-entropy status
         """
         args = arg.strip().split()
         
@@ -821,7 +822,7 @@ class TradingCLI(cmd.Cmd):
             print("Commands: status, train, train-best, train-full, train-monthly,")
             print("          backtest, paper, predict, features, drift, compare,")
             print("          retrain, retrain-status, collect, label, historical,")
-            print("          backfill, models")
+            print("          backfill, models, entropy")
             return
         
         cmd = args[0].lower()
@@ -884,8 +885,50 @@ class TradingCLI(cmd.Cmd):
             self._ml_train_monthly(force)
         elif cmd == "models":
             self._ml_models()
+        elif cmd == "entropy":
+            symbol = args[1].upper() if len(args) > 1 else None
+            self._ml_entropy(symbol)
         else:
             print(f"Unknown ML command: {cmd}")
+
+    def _ml_entropy(self, symbol: str = None):
+        """Show rolling direction entropy guard status."""
+        try:
+            status = signal_generator.get_entropy_status(symbol)
+
+            print("\n" + "=" * 70)
+            print("DIRECTION ENTROPY STATUS")
+            print("=" * 70)
+            print(f"Enabled: {status.get('enabled')}")
+            print(
+                f"Window: {status.get('window_size')} | Min Samples: {status.get('min_samples')} | "
+                f"Min Entropy: {status.get('min_entropy'):.3f}"
+            )
+
+            symbols = status.get("symbols", {})
+            if not symbols:
+                print("\nNo symbols available.")
+                return
+
+            print("\n" + "-" * 70)
+            print(f"{'Symbol':<12} {'Samples':<8} {'Entropy':<8} {'Tradable':<9} Distribution")
+            print("-" * 70)
+
+            for sym, info in symbols.items():
+                samples = info.get("samples", 0)
+                entropy = info.get("entropy")
+                entropy_str = f"{entropy:.3f}" if entropy is not None else "N/A"
+                tradable = "YES" if info.get("tradable") else "NO"
+                dist = info.get("distribution", {})
+                reason = info.get("reason", "")
+                print(f"{sym:<12} {samples:<8} {entropy_str:<8} {tradable:<9} {dist}")
+                if reason != "ok":
+                    print(f"{'':<12} {'':<8} {'':<8} {'':<9} reason={reason}")
+
+            print("-" * 70)
+
+        except Exception as e:
+            print(f"\n[ERROR] {e}")
     
     def _ml_status(self):
         """Show ML system status."""
@@ -2327,40 +2370,25 @@ class TradingCLI(cmd.Cmd):
             traceback.print_exc()
     
     def _ml_train_full(self, args: list):
-        """Train all symbols using NSE bhavcopy historical data with 59 features."""
+        """Train all symbols using live feature snapshots from database."""
         try:
-            from ml.full_pipeline import FullPipelineTrainer
-            from datetime import date
+            from ml.full_pipeline import SimplifiedPipelineTrainer
             
             print("\n" + "="*60)
-            print("FULL TRAINING PIPELINE (NSE Bhavcopy)")
+            print("FULL TRAINING PIPELINE (Live Snapshots)")
             print("="*60)
             
-            # Parse optional date arguments
-            if len(args) >= 2:
-                start_date = date.fromisoformat(args[0])
-                end_date = date.fromisoformat(args[1])
-            else:
-                # Default: Jan-May 2024 (known available in archives)
-                start_date = date(2024, 1, 1)
-                end_date = date(2024, 5, 31)
-            
-            print(f"\nDate Range: {start_date} to {end_date}")
-            print("This downloads NSE bhavcopy data and trains per-symbol models.")
+            print("\nTrains per-symbol models using live feature snapshots")
+            print("collected by the bot during market hours.")
             print("\nFeatures include:")
-            print("   - OHLCV, Futures OI")
-            print("   - Options OI (calls/puts), PCR")
-            print("   - ATM/OTM analysis, Max Pain")
+            print("   - Real Greeks (IV, Delta, Gamma, Theta, Vega)")
+            print("   - OI data (calls/puts), PCR")
+            print("   - ATM/OTM analysis")
             print("   - Technical indicators (RSI, MACD, BB)")
-            print("   - Greek proxies (IV, Delta, Gamma, Theta, Vega)")
             print("\nStarting training pipeline...\n")
             
-            trainer = FullPipelineTrainer()
-            results = trainer.run_full_pipeline(
-                start_date=start_date,
-                end_date=end_date,
-                force_download="--force" in args or "-f" in args
-            )
+            trainer = SimplifiedPipelineTrainer()
+            results = trainer.run_full_pipeline()
             
             if results:
                 print("\n" + "="*60)
@@ -2378,7 +2406,9 @@ class TradingCLI(cmd.Cmd):
                 print("\nModels saved to: data/ml_models/")
                 print("Use 'ml models' to see trained model details.")
             else:
-                print("\n[ERROR] Training failed. Check logs for details.")
+                print("\n[ERROR] Training failed - not enough snapshots.")
+                print("Make sure the bot has been collecting features during market hours.")
+                print("Use 'ml collect start' to begin collection, then try again later.")
                 
         except Exception as e:
             print(f"\n[ERROR] {e}")
@@ -2386,35 +2416,53 @@ class TradingCLI(cmd.Cmd):
             traceback.print_exc()
     
     def _ml_train_monthly(self, force: bool = False):
-        """Run monthly update pipeline - download new data and retrain."""
+        """Run monthly retrain - retrain all models from latest snapshot data."""
         try:
-            from ml.full_pipeline import MonthlyUpdatePipeline
+            from ml.full_pipeline import SimplifiedPipelineTrainer
+            from pathlib import Path
+            import json
             
             print("\n" + "="*60)
-            print("MONTHLY UPDATE PIPELINE")
+            print("MONTHLY RETRAIN PIPELINE")
             print("="*60)
             
-            pipeline = MonthlyUpdatePipeline()
-            needs_update, start, end = pipeline.check_update_needed()
+            # Check last training date
+            model_dir = Path("data/ml_models")
+            summaries = list(model_dir.glob("training_summary_*.json"))
             
-            if not needs_update and not force:
-                print("\nNo update needed. Models are up to date.")
-                print(f"Last update date: {pipeline.get_last_update_date()}")
-                print("\nUse '--force' or '-f' to force retrain.")
-                return
+            if summaries and not force:
+                latest = max(summaries, key=lambda p: p.stat().st_mtime)
+                with open(latest) as f:
+                    summary = json.load(f)
+                ts = summary.get("timestamp", "unknown")
+                n_models = len(summary.get("symbols", []))
+                print(f"\nLast training: {ts} ({n_models} models)")
+                
+                # Check if recent (within 7 days)
+                from datetime import datetime, timedelta
+                try:
+                    last_dt = datetime.strptime(ts, "%Y%m%d_%H%M%S")
+                    if datetime.now() - last_dt < timedelta(days=7):
+                        print("Models were trained within the last 7 days.")
+                        print("Use '--force' or '-f' to force retrain.")
+                        return
+                except ValueError:
+                    pass
             
             if force:
                 print("\nForcing full retrain...")
             else:
-                print(f"\nUpdating with data from {start} to {end}...")
+                print("\nRetraining models from latest snapshot data...")
             
-            results = pipeline.run_monthly_update(force=force)
+            trainer = SimplifiedPipelineTrainer()
+            results = trainer.run_full_pipeline()
             
             if results:
-                print("\n[SUCCESS] Monthly update complete!")
+                print(f"\n[SUCCESS] Monthly retrain complete!")
                 print(f"Models updated: {len(results)}")
             else:
-                print("\n[INFO] No new data available or update not needed.")
+                print("\n[INFO] No models trained - insufficient snapshot data.")
+                print("Make sure the bot has been collecting features during market hours.")
                 
         except Exception as e:
             print(f"\n[ERROR] {e}")

@@ -793,7 +793,7 @@ class PositionTracker:
         """
         logger.info(f"Triggering exit for {execution_id}: {reason}")
         
-        success = order_manager.close_position(execution_id, OrderType.MARKET)
+        success = order_manager.close_position(execution_id, OrderType.MARKET, reason=reason)
         
         if success:
             self._notify("position_closed", execution_id, pnl, reason)
@@ -938,7 +938,7 @@ class PositionTracker:
                 trade_logger.info("=" * 80)
                 trade_logger.info("")
             
-            order_manager.close_position(execution_id)
+            order_manager.close_position(execution_id, reason=reason)
             self._notify("position_closed", execution_id, pnl, reason)
             total_pnl += pnl
         

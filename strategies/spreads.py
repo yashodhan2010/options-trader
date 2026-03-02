@@ -9,7 +9,7 @@ import pandas as pd
 from .base_strategy import (
     BaseStrategy, StrategyType, StrategySignal, OptionLeg, TradeDirection
 )
-from config.settings import TRADING_CONFIG, STRATEGY_CONFIG, UNDERLYING_ASSETS, get_lot_size, get_strike_interval
+from config.settings import TRADING_CONFIG, STRATEGY_CONFIG, UNDERLYING_ASSETS, get_lot_size, get_trade_quantity, get_strike_interval
 from core.logger import logger
 
 
@@ -112,8 +112,7 @@ class BullCallSpreadStrategy(BaseStrategy):
             logger.info(f"Bull Call Spread {self.underlying}: skipped - strategy confidence {confidence:.2f} < {self.min_confidence}")
             return None
         
-        lot_size = get_lot_size(self.underlying)
-        quantity = lot_size * TRADING_CONFIG.get("default_quantity", 1)
+        quantity = get_trade_quantity(self.underlying)
         
         legs = [
             OptionLeg(
@@ -300,8 +299,7 @@ class BearPutSpreadStrategy(BaseStrategy):
             logger.info(f"Bear Put Spread {self.underlying}: skipped - strategy confidence {confidence:.2f} < {self.min_confidence}")
             return None
         
-        lot_size = get_lot_size(self.underlying)
-        quantity = lot_size * TRADING_CONFIG.get("default_quantity", 1)
+        quantity = get_trade_quantity(self.underlying)
         
         legs = [
             OptionLeg(
@@ -502,8 +500,7 @@ class BearCallSpreadStrategy(BaseStrategy):
             logger.info(f"Bear Call Spread {self.underlying}: skipped - strategy confidence {confidence:.2f} < {self.min_confidence}")
             return None
         
-        lot_size = get_lot_size(self.underlying)
-        quantity = lot_size * TRADING_CONFIG.get("default_quantity", 1)
+        quantity = get_trade_quantity(self.underlying)
         
         # SELL leg first (main trade), then BUY leg (hedge)
         legs = [
@@ -717,8 +714,7 @@ class BullPutSpreadStrategy(BaseStrategy):
             logger.info(f"Bull Put Spread {self.underlying}: skipped - strategy confidence {confidence:.2f} < {self.min_confidence}")
             return None
         
-        lot_size = get_lot_size(self.underlying)
-        quantity = lot_size * TRADING_CONFIG.get("default_quantity", 1)
+        quantity = get_trade_quantity(self.underlying)
         
         # SELL leg first (main trade), then BUY leg (hedge)
         legs = [

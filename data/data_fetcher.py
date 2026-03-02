@@ -718,6 +718,13 @@ class DataFetcher:
         total_call_oi = calls["oi"].sum()
         total_put_oi = puts["oi"].sum()
         pcr = total_put_oi / total_call_oi if total_call_oi > 0 else 0
+
+        # Option-flow volume metrics (scan-level, useful for event regime detection)
+        total_call_volume = calls["volume"].sum() if "volume" in calls.columns else 0
+        total_put_volume = puts["volume"].sum() if "volume" in puts.columns else 0
+        put_call_volume_ratio = (
+            total_put_volume / total_call_volume if total_call_volume > 0 else 0
+        )
         
         # Find max pain
         strikes = chain["strike"].unique()
@@ -749,6 +756,9 @@ class DataFetcher:
             "pcr": round(pcr, 2),
             "total_call_oi": total_call_oi,
             "total_put_oi": total_put_oi,
+            "total_call_volume": float(total_call_volume),
+            "total_put_volume": float(total_put_volume),
+            "put_call_volume_ratio": round(float(put_call_volume_ratio), 3),
             "max_pain": max_pain_strike,
             "max_call_oi_strike": max_call_oi_strike,
             "max_put_oi_strike": max_put_oi_strike,

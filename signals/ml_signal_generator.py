@@ -6,13 +6,15 @@ No rule-based signal generation - ML drives the entire signal flow.
 """
 from datetime import datetime
 from typing import List, Dict, Any, Optional
+from collections import deque, Counter
+import math
 import pandas as pd
 
 from data.data_fetcher import data_fetcher
 from strategies.catalogue import StrategyCatalogue
 from strategies.base_strategy import StrategySignal, StrategyType, TradeDirection, OptionLeg
 from config.settings import (
-    UNDERLYING_ASSETS, STRATEGY_CONFIG, ML_CONFIG,
+    UNDERLYING_ASSETS, STRATEGY_CONFIG, ML_CONFIG, EVENT_REGIME_CONFIG,
     WATCHLIST, WATCHLIST_SYMBOLS, is_in_watchlist, get_watchlist_assets
 )
 from core.logger import logger
@@ -104,6 +106,26 @@ class MLSignalGenerator:
         # Configuration
         self.min_confidence = ML_CONFIG.get("min_confidence_for_trade", 0.55)
         self.model_loaded = False
+
+        entropy_cfg = ML_CONFIG.get("direction_entropy_guard", {})
+        self.entropy_guard_enabled = entropy_cfg.get("enabled", True)
+        self.entropy_window_size = entropy_cfg.get("window_size", 40)
+        self.entropy_min_samples = entropy_cfg.get("min_samples", 20)
+        self.entropy_min_value = entropy_cfg.get("min_entropy", 0.35)
+        self._direction_windows: Dict[str, deque] = {
+            symbol: deque(maxlen=self.entropy_window_size) for symbol in self.underlyings
+        }
+
+        # Event-regime overlay state
+        self.event_config = EVENT_REGIME_CONFIG
+        self.event_enabled = self.event_config.get("enabled", False)
+        risk_off_cfg = self.event_config.get("risk_off", {})
+        pcv_cfg = risk_off_cfg.get("put_call_volume_spike", {})
+        self._pcv_window_size = pcv_cfg.get("window_size", 24)
+        self._pcv_windows: Dict[str, deque] = {
+            symbol: deque(maxlen=self._pcv_window_size) for symbol in self.underlyings
+        }
+        self._risk_off_state: Dict[str, bool] = {symbol: False for symbol in self.underlyings}
         
         # Initialize strategy catalogues
         for underlying in self.underlyings:
@@ -164,10 +186,11 @@ class MLSignalGenerator:
         
         targets = [underlying] if underlying else self.underlyings
         all_signals = []
+        global_event_context = self._build_global_event_context() if self.event_enabled else {}
         
         for target in targets:
             try:
-                signals = self._generate_ml_signals(target, strategy_type)
+                signals = self._generate_ml_signals(target, strategy_type, global_event_context)
                 all_signals.extend(signals)
                 self.last_signals[target] = signals
                 
@@ -195,6 +218,7 @@ class MLSignalGenerator:
         self,
         underlying: str,
         force_strategy: Optional[StrategyType] = None,
+        global_event_context: Optional[Dict[str, Any]] = None,
     ) -> List[StrategySignal]:
         """
         Generate signals for a single underlying using ML prediction.
@@ -250,24 +274,69 @@ class MLSignalGenerator:
             logger.warning(f"Could not extract features for {underlying}")
             return []
         
-        # Get ML prediction
-        prediction = self._predictor.predict(features, underlying)
+        prediction, blended_confidence, should_trade = self._predictor.predict_with_guardrails(
+            features=features,
+            rule_confidence=self.min_confidence,
+            underlying=underlying,
+            current_positions=0,
+            is_paper_mode=True,
+        )
         
         if prediction is None:
             logger.warning(f"ML prediction failed for {underlying}")
             return []
+
+        if getattr(prediction, "abstained", False):
+            logger.info(f"Abstain band triggered for {underlying} - skipping trade")
+            return []
+
+        prediction.raw_ml_confidence = prediction.confidence
+        prediction.rule_confidence = self.min_confidence
+        prediction.blended_confidence = blended_confidence
+        prediction.confidence = blended_confidence
         
         logger.info(
             f"ML Prediction for {underlying}: {prediction.direction} "
             f"(confidence: {prediction.confidence:.1%})"
         )
         
+        if not should_trade:
+            logger.info(
+                f"Guardrails blocked trade for {underlying} "
+                f"(ML: {prediction.raw_ml_confidence:.1%}, blended: {prediction.confidence:.1%})"
+            )
+            return []
+
         # Check confidence threshold
         if prediction.confidence < self.min_confidence:
             logger.info(
                 f"ML confidence {prediction.confidence:.1%} below threshold "
                 f"{self.min_confidence:.1%} - skipping {underlying}"
             )
+            return []
+
+        # Intraday context is used both for timing and event-regime flip detection
+        intraday = data_fetcher.get_intraday_analysis(underlying)
+        intraday_bias = intraday.get("intraday_bias", "NEUTRAL") if intraday else "NEUTRAL"
+
+        # Event-regime overlay (proxy + flow based)
+        event_outcome = self._apply_event_regime_overlay(
+            underlying=underlying,
+            prediction=prediction,
+            oi_data=oi_data,
+            intraday=intraday,
+            global_event_context=global_event_context or {},
+        )
+        if event_outcome.get("blocked"):
+            logger.warning(
+                f"Event regime blocked {underlying}: direction={prediction.direction}, "
+                f"reasons={event_outcome.get('reasons', [])}"
+            )
+            return []
+
+        self._record_prediction_direction(underlying, prediction.direction)
+        if not self._passes_direction_entropy_guard(underlying):
+            logger.info(f"Direction entropy guard blocked trade for {underlying}")
             return []
         
         # Trend confirmation: validate ML direction against recent prediction history
@@ -280,8 +349,6 @@ class MLSignalGenerator:
         # ========== INTRADAY TIMING FILTER ==========
         # Daily ML gives direction (swing map), intraday candles gate entry timing.
         # Only enter when 5-min price action aligns or is neutral.
-        intraday = data_fetcher.get_intraday_analysis(underlying)
-        intraday_bias = intraday.get("intraday_bias", "NEUTRAL") if intraday else "NEUTRAL"
         
         if prediction.direction == "BULLISH" and intraday_bias == "BEARISH":
             logger.info(
@@ -371,6 +438,134 @@ class MLSignalGenerator:
                 strategy.ml_override = False
         
         return signals
+
+    def _build_global_event_context(self) -> Dict[str, Any]:
+        """Build global proxy-based event context for the current scan."""
+        context: Dict[str, Any] = {"risk_off_score": 0.0, "reasons": []}
+        try:
+            risk_off_cfg = self.event_config.get("risk_off", {})
+            breadth_cfg = risk_off_cfg.get("market_breadth", {})
+            idx_symbols = breadth_cfg.get("index_symbols", [])
+            bearish_threshold = breadth_cfg.get("bearish_return_5d_threshold", -0.8)
+            min_bearish_count = breadth_cfg.get("min_bearish_count", 3)
+            score_weight = breadth_cfg.get("score_weight", 1.0)
+
+            bearish_count = 0
+            returns_5d: Dict[str, float] = {}
+            for symbol in idx_symbols:
+                hist = data_fetcher.get_historical_analysis(symbol, days=30)
+                if not hist:
+                    continue
+                ret5 = hist.get("returns_5d")
+                if ret5 is None:
+                    continue
+                returns_5d[symbol] = float(ret5)
+                if float(ret5) <= bearish_threshold:
+                    bearish_count += 1
+
+            context["index_returns_5d"] = returns_5d
+            context["bearish_index_count"] = bearish_count
+            if bearish_count >= min_bearish_count:
+                context["risk_off_score"] += score_weight
+                context["reasons"].append(
+                    f"breadth_bearish={bearish_count}/{max(len(idx_symbols), 1)}"
+                )
+
+            commodity_cfg = self.event_config.get("commodity_proxy", {})
+            commodity_symbols = commodity_cfg.get("symbols", [])
+            if commodity_symbols:
+                bull_th = commodity_cfg.get("bullish_return_5d_threshold", 1.5)
+                min_bull = commodity_cfg.get("min_bullish_count", 1)
+                comm_weight = commodity_cfg.get("score_weight", 0.5)
+                commodity_bull = 0
+                for symbol in commodity_symbols:
+                    hist = data_fetcher.get_historical_analysis(symbol, days=30)
+                    ret5 = (hist or {}).get("returns_5d")
+                    if ret5 is not None and float(ret5) >= bull_th:
+                        commodity_bull += 1
+                if commodity_bull >= min_bull:
+                    context["risk_off_score"] += comm_weight
+                    context["reasons"].append(f"commodity_bull={commodity_bull}")
+
+        except Exception as e:
+            logger.debug(f"Failed to build event context: {e}")
+
+        return context
+
+    def _apply_event_regime_overlay(
+        self,
+        underlying: str,
+        prediction,
+        oi_data: Dict[str, Any],
+        intraday: Dict[str, Any],
+        global_event_context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Apply event-regime scoring and optionally flip/block signals."""
+        if not self.event_enabled:
+            return {"active": False, "blocked": False, "reasons": []}
+
+        risk_off_cfg = self.event_config.get("risk_off", {})
+        entry_threshold = risk_off_cfg.get("entry_threshold", 2.0)
+        exit_threshold = risk_off_cfg.get("exit_threshold", 1.0)
+        shock_cfg = risk_off_cfg.get("intraday_shock", {})
+        pcv_cfg = risk_off_cfg.get("put_call_volume_spike", {})
+
+        score = float(global_event_context.get("risk_off_score", 0.0))
+        reasons = list(global_event_context.get("reasons", []))
+
+        recent_5c_ret = (intraday or {}).get("recent_5c_return_pct")
+        if recent_5c_ret is not None and float(recent_5c_ret) <= shock_cfg.get("recent_5c_return_pct_threshold", -0.35):
+            score += float(shock_cfg.get("score_weight", 0.7))
+            reasons.append(f"intraday_shock={float(recent_5c_ret):.3f}%")
+
+        if pcv_cfg.get("enabled", True):
+            pcv_ratio = oi_data.get("put_call_volume_ratio") if oi_data else None
+            if pcv_ratio is not None:
+                window = self._pcv_windows.setdefault(underlying, deque(maxlen=self._pcv_window_size))
+                baseline = (sum(window) / len(window)) if len(window) >= pcv_cfg.get("min_samples", 8) else None
+                if baseline and baseline > 0:
+                    multiplier = pcv_cfg.get("spike_multiplier", 1.6)
+                    min_ratio = pcv_cfg.get("min_ratio", 1.2)
+                    if float(pcv_ratio) >= max(min_ratio, baseline * multiplier):
+                        score += float(pcv_cfg.get("score_weight", 1.2))
+                        reasons.append(
+                            f"pcv_spike={float(pcv_ratio):.2f} vs avg={baseline:.2f}"
+                        )
+                window.append(float(pcv_ratio))
+
+        prev_state = self._risk_off_state.get(underlying, False)
+        if prev_state:
+            is_active = score >= exit_threshold
+        else:
+            is_active = score >= entry_threshold
+        self._risk_off_state[underlying] = is_active
+
+        if not is_active:
+            return {"active": False, "blocked": False, "reasons": reasons, "score": score}
+
+        sensitive = set(self.event_config.get("risk_off_sensitive_symbols", []))
+        is_sensitive = underlying in sensitive or underlying in UNDERLYING_ASSETS
+        flip_mode = self.event_config.get("flip_mode", "flip_to_bearish")
+
+        if is_sensitive and prediction.direction == "BULLISH":
+            if flip_mode == "block_bullish":
+                return {
+                    "active": True,
+                    "blocked": True,
+                    "reasons": reasons,
+                    "score": score,
+                }
+
+            original_direction = prediction.direction
+            prediction.direction = "BEARISH"
+            penalty = float(self.event_config.get("confidence_penalty", 0.12))
+            prediction.confidence = max(0.35, prediction.confidence - penalty)
+            logger.warning(
+                f"[EVENT_FLIP] {underlying}: {original_direction} -> {prediction.direction}, "
+                f"score={score:.2f}, reasons={reasons}"
+            )
+
+        return {"active": True, "blocked": False, "reasons": reasons, "score": score}
     
     def _confirm_trend(self, underlying: str, ml_direction: str) -> bool:
         """
@@ -437,6 +632,41 @@ class MLSignalGenerator:
         except Exception as e:
             logger.warning(f"Trend confirmation check failed: {e}")
             return True  # On error, allow the trade
+
+    def _record_prediction_direction(self, underlying: str, direction: str) -> None:
+        """Record predicted direction for entropy monitoring."""
+        if underlying not in self._direction_windows:
+            self._direction_windows[underlying] = deque(maxlen=self.entropy_window_size)
+        self._direction_windows[underlying].append(direction)
+
+    def _passes_direction_entropy_guard(self, underlying: str) -> bool:
+        """Block trading if recent prediction directions collapse to near-single class."""
+        if not self.entropy_guard_enabled:
+            return True
+
+        window = self._direction_windows.get(underlying)
+        if not window or len(window) < self.entropy_min_samples:
+            return True
+
+        counts = Counter(window)
+        total = sum(counts.values())
+        if total == 0:
+            return True
+
+        entropy = 0.0
+        for count in counts.values():
+            p = count / total
+            if p > 0:
+                entropy -= p * math.log2(p)
+
+        if entropy < self.entropy_min_value:
+            logger.warning(
+                f"Low direction entropy for {underlying}: H={entropy:.3f} < {self.entropy_min_value:.3f}, "
+                f"counts={dict(counts)}"
+            )
+            return False
+
+        return True
     
     # Credit-only strategies for cautious RSI situations
     _CREDIT_ONLY = {
@@ -571,7 +801,9 @@ class MLSignalGenerator:
         
         # Add ML metadata to metrics
         ml_signal.metrics["ml_direction"] = prediction.direction
-        ml_signal.metrics["ml_confidence"] = prediction.confidence
+        ml_signal.metrics["ml_confidence"] = getattr(prediction, "raw_ml_confidence", prediction.confidence)
+        ml_signal.metrics["rule_confidence"] = getattr(prediction, "rule_confidence", self.min_confidence)
+        ml_signal.metrics["blended_confidence"] = prediction.confidence
         ml_signal.metrics["ml_probabilities"] = prediction.probabilities
         ml_signal.metrics["ml_model_version"] = prediction.model_version
         ml_signal.metrics["ml_model_type"] = prediction.model_type
@@ -680,6 +912,51 @@ class MLSignalGenerator:
             "min_confidence": self.min_confidence,
             "underlyings": self.underlyings,
         }
+
+    def get_entropy_status(self, underlying: Optional[str] = None) -> Dict[str, Any]:
+        """Get rolling direction entropy status for one or all symbols."""
+        targets = [underlying] if underlying else self.underlyings
+        result: Dict[str, Any] = {
+            "enabled": self.entropy_guard_enabled,
+            "window_size": self.entropy_window_size,
+            "min_samples": self.entropy_min_samples,
+            "min_entropy": self.entropy_min_value,
+            "symbols": {},
+        }
+
+        for symbol in targets:
+            window = self._direction_windows.get(symbol, deque(maxlen=self.entropy_window_size))
+            counts = Counter(window)
+            total = sum(counts.values())
+
+            entropy = None
+            if total > 0:
+                entropy_val = 0.0
+                for count in counts.values():
+                    p = count / total
+                    if p > 0:
+                        entropy_val -= p * math.log2(p)
+                entropy = entropy_val
+
+            tradable = True
+            reason = "ok"
+            if self.entropy_guard_enabled:
+                if total < self.entropy_min_samples:
+                    tradable = False
+                    reason = f"warming_up ({total}/{self.entropy_min_samples})"
+                elif entropy is not None and entropy < self.entropy_min_value:
+                    tradable = False
+                    reason = f"low_entropy ({entropy:.3f} < {self.entropy_min_value:.3f})"
+
+            result["symbols"][symbol] = {
+                "samples": total,
+                "distribution": dict(counts),
+                "entropy": entropy,
+                "tradable": tradable,
+                "reason": reason,
+            }
+
+        return result
     
     def clear_history(self) -> None:
         """Clear signal history."""

@@ -1,6 +1,6 @@
 # Options Trader — Complete Architecture Reference
 
-> **Last updated:** 2026-02-17  
+> **Last updated:** 2026-03-02  
 > **Total files:** ~55 Python files | **~25,500 lines**  
 > **Runtime:** Python 3.x + Conda (`options-trader` env)
 
@@ -95,6 +95,7 @@ An ML-driven options trading bot for Indian markets (NSE/BSE) via Zerodha Kite C
 | `UNDERLYING_ASSETS` | NIFTY (lot=25, 50pt), BANKNIFTY (lot=15, 100pt), FINNIFTY (lot=25, 50pt), SENSEX (lot=10, 100pt, BFO) |
 | `STRATEGY_CONFIG` | 10 enabled strategies, `otm_offset=1` |
 | `LIQUIDITY_GUARD` | Min volume (1000 idx / 500 stock), min OI (5000 idx / 1000 stock), max spread 5% |
+| `EVENT_REGIME_CONFIG` | Risk-off breadth + intraday shock + put/call volume spike scoring, with configurable `flip_mode`, hysteresis thresholds, and confidence penalty |
 | `ML_CONFIG` | `training_symbols`: NIFTY, BANKNIFTY, SENSEX, AXISBANK, HDFCBANK, RELIANCE, SBIN; `model_type=ensemble`, `optuna_trials=50`, guardrails, feedback, auto-retrain configs |
 
 **Utility functions:** `get_lot_size()`, `get_options_exchange()`, `get_strike_interval()`, `get_instrument_token()`, `get_asset_by_name()`
@@ -118,7 +119,7 @@ Defines stock-specific lot sizes, instrument tokens, equity tokens for historica
 
 | Table | Purpose |
 |---|---|
-| `trades` | All executed trades (entry/exit prices, P&L, strategy, direction) |
+| `trades` | All executed trades (entry/exit prices, P&L, strategy, direction, `exit_reason`) |
 | `orders` | Individual order records per leg |
 | `signals` | Generated signals (before execution decision) |
 | `daily_pnl` | End-of-day P&L snapshots |
@@ -150,7 +151,7 @@ Defines stock-specific lot sizes, instrument tokens, equity tokens for historica
 | `get_ltp_batch(symbols)` | Dict[str→float] | **Position tracker (batched polling)** |
 | `get_options_chain(underlying)` | DataFrame | Strategy analysis, signal gen |
 | `get_options_chain_with_greeks()` | DataFrame + Greeks | CLI display |
-| `get_oi_data(underlying)` | Dict (PCR, max pain, sentiment) | Signal gen, strategies |
+| `get_oi_data(underlying)` | Dict (PCR, max pain, sentiment, total call/put volume, put/call volume ratio) | Signal gen, event overlay, strategies |
 | `get_historical_data(symbol, interval, days)` | DataFrame | Analysis, ML features |
 | `get_historical_analysis(underlying)` | Dict (trend, RSI, ATR, SMA, S/R) | **Daily swing analysis** (uses `day` candles) |
 | `get_intraday_analysis(underlying)` | Dict (VWAP, EMA9/21, RSI5m, bias) | **5-min entry timing** |
@@ -236,11 +237,23 @@ For each symbol in (UNDERLYING_ASSETS + watchlist):
   5. get_historical_analysis() ──────────────── daily SMA, RSI, ATR, trend
   6. feature_engineer.extract_features() ────── 61 features
   7. predictor.predict() ────────────────────── BULLISH/NEUTRAL/BEARISH + confidence
-  8. _confirm_trend() ──────────────────────── check last 5 DB labels align
-  9. get_intraday_analysis() ────────────────── VWAP/EMA/RSI5m → intraday bias
-  10. DIRECTION_STRATEGY_MAP lookup ─────────── pick strategy by direction × IV
-  11. strategy.analyze() ────────────────────── construct StrategySignal with legs
+  8. _build_global_event_context() ──────────── breadth + shock + put/call volume spike state
+  9. _apply_event_regime_overlay() ──────────── flip/block/penalize confidence on risk-off regime
+  10. _confirm_trend() ───────────────────────── check last 5 DB labels align
+  11. get_intraday_analysis() ────────────────── VWAP/EMA/RSI5m → intraday bias
+  12. DIRECTION_STRATEGY_MAP lookup ──────────── pick strategy by direction × IV
+  13. strategy.analyze() ─────────────────────── construct StrategySignal with legs
 ```
+
+#### Event-Regime Overlay (MVP)
+
+- Builds a shared market context per scan from three proxies:
+  1. **Breadth risk-off** across tracked symbols
+  2. **Short-horizon intraday shock** (rapid downside moves)
+  3. **Put/Call volume spike** from options-chain aggregates
+- Uses hysteresis thresholds (`entry_threshold` / `exit_threshold`) to avoid rapid flip-flop.
+- Applies one of: **flip direction**, **block new entries**, or **confidence penalty**, based on `EVENT_REGIME_CONFIG`.
+- Emits explicit audit logs (`[EVENT_FLIP] ...`) when direction is transformed due to event regime.
 
 #### Strategy Selection Map (direction × IV regime)
 
@@ -454,6 +467,8 @@ The bot uses a **two-layer scan** approach:
 | `optuna_trials` | `ML_CONFIG` | 50 | Hyperparameter search trials |
 | `skip_first_minutes` | `MARKET_HOURS` | 105 (until 11:00) | Skip morning noise |
 | `no_trade_after` | `MARKET_HOURS` | 14:00 | No new trades after 2 PM |
+| `entry_threshold` / `exit_threshold` | `EVENT_REGIME_CONFIG.risk_off` | 1.0 / 0.8 | Risk-off regime activation/deactivation hysteresis |
+| `flip_mode` | `EVENT_REGIME_CONFIG` | `flip_or_block` | Event handling policy (flip/block/penalize) |
 
 ---
 
@@ -476,6 +491,7 @@ Three-phase capital scaling plan to reach ₹1L/month target:
 | Issue | Location | Impact |
 |---|---|---|
 | `int64` JSON serialization error | Snapshot saving | Warning in logs, non-fatal |
+| MLflow local metadata warnings | `mlruns/artifacts` malformed metadata files | Warning noise in logs, does not block inference/trading |
 | `options_trader/` package (planned restructure) | Never implemented | Current flat structure works fine |
 | BSE instruments limited chain | BullPutSpread for SENSEX | "Strikes not found" when ATR pushes too far OTM |
 | Model confidence low (~51%) | Most symbols | Signals generated but skipped below 52% threshold |

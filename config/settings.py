@@ -31,7 +31,8 @@ KITE_CONFIG = {
 # Trading Configuration
 TRADING_CONFIG = {
     "exchange": "NFO",  # NFO for options
-    "default_quantity": 1,  # Lot size multiplier
+    "default_quantity": 1,  # Lot size multiplier (for stocks)
+    "index_quantity_multiplier": 2,  # Lot multiplier for index options (NIFTY/BANKNIFTY/FINNIFTY/SENSEX)
     "max_positions": 5,
     "paper_max_positions": 15,  # Relaxed cap for paper trading (set higher than live)
     "capital_per_trade": 150000,  # INR
@@ -139,7 +140,7 @@ UNDERLYING_ASSETS = {
         "symbol": "NIFTY 50",
         "exchange": "NSE",
         "options_exchange": "NFO",  # NSE F&O
-        "lot_size": 25,
+        "lot_size": 75,
         "tick_size": 0.05,
         "strike_interval": 50,
         "expiry_day": "Thursday",  # Weekly expiry
@@ -149,7 +150,7 @@ UNDERLYING_ASSETS = {
         "symbol": "NIFTY BANK",
         "exchange": "NSE",
         "options_exchange": "NFO",  # NSE F&O
-        "lot_size": 15,
+        "lot_size": 30,
         "tick_size": 0.05,
         "strike_interval": 100,
         "expiry_day": "Wednesday",  # Weekly expiry
@@ -159,7 +160,7 @@ UNDERLYING_ASSETS = {
         "symbol": "NIFTY FIN SERVICE",
         "exchange": "NSE",
         "options_exchange": "NFO",  # NSE F&O
-        "lot_size": 25,
+        "lot_size": 60,
         "tick_size": 0.05,
         "strike_interval": 50,
         "expiry_day": "Tuesday",
@@ -169,7 +170,7 @@ UNDERLYING_ASSETS = {
         "symbol": "SENSEX",
         "exchange": "BSE",
         "options_exchange": "BFO",  # BSE F&O
-        "lot_size": 10,
+        "lot_size": 20,
         "tick_size": 0.05,
         "strike_interval": 100,
         "expiry_day": "Friday",  # Weekly expiry
@@ -268,6 +269,7 @@ ML_CONFIG = {
     
     # Model paths
     "model_path": ML_MODELS_DIR,
+    "prefer_symbol_models": True,      # Prefer per-symbol *_model_*.joblib artifacts when available
     "mlflow_tracking_uri": str(BASE_DIR / "mlruns"),
     "mlflow_enabled": os.getenv("MLFLOW_ENABLED", "true").lower() == "true",
     
@@ -301,6 +303,29 @@ ML_CONFIG = {
     "feature_set": "full",              # 'minimal', 'standard', 'full'
     "lookback_periods": [5, 10, 20, 50],
     "normalize_features": True,
+    "feature_schema": {
+        "strict_mode": True,
+        "min_overlap_ratio": 0.50,
+        "warn_overlap_ratio": 0.75,
+        "max_missing_features": 25,
+    },
+    "abstain_band": {
+        "default_margin": 0.08,          # Abstain if top-2 class probs too close
+        "min_top_probability": 0.45,     # Abstain if top class prob too low
+        "by_symbol": {},                 # Optional per-symbol override
+    },
+    "direction_entropy_guard": {
+        "enabled": True,
+        "window_size": 40,
+        "min_samples": 20,
+        "min_entropy": 0.35,            # Block if direction distribution collapses
+    },
+    "training_class_guard": {
+        "enabled": True,
+        "min_minority_samples": 12,
+        "min_minority_ratio": 0.10,
+        "require_test_class_diversity": False,
+    },
     
     # Prediction caching
     "prediction_cache_seconds": 60,     # Cache predictions for this long
@@ -345,6 +370,46 @@ ML_CONFIG = {
         "auto_promote": False,               # Auto-promote if accuracy > 55%
         "use_feedback_target": True,         # Use trade P&L as target (not next-day return)
         "check_interval_seconds": 3600,      # Background check interval (1 hour)
+    },
+}
+
+# Event-regime overlay (proxy-only MVP, no external news API)
+EVENT_REGIME_CONFIG = {
+    "enabled": True,
+    "flip_mode": "flip_to_bearish",          # flip_to_bearish | block_bullish
+    "confidence_penalty": 0.12,                # Reduce confidence when event flip applies
+    "risk_off_sensitive_symbols": [
+        "NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX",
+        "AXISBANK", "HDFCBANK", "IDFCFIRSTB", "SBIN",
+    ],
+    "risk_off": {
+        "entry_threshold": 1.0,                # Activate risk-off state at/above this score
+        "exit_threshold": 0.8,                 # Deactivate only when below this (hysteresis)
+        "market_breadth": {
+            "index_symbols": ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"],
+            "bearish_return_5d_threshold": -0.8,
+            "min_bearish_count": 3,
+            "score_weight": 1.0,
+        },
+        "intraday_shock": {
+            "recent_5c_return_pct_threshold": -0.35,
+            "score_weight": 0.7,
+        },
+        "put_call_volume_spike": {
+            "enabled": True,
+            "window_size": 24,
+            "min_samples": 8,
+            "spike_multiplier": 1.6,           # current >= avg(window) * multiplier
+            "min_ratio": 1.2,                  # absolute floor for put/call volume ratio
+            "score_weight": 1.2,
+        },
+    },
+    # Optional proxy basket for commodity-led sessions (configure symbols as needed)
+    "commodity_proxy": {
+        "symbols": [],
+        "bullish_return_5d_threshold": 1.5,
+        "min_bullish_count": 1,
+        "score_weight": 0.5,
     },
 }
 
@@ -457,6 +522,28 @@ def get_lot_size(name: str) -> int:
         return asset.get("lot_size", 25)
     
     return 25  # Default
+
+
+def get_trade_quantity(name: str) -> int:
+    """
+    Get trade quantity for an underlying, applying the correct multiplier.
+    
+    Index options (NIFTY, BANKNIFTY, etc.) use index_quantity_multiplier
+    to scale up lot count since their base lot sizes are small (10-25).
+    Stock options use default_quantity multiplier.
+    
+    Args:
+        name: Symbol name
+        
+    Returns:
+        Trade quantity (lot_size * multiplier)
+    """
+    lot_size = get_lot_size(name)
+    if name in UNDERLYING_ASSETS:
+        multiplier = TRADING_CONFIG.get("index_quantity_multiplier", 1)
+    else:
+        multiplier = TRADING_CONFIG.get("default_quantity", 1)
+    return lot_size * multiplier
 
 
 def get_options_exchange(name: str) -> str:

@@ -9,7 +9,7 @@ import pandas as pd
 from .base_strategy import (
     BaseStrategy, StrategyType, StrategySignal, OptionLeg, TradeDirection
 )
-from config.settings import TRADING_CONFIG, STRATEGY_CONFIG, METRICS_CONFIG, UNDERLYING_ASSETS, get_lot_size
+from config.settings import TRADING_CONFIG, STRATEGY_CONFIG, METRICS_CONFIG, UNDERLYING_ASSETS, get_lot_size, get_trade_quantity
 from core.logger import logger
 
 
@@ -86,8 +86,7 @@ class LongCallStrategy(BaseStrategy):
             return None
         
         # Create option leg
-        lot_size = get_lot_size(self.underlying)
-        quantity = lot_size * TRADING_CONFIG.get("default_quantity", 1)
+        quantity = get_trade_quantity(self.underlying)
         
         leg = OptionLeg(
             symbol=option["symbol"],
@@ -295,8 +294,7 @@ class LongPutStrategy(BaseStrategy):
         if not self.ml_override and confidence < self.min_confidence:
             return None
         
-        lot_size = get_lot_size(self.underlying)
-        quantity = lot_size * TRADING_CONFIG.get("default_quantity", 1)
+        quantity = get_trade_quantity(self.underlying)
         
         leg = OptionLeg(
             symbol=option["symbol"],
@@ -443,8 +441,7 @@ class ShortCallStrategy(BaseStrategy):
         if not self.ml_override and confidence < self.min_confidence:
             return None
         
-        lot_size = get_lot_size(self.underlying)
-        quantity = lot_size * TRADING_CONFIG.get("default_quantity", 1)
+        quantity = get_trade_quantity(self.underlying)
         
         leg = OptionLeg(
             symbol=option["symbol"],
@@ -566,8 +563,7 @@ class ShortPutStrategy(BaseStrategy):
         if not self.ml_override and confidence < self.min_confidence:
             return None
         
-        lot_size = get_lot_size(self.underlying)
-        quantity = lot_size * TRADING_CONFIG.get("default_quantity", 1)
+        quantity = get_trade_quantity(self.underlying)
         
         leg = OptionLeg(
             symbol=option["symbol"],

@@ -123,6 +123,44 @@ class OptionsTradingBot:
     def _on_position_closed(self, execution_id: str, pnl: float, reason: str) -> None:
         """Handle position closed."""
         logger.info(f"Position Closed: {execution_id}, P&L: Rs.{pnl:.2f}, Reason: {reason}")
+
+        # Log ML outcome for continuous feedback
+        try:
+            from core.database import database
+            from ml import get_feedback_collector
+
+            trade = database.get_trade_by_execution_id(execution_id)
+            if trade:
+                entry_time_raw = trade.get("entry_time")
+                entry_time = None
+                if isinstance(entry_time_raw, datetime):
+                    entry_time = entry_time_raw
+                elif entry_time_raw:
+                    try:
+                        entry_time = datetime.fromisoformat(str(entry_time_raw))
+                    except ValueError:
+                        entry_time = None
+
+                duration_seconds = 0
+                if entry_time:
+                    duration_seconds = max(0, int((datetime.now() - entry_time).total_seconds()))
+
+                signal_data = trade.get("signal_data") or {}
+                max_loss = float(signal_data.get("max_loss", 0) or 0)
+                if max_loss > 0:
+                    pnl_percent = (pnl / max_loss) * 100.0
+                else:
+                    pnl_percent = 0.0
+
+                feedback_collector = get_feedback_collector()
+                feedback_collector.log_outcome(
+                    execution_id=execution_id,
+                    actual_pnl=float(pnl),
+                    actual_pnl_percent=float(pnl_percent),
+                    trade_duration_seconds=duration_seconds,
+                )
+        except Exception as e:
+            logger.warning(f"Could not log ML outcome for {execution_id}: {e}")
         
         # Log to trade file
         result = "PROFIT" if pnl >= 0 else "LOSS"
@@ -508,6 +546,7 @@ class OptionsTradingBot:
                         
                         # Log to dedicated trade log file
                         self._log_trade_entry(signal, execution)
+                        self._log_ml_prediction(signal, execution)
                         
                         self._send_notification(
                             f"New Trade Executed!\n"
@@ -558,6 +597,40 @@ class OptionsTradingBot:
         trade_logger.info(f"Rationale:    {signal.rationale}")
         trade_logger.info("=" * 80)
         trade_logger.info("")
+
+    def _log_ml_prediction(self, signal, execution) -> None:
+        """Log ML prediction metadata for executed trades."""
+        try:
+            from ml import get_feedback_collector
+
+            metrics = signal.metrics or {}
+            ml_direction = metrics.get("ml_direction", "NEUTRAL")
+            ml_confidence = float(metrics.get("ml_confidence", signal.confidence))
+            rule_confidence = float(metrics.get("rule_confidence", ml_confidence))
+            blended_confidence = float(metrics.get("blended_confidence", signal.confidence))
+            model_version = metrics.get("ml_model_version", "unknown")
+            model_type = metrics.get("ml_model_type", "unknown")
+
+            feedback_collector = get_feedback_collector()
+            success = feedback_collector.log_prediction(
+                execution_id=execution.execution_id,
+                underlying=signal.underlying,
+                strategy_type=signal.strategy_type.value,
+                model_version=model_version,
+                model_type=model_type,
+                direction_prediction=ml_direction,
+                ml_confidence=ml_confidence,
+                rule_confidence=rule_confidence,
+                blended_confidence=blended_confidence,
+            )
+
+            if success:
+                logger.debug(f"Logged ML prediction for {execution.execution_id}")
+            else:
+                logger.warning(f"Failed to log ML prediction for {execution.execution_id}")
+
+        except Exception as e:
+            logger.warning(f"Could not log ML prediction for {execution.execution_id}: {e}")
 
     def _meets_auto_trade_criteria(self, signal) -> bool:
         """

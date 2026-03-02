@@ -318,6 +318,28 @@ class OrderManager:
                 logger.error(f"Failed to place order: {e}")
         
         self.order_history.append(order)
+
+        # Persist order for audit trail when we have an order ID
+        if order.order_id:
+            try:
+                from core.database import database
+                from config.settings import BOT_CONFIG
+
+                if BOT_CONFIG.get("persist_positions", True):
+                    database.save_order({
+                        "order_id": order.order_id,
+                        "execution_id": execution_id,
+                        "symbol": order.symbol,
+                        "transaction_type": order.transaction_type,
+                        "quantity": order.quantity,
+                        "price": order.filled_price or order.price,
+                        "status": order.status.value,
+                        "order_type": order.order_type.value,
+                        "placed_at": order.placed_at or datetime.now(),
+                    })
+            except Exception as e:
+                logger.debug(f"Failed to persist order {order.order_id}: {e}")
+
         return order
     
     def _wait_for_completion(self, execution: TradeExecution, timeout: int = 30) -> None:
@@ -401,7 +423,13 @@ class OrderManager:
         except Exception as e:
             logger.error(f"Failed to persist trade to database: {e}")
     
-    def _update_trade_in_db(self, execution_id: str, status: str, realized_pnl: float) -> None:
+    def _update_trade_in_db(
+        self,
+        execution_id: str,
+        status: str,
+        realized_pnl: float,
+        exit_reason: Optional[str] = None,
+    ) -> None:
         """
         Update trade status in database.
         
@@ -422,6 +450,7 @@ class OrderManager:
                 status=status,
                 exit_time=datetime.now(),
                 realized_pnl=realized_pnl,
+                exit_reason=exit_reason,
             )
             logger.debug(f"Trade updated in database: {execution_id} -> {status}")
         except Exception as e:
@@ -455,6 +484,7 @@ class OrderManager:
         self,
         execution_id: str,
         order_type: OrderType = OrderType.MARKET,
+        reason: str = "manual",
     ) -> bool:
         """
         Close an active position.
@@ -505,7 +535,7 @@ class OrderManager:
             execution.exit_time = datetime.now()
             
             # Update database
-            self._update_trade_in_db(execution_id, "CLOSED", execution.realized_pnl)
+            self._update_trade_in_db(execution_id, "CLOSED", execution.realized_pnl, reason)
             
             # Remove from active executions
             del self.active_executions[execution_id]

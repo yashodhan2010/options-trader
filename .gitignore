@@ -63,3 +63,6 @@ data/ml_models/
 # Bhavcopy cache
 data/bhavcopy_cache/
 data/nse_cache/
+
+#trading-key
+trading-key.pem

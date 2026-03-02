@@ -178,10 +178,8 @@ class SimplifiedPipelineTrainer:
         
         logger.info(f"  After NaN handling: {len(X)} valid samples")
         
-        # Scale features
-        from sklearn.preprocessing import StandardScaler
-        scaler = StandardScaler()
-        X = scaler.fit_transform(X)
+        # NOTE: Scaling moved to train_symbol_model to avoid train/test leakage
+        # (scaler must be fit on training data only)
         
         return X, y, valid_features
     
@@ -189,11 +187,14 @@ class SimplifiedPipelineTrainer:
         """
         Train ensemble model for a symbol.
         
+        Uses TEMPORAL (chronological) train/test split with embargo gap to prevent
+        data leakage from autocorrelated time-series samples.
+        
         Ensemble: Random Forest + LightGBM + XGBoost with equal weights.
         """
         try:
-            from sklearn.model_selection import train_test_split
             from sklearn.ensemble import RandomForestClassifier
+            from sklearn.preprocessing import StandardScaler
             from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
             
             try:
@@ -212,24 +213,66 @@ class SimplifiedPipelineTrainer:
             unique_classes = np.unique(y)
             logger.info(f"  Classes present: {unique_classes} (mapping: 0=DOWN, 1=NEUTRAL, 2=UP)")
             
-            # Train/test split - only stratify if all classes are present
-            stratify = y if len(unique_classes) >= 2 else None
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=0.2, random_state=42, stratify=stratify
-            )
+            # TEMPORAL train/test split (data is already in chronological order)
+            # Add embargo gap between train and test to avoid near-duplicate leakage
+            embargo_frac = 0.02  # ~2% gap between train and test
+            train_end = int(len(X) * 0.8)
+            embargo_size = max(1, int(len(X) * embargo_frac))
+            test_start = min(train_end + embargo_size, len(X))
+            
+            X_train, y_train = X[:train_end], y[:train_end]
+            X_test, y_test = X[test_start:], y[test_start:]
+            
+            logger.info(f"  Temporal split: {len(X_train)} train, {embargo_size} embargo, {len(X_test)} test")
+            
+            if len(X_test) < 5:
+                logger.warning(f"{symbol}: Too few test samples after temporal split")
+                return None
+
+            # Class-balance guardrails (prevents unstable one-sided models in low-data regime)
+            class_guard = ML_CONFIG.get("training_class_guard", {})
+            if class_guard.get("enabled", True):
+                train_classes, train_counts = np.unique(y_train, return_counts=True)
+                test_classes, _ = np.unique(y_test, return_counts=True)
+
+                if len(train_classes) < 2:
+                    logger.warning(f"{symbol}: Skipping training - only one class in train split: {train_classes}")
+                    return None
+
+                if class_guard.get("require_test_class_diversity", True) and len(test_classes) < 2:
+                    logger.warning(f"{symbol}: Skipping training - only one class in test split: {test_classes}")
+                    return None
+
+                minority_samples = int(np.min(train_counts))
+                minority_ratio = minority_samples / max(1, len(y_train))
+                min_minority_samples = int(class_guard.get("min_minority_samples", 20))
+                min_minority_ratio = float(class_guard.get("min_minority_ratio", 0.10))
+
+                if minority_samples < min_minority_samples or minority_ratio < min_minority_ratio:
+                    logger.warning(
+                        f"{symbol}: Skipping training - class imbalance too high "
+                        f"(minority={minority_samples}, ratio={minority_ratio:.1%}, "
+                        f"thresholds: samples>={min_minority_samples}, ratio>={min_minority_ratio:.1%})"
+                    )
+                    return None
+            
+            # Scale features - fit on TRAINING data only (prevents test data leakage)
+            scaler = StandardScaler()
+            X_train = scaler.fit_transform(X_train)
+            X_test = scaler.transform(X_test)
             
             # Train models
             models = {}
             
-            # Random Forest (always available)
-            rf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+            # Random Forest (always available) - balanced class weights for imbalanced data
+            rf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1, class_weight='balanced')
             rf.fit(X_train, y_train)
             models['rf'] = rf
             
-            # LightGBM (if available)
+            # LightGBM (if available) - balanced class weights
             if LGBM_AVAILABLE:
                 try:
-                    lgb_model = lgb.LGBMClassifier(n_estimators=100, random_state=42, verbose=-1)
+                    lgb_model = lgb.LGBMClassifier(n_estimators=100, random_state=42, verbose=-1, is_unbalance=True)
                     lgb_model.fit(X_train, y_train)
                     models['lgb'] = lgb_model
                 except Exception as lgb_e:
@@ -238,8 +281,14 @@ class SimplifiedPipelineTrainer:
             # XGBoost (if available)
             if XGB_AVAILABLE:
                 try:
+                    # XGBoost requires consecutive labels 0..N-1
+                    from sklearn.preprocessing import LabelEncoder
+                    le = LabelEncoder()
+                    y_train_enc = le.fit_transform(y_train.astype(int))
+                    
                     xgb = XGBClassifier(n_estimators=100, random_state=42, use_label_encoder=False, eval_metric='mlogloss')
-                    xgb.fit(X_train, y_train)
+                    xgb.fit(X_train, y_train_enc)
+                    xgb._label_encoder = le  # Store for inverse_transform during predict
                     models['xgb'] = xgb
                 except Exception as xgb_e:
                     logger.warning(f"XGBoost training failed: {xgb_e}")
@@ -248,16 +297,38 @@ class SimplifiedPipelineTrainer:
             if not models:
                 logger.warning(f"{symbol}: No models trained successfully")
                 return None
-                
+            
+            ensemble_classes = np.unique(y_train)
+
             y_pred_proba = None
             for name, model in models.items():
                 proba = model.predict_proba(X_test)
-                if y_pred_proba is None:
-                    y_pred_proba = proba / len(models)
+
+                if hasattr(model, '_label_encoder') and hasattr(model._label_encoder, 'classes_'):
+                    model_classes = model._label_encoder.classes_
+                elif hasattr(model, 'classes_'):
+                    model_classes = model.classes_
                 else:
-                    y_pred_proba += proba / len(models)
+                    model_classes = np.arange(proba.shape[1])
+
+                aligned_proba = np.zeros((len(X_test), len(ensemble_classes)), dtype=float)
+                class_to_idx = {cls: idx for idx, cls in enumerate(ensemble_classes)}
+
+                for col_idx, class_label in enumerate(model_classes):
+                    if class_label in class_to_idx:
+                        aligned_proba[:, class_to_idx[class_label]] = proba[:, col_idx]
+
+                row_sum = aligned_proba.sum(axis=1, keepdims=True)
+                row_sum[row_sum == 0] = 1.0
+                aligned_proba = aligned_proba / row_sum
+
+                if y_pred_proba is None:
+                    y_pred_proba = aligned_proba / len(models)
+                else:
+                    y_pred_proba += aligned_proba / len(models)
             
-            y_pred = np.argmax(y_pred_proba, axis=1)
+            # Map argmax column indices back to actual class labels
+            y_pred = ensemble_classes[np.argmax(y_pred_proba, axis=1)]
             
             # Metrics (handle older sklearn versions that don't have zero_division)
             try:
@@ -278,8 +349,20 @@ class SimplifiedPipelineTrainer:
                     'confusion_matrix': confusion_matrix(y_test, y_pred).tolist(),
                     'individual_metrics': {
                         name: {
-                            'accuracy': accuracy_score(y_test, model.predict(X_test)),
-                            'f1_score': f1_score(y_test, model.predict(X_test), average='weighted', zero_division=0)
+                            'accuracy': accuracy_score(
+                                y_test,
+                                model._label_encoder.inverse_transform(model.predict(X_test).astype(int))
+                                if hasattr(model, '_label_encoder') and hasattr(model._label_encoder, 'inverse_transform')
+                                else model.predict(X_test)
+                            ),
+                            'f1_score': f1_score(
+                                y_test,
+                                model._label_encoder.inverse_transform(model.predict(X_test).astype(int))
+                                if hasattr(model, '_label_encoder') and hasattr(model._label_encoder, 'inverse_transform')
+                                else model.predict(X_test),
+                                average='weighted',
+                                zero_division=0,
+                            )
                         }
                         for name, model in models.items()
                     },
@@ -296,8 +379,19 @@ class SimplifiedPipelineTrainer:
                     'confusion_matrix': confusion_matrix(y_test, y_pred).tolist(),
                     'individual_metrics': {
                         name: {
-                            'accuracy': accuracy_score(y_test, model.predict(X_test)),
-                            'f1_score': f1_score(y_test, model.predict(X_test), average='weighted')
+                            'accuracy': accuracy_score(
+                                y_test,
+                                model._label_encoder.inverse_transform(model.predict(X_test).astype(int))
+                                if hasattr(model, '_label_encoder') and hasattr(model._label_encoder, 'inverse_transform')
+                                else model.predict(X_test)
+                            ),
+                            'f1_score': f1_score(
+                                y_test,
+                                model._label_encoder.inverse_transform(model.predict(X_test).astype(int))
+                                if hasattr(model, '_label_encoder') and hasattr(model._label_encoder, 'inverse_transform')
+                                else model.predict(X_test),
+                                average='weighted'
+                            )
                         }
                         for name, model in models.items()
                     },
@@ -309,10 +403,14 @@ class SimplifiedPipelineTrainer:
             
             result = {
                 'models': models,
+                'scaler': scaler,
+                'ensemble_classes': ensemble_classes,
                 'feature_names': feature_names,
                 'metrics': metrics,
                 'n_samples': len(X),
+                'train_samples': len(X_train),
                 'test_samples': len(X_test),
+                'embargo_samples': embargo_size,
                 'timestamp': datetime.now().isoformat()
             }
             

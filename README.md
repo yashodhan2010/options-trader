@@ -10,6 +10,7 @@ A comprehensive, modular options trading bot for Indian markets using Zerodha Ki
 - **ML-Driven Signals**: All entry signals come from ML predictions
 - **No Rule-Based Signals**: ML is the sole source of trading decisions
 - **Ternary Prediction**: BULLISH, NEUTRAL, or BEARISH with Optuna-optimized thresholds
+- **Event-Regime Overlay (NEW)**: Global risk-off context can flip/block ML direction during shock regimes
 - **Ensemble Models**: XGBoost + LightGBM + Random Forest with Optuna-tuned weights
 - **34+ Features**: Price, technicals, Greeks, OI sentiment, volatility
 - **Optuna Deep Integration**: Hyperparameter tuning, ensemble weight optimization, label threshold optimization, MedianPruner for early stopping
@@ -31,6 +32,7 @@ A comprehensive, modular options trading bot for Indian markets using Zerodha Ki
 ### 📈 Market Analysis
 - Real-time analysis of options metrics
 - Open Interest (OI) based sentiment analysis
+- Put/Call volume aggregates (`total_call_volume`, `total_put_volume`, `put_call_volume_ratio`)
 - Volatility regime detection
 - Put-Call Ratio (PCR) analysis
 - Max Pain calculation
@@ -52,6 +54,7 @@ A comprehensive, modular options trading bot for Indian markets using Zerodha Ki
 - Paper trading mode for testing
 - **Real-time WebSocket monitoring** for instant exit signals
 - **Position persistence** for overnight recovery
+- **Audit Persistence Enhancements**: trade `exit_reason` capture, per-leg order persistence, ML outcome feedback on close
 
 ### 🛡️ Risk Management
 - Configurable stop loss and target percentages
@@ -203,6 +206,25 @@ Edit `config/settings.py` to customize:
 - **Strategy Settings**: Enabled strategies, strike selection
 - **Market Hours**: Trading windows
 
+### Event-Regime Configuration (NEW)
+
+`config/settings.py` now includes `EVENT_REGIME_CONFIG` to account for macro/event-like market stress using internal market proxies (no external news API required in MVP).
+
+```python
+EVENT_REGIME_CONFIG = {
+    "enabled": True,
+    "flip_mode": "flip_or_block",        # flip_or_block | block | confidence_penalty
+    "confidence_penalty": 0.10,
+    "risk_off": {
+        "entry_threshold": 1.0,
+        "exit_threshold": 0.8,
+    },
+    # breadth + intraday shock + put/call volume spike sub-configs
+}
+```
+
+When a risk-off regime is active, the signal engine can flip or suppress risky directional entries and logs explicit `[EVENT_FLIP]` audit lines.
+
 ### Market Hours Configuration
 
 The bot respects market timing to avoid initial volatility:
@@ -347,29 +369,23 @@ python bot.py --overview
 
 ## Signal Generation
 
-The signal generator analyzes:
+The primary signal path (`signals/ml_signal_generator.py`) uses:
 
-1. **Open Interest Data**
-   - Put-Call Ratio (PCR)
-   - Max Pain level
-   - Max OI strikes (support/resistance)
+1. **ML Direction Prediction**
+    - Ternary output: BULLISH / NEUTRAL / BEARISH
+    - Confidence score with guardrails
 
-2. **Volatility Metrics**
-   - Historical Volatility (HV)
-   - Implied Volatility (IV)
-   - IV/HV ratio
-   - Volatility regime classification
+2. **OI + Volume Context**
+    - PCR, max pain, OI sentiment
+    - Put/Call volume ratio and sudden put-volume pressure
 
-3. **Signal Generation**
-   - Put-Call Ratio (PCR)
-   - Max Pain level
-   - Max OI strikes (support/resistance)
+3. **Event-Regime Overlay**
+    - Breadth risk-off and intraday shock scoring
+    - Flip/block/confidence-penalty logic based on config
 
-4. **Historical Data Analysis**
-   - Trend detection (BULLISH/BEARISH/NEUTRAL)
-   - RSI (Relative Strength Index)
-   - Price momentum
-   - Confidence boost for signals
+4. **Trend & Timing Confirmation**
+    - Daily trend alignment checks
+    - Intraday VWAP/EMA/RSI timing filter before strategy mapping
 
 ## Options Pricing & Greeks
 

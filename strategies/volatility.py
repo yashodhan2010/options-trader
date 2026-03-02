@@ -9,7 +9,7 @@ import pandas as pd
 from .base_strategy import (
     BaseStrategy, StrategyType, StrategySignal, OptionLeg, TradeDirection
 )
-from config.settings import TRADING_CONFIG, UNDERLYING_ASSETS, get_lot_size
+from config.settings import TRADING_CONFIG, UNDERLYING_ASSETS, get_lot_size, get_trade_quantity
 from core.logger import logger
 
 
@@ -113,8 +113,7 @@ class IronCondorStrategy(BaseStrategy):
         if not self.ml_override and confidence < self.min_confidence:
             return None
         
-        lot_size = get_lot_size(self.underlying)
-        quantity = lot_size * TRADING_CONFIG.get("default_quantity", 1)
+        quantity = get_trade_quantity(self.underlying)
         
         legs = [
             OptionLeg(
@@ -281,8 +280,7 @@ class StraddleStrategy(BaseStrategy):
         if not self.ml_override and confidence < self.min_confidence:
             return None
         
-        lot_size = get_lot_size(self.underlying)
-        quantity = lot_size * TRADING_CONFIG.get("default_quantity", 1)
+        quantity = get_trade_quantity(self.underlying)
         
         direction = TradeDirection.SELL if self.is_short else TradeDirection.BUY
         
@@ -442,8 +440,7 @@ class StrangleStrategy(BaseStrategy):
         if not self.ml_override and confidence < self.min_confidence:
             return None
         
-        lot_size = get_lot_size(self.underlying)
-        quantity = lot_size * TRADING_CONFIG.get("default_quantity", 1)
+        quantity = get_trade_quantity(self.underlying)
         
         direction = TradeDirection.SELL if self.is_short else TradeDirection.BUY
         

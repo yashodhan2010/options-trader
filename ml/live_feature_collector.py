@@ -255,11 +255,25 @@ class LiveFeatureCollector:
             return None
     
     def _save_snapshot(self, snapshot: Dict[str, Any]) -> bool:
-        """Save a feature snapshot to the database."""
+        """Save a feature snapshot to the database, ensuring all feature values are JSON serializable."""
+        import numpy as np
+        def convert_types(obj):
+            if isinstance(obj, dict):
+                return {k: convert_types(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_types(v) for v in obj]
+            elif isinstance(obj, (np.integer,)):
+                return int(obj)
+            elif isinstance(obj, (np.floating,)):
+                return float(obj)
+            elif isinstance(obj, (np.ndarray,)):
+                return obj.tolist()
+            else:
+                return obj
         try:
             conn = database._get_connection()
             cursor = conn.cursor()
-            
+            features_serializable = convert_types(snapshot["features"])
             cursor.execute("""
                 INSERT INTO ml_feature_snapshots (
                     underlying, snapshot_time, spot_price, features_json,
@@ -269,17 +283,15 @@ class LiveFeatureCollector:
                 snapshot["underlying"],
                 snapshot["timestamp"],
                 snapshot["spot_price"],
-                json.dumps(snapshot["features"]),
+                json.dumps(features_serializable),
                 snapshot["feature_count"],
                 1 if snapshot["has_options_data"] else 0,
                 1 if snapshot["has_oi_data"] else 0,
                 1 if snapshot["has_greeks"] else 0
             ))
-            
             conn.commit()
             conn.close()
             return True
-            
         except Exception as e:
             logger.error(f"Error saving snapshot: {e}")
             return False

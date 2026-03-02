@@ -9,7 +9,9 @@ import time
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import dataclass
+from pathlib import Path
 import numpy as np
+import joblib
 
 from config.settings import ML_CONFIG
 from core.logger import logger
@@ -73,6 +75,9 @@ class MLPredictor:
         self.model_version: Optional[str] = None
         self.model_type: Optional[str] = None
         self.model_timestamp: Optional[datetime] = None
+        self._class_labels: Optional[np.ndarray] = None
+        self._symbol_model_cache: Dict[str, Dict[str, Any]] = {}
+        self._active_symbol: Optional[str] = None
         
         # Feedback-based adjustments
         self.confidence_adjustment: float = 1.0  # Multiplier from feedback
@@ -90,6 +95,17 @@ class MLPredictor:
         
         self.enabled = ML_CONFIG.get("enabled", True)
         self.confidence_weight = ML_CONFIG.get("confidence_weight", 0.5)
+        self.prefer_symbol_models = ML_CONFIG.get("prefer_symbol_models", True)
+        abstain_band = ML_CONFIG.get("abstain_band", {})
+        self.default_abstain_margin = abstain_band.get("default_margin", 0.08)
+        self.min_top_probability = abstain_band.get("min_top_probability", 0.45)
+        self.abstain_margin_by_symbol = abstain_band.get("by_symbol", {})
+
+        feature_schema = ML_CONFIG.get("feature_schema", {})
+        self.feature_schema_strict = feature_schema.get("strict_mode", True)
+        self.min_feature_overlap_ratio = feature_schema.get("min_overlap_ratio", 0.5)
+        self.warn_feature_overlap_ratio = feature_schema.get("warn_overlap_ratio", 0.75)
+        self.max_missing_features = feature_schema.get("max_missing_features", 25)
         
         logger.info("MLPredictor initialized")
     
@@ -138,6 +154,10 @@ class MLPredictor:
                 self.model_timestamp = datetime.fromisoformat(trained_at)
             else:
                 self.model_timestamp = datetime.now()
+
+            class_labels = metadata.get("class_labels") if isinstance(metadata, dict) else None
+            self._class_labels = np.array(class_labels) if class_labels else None
+            self._active_symbol = None
             
             # Load feedback config if available
             self._load_feedback_config(model_version)
@@ -150,6 +170,95 @@ class MLPredictor:
             
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
+            return False
+
+    def _activate_model_bundle(self, underlying: str, bundle: Dict[str, Any]) -> bool:
+        try:
+            self.model = bundle.get("model")
+            self.scaler = bundle.get("scaler")
+            self.feature_names = bundle.get("feature_names", [])
+            self.model_version = bundle.get("model_version")
+            self.model_type = bundle.get("model_type", "unknown")
+            self.model_timestamp = bundle.get("model_timestamp") or datetime.now()
+            self._class_labels = bundle.get("class_labels")
+            self._active_symbol = underlying
+            self._prediction_cache.clear()
+            return self.model is not None
+        except Exception as e:
+            logger.error(f"Failed to activate symbol model for {underlying}: {e}")
+            return False
+
+    def _load_symbol_model_for_underlying(self, underlying: str) -> bool:
+        if not underlying:
+            return False
+
+        if self._active_symbol == underlying and self.model is not None:
+            return True
+
+        cached = self._symbol_model_cache.get(underlying)
+        if cached:
+            return self._activate_model_bundle(underlying, cached)
+
+        model_root = Path(ML_CONFIG.get("model_path", "data/ml_models"))
+        if not model_root.exists():
+            return False
+
+        model_files = sorted(
+            model_root.glob(f"{underlying}_model_*.joblib"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+
+        if not model_files:
+            return False
+
+        latest = model_files[0]
+
+        try:
+            artifact = joblib.load(latest)
+
+            if isinstance(artifact, dict) and "models" in artifact:
+                model_dict = dict(artifact.get("models", {}))
+                default_weight = 1.0 / max(1, len(model_dict))
+                weights = artifact.get("metrics", {}).get("optimized_weights", {})
+                model_dict["weights"] = {
+                    name: float(weights.get(name, default_weight))
+                    for name in model_dict.keys()
+                }
+
+                class_labels = artifact.get("ensemble_classes")
+                bundle = {
+                    "model": model_dict,
+                    "scaler": artifact.get("scaler"),
+                    "feature_names": artifact.get("feature_names", []),
+                    "model_version": latest.stem,
+                    "model_type": "symbol_ensemble",
+                    "model_timestamp": datetime.fromisoformat(artifact.get("timestamp")) if artifact.get("timestamp") else datetime.fromtimestamp(latest.stat().st_mtime),
+                    "class_labels": np.array(class_labels) if class_labels is not None else None,
+                }
+
+            elif isinstance(artifact, dict) and "model" in artifact:
+                class_labels = artifact.get("class_labels")
+                bundle = {
+                    "model": artifact.get("model"),
+                    "scaler": artifact.get("scaler"),
+                    "feature_names": artifact.get("feature_names", []),
+                    "model_version": latest.stem,
+                    "model_type": "symbol_single",
+                    "model_timestamp": datetime.fromtimestamp(latest.stat().st_mtime),
+                    "class_labels": np.array(class_labels) if class_labels is not None else None,
+                }
+            else:
+                return False
+
+            self._symbol_model_cache[underlying] = bundle
+            loaded = self._activate_model_bundle(underlying, bundle)
+            if loaded:
+                logger.info(f"Loaded symbol model for {underlying}: {latest.name}")
+            return loaded
+
+        except Exception as e:
+            logger.warning(f"Failed to load symbol model for {underlying}: {e}")
             return False
     
     def _load_feedback_config(self, model_version: str):
@@ -192,10 +301,13 @@ class MLPredictor:
         """
         if not self.enabled:
             return None
+
+        if self.prefer_symbol_models and underlying:
+            self._load_symbol_model_for_underlying(underlying)
         
         # Check if model is loaded
         if self.model is None:
-            if not self.load_model():
+            if not self.load_model() and not self._load_symbol_model_for_underlying(underlying):
                 return None
         
         # Convert FeatureSet to dict if needed
@@ -205,7 +317,7 @@ class MLPredictor:
             features = features.features
         
         # Check cache
-        cache_key = f"{underlying}_{hash(frozenset(features.items()))}"
+        cache_key = f"{self.model_version}_{underlying}_{hash(frozenset(features.items()))}"
         if use_cache and cache_key in self._prediction_cache:
             cached_pred, cached_time = self._prediction_cache[cache_key]
             if (datetime.now() - cached_time).total_seconds() < self.cache_ttl:
@@ -222,10 +334,10 @@ class MLPredictor:
                 X = X.reshape(1, -1)
             
             # Make prediction
-            if self.model_type == "ensemble" and isinstance(self.model, dict):
-                prediction = self._ensemble_predict(X)
+            if isinstance(self.model, dict):
+                prediction = self._ensemble_predict(X, underlying)
             else:
-                prediction = self._single_model_predict(X)
+                prediction = self._single_model_predict(X, underlying)
             
             # Cache prediction
             if use_cache:
@@ -239,33 +351,164 @@ class MLPredictor:
     
     def _features_to_array(self, features: Dict[str, float]) -> np.ndarray:
         """Convert feature dictionary to numpy array in correct order."""
-        return np.array([features.get(name, 0.0) for name in self.feature_names])
+        required = set(self.feature_names)
+        provided = set(features.keys())
+
+        overlap = len(required & provided) / max(1, len(required))
+        missing_count = max(0, len(required) - len(required & provided))
+
+        if overlap < self.warn_feature_overlap_ratio:
+            logger.warning(
+                f"Low feature overlap for model {self.model_version}: {overlap:.1%} "
+                f"({len(required & provided)}/{len(required)})"
+            )
+
+        if self.feature_schema_strict:
+            if overlap < self.min_feature_overlap_ratio:
+                raise ValueError(
+                    f"Feature overlap too low ({overlap:.1%} < {self.min_feature_overlap_ratio:.1%})"
+                )
+            if missing_count > self.max_missing_features:
+                raise ValueError(
+                    f"Missing features too high ({missing_count} > {self.max_missing_features})"
+                )
+
+        vector = []
+        for name in self.feature_names:
+            value = features.get(name, 0.0)
+            try:
+                value = float(value)
+            except Exception:
+                value = 0.0
+
+            if not np.isfinite(value):
+                value = 0.0
+
+            vector.append(value)
+
+        return np.array(vector, dtype=float)
+
+    def _direction_bucket_for_class(self, class_label: Any, all_classes: np.ndarray) -> str:
+        if isinstance(class_label, str):
+            normalized = class_label.strip().upper()
+            if normalized in {"BEARISH", "DOWN", "SELL", "PUT", "PE"}:
+                return "BEARISH"
+            if normalized in {"BULLISH", "UP", "BUY", "CALL", "CE"}:
+                return "BULLISH"
+            if normalized in {"NEUTRAL", "SIDEWAYS"}:
+                return "NEUTRAL"
+
+        numeric_classes = []
+        for item in all_classes:
+            try:
+                numeric_classes.append(int(item))
+            except Exception:
+                continue
+
+        try:
+            value = int(class_label)
+        except Exception:
+            return "NEUTRAL"
+
+        if len(set(numeric_classes)) == 2:
+            lo, hi = sorted(set(numeric_classes))
+            if value == lo:
+                return "BEARISH"
+            if value == hi:
+                return "BULLISH"
+
+        if value <= 0:
+            return "BEARISH"
+        if value >= 2:
+            return "BULLISH"
+        return "NEUTRAL"
+
+    def _map_probabilities_to_direction_space(self, probs: np.ndarray, classes: np.ndarray) -> np.ndarray:
+        mapped = np.zeros(3, dtype=float)
+
+        for prob, class_label in zip(probs, classes):
+            if not np.isfinite(prob):
+                continue
+
+            bucket = self._direction_bucket_for_class(class_label, classes)
+            if bucket == "BEARISH":
+                mapped[0] += float(prob)
+            elif bucket == "BULLISH":
+                mapped[2] += float(prob)
+            else:
+                mapped[1] += float(prob)
+
+        total = float(mapped.sum())
+        if total <= 0:
+            mapped[1] = 1.0
+            return mapped
+
+        return mapped / total
+
+    def _extract_model_probabilities(self, model: Any, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        classes = None
+
+        if hasattr(model, "_label_encoder") and hasattr(model._label_encoder, "classes_"):
+            classes = np.array(model._label_encoder.classes_)
+        elif hasattr(model, "classes_"):
+            classes = np.array(model.classes_)
+        elif self._class_labels is not None and len(self._class_labels) > 0:
+            classes = np.array(self._class_labels)
+
+        if hasattr(model, "predict_proba"):
+            probs = np.array(model.predict_proba(X)[0], dtype=float)
+            if classes is None or len(classes) != len(probs):
+                classes = np.arange(len(probs))
+            return probs, classes
+
+        pred = model.predict(X)[0]
+
+        if classes is None or len(classes) == 0:
+            classes = np.array([pred])
+
+        probs = np.zeros(len(classes), dtype=float)
+        try:
+            pred_idx = int(np.where(classes == pred)[0][0])
+        except Exception:
+            pred_idx = 0
+        probs[pred_idx] = 1.0
+        return probs, classes
+
+    def _get_abstain_margin(self, underlying: Optional[str]) -> float:
+        if underlying and underlying in self.abstain_margin_by_symbol:
+            return float(self.abstain_margin_by_symbol.get(underlying, self.default_abstain_margin))
+        return float(self.default_abstain_margin)
+
+    def _apply_abstain_rule(
+        self,
+        mapped_probs: np.ndarray,
+        underlying: Optional[str] = None,
+    ) -> Tuple[int, str, float, bool]:
+        sorted_idx = np.argsort(mapped_probs)[::-1]
+        top_idx = int(sorted_idx[0])
+        top_prob = float(mapped_probs[top_idx])
+        second_prob = float(mapped_probs[int(sorted_idx[1])]) if len(sorted_idx) > 1 else 0.0
+
+        margin = top_prob - second_prob
+        abstain_margin = self._get_abstain_margin(underlying)
+
+        should_abstain = top_prob < self.min_top_probability or margin < abstain_margin
+        if should_abstain:
+            logger.info(
+                f"Abstain triggered for {underlying or 'GLOBAL'}: top={top_prob:.2f}, "
+                f"margin={margin:.2f}, min_top={self.min_top_probability:.2f}, min_margin={abstain_margin:.2f}"
+            )
+            return 1, "NEUTRAL", top_prob, True
+
+        direction = self.DIRECTION_MAP.get(top_idx, "NEUTRAL")
+        return top_idx, direction, top_prob, False
     
-    def _single_model_predict(self, X: np.ndarray) -> MLPrediction:
+    def _single_model_predict(self, X: np.ndarray, underlying: Optional[str] = None) -> MLPrediction:
         """Make prediction with single model."""
-        # Get probabilities
-        if hasattr(self.model, "predict_proba"):
-            probs = self.model.predict_proba(X)[0]
-        else:
-            # Fallback for models without predict_proba
-            pred = self.model.predict(X)[0]
-            probs = np.zeros(3)
-            probs[int(pred)] = 1.0
+        probs, classes = self._extract_model_probabilities(self.model, X)
+        mapped_probs = self._map_probabilities_to_direction_space(probs, classes)
         
-        # Handle binary vs multiclass models
-        if len(probs) == 2:
-            # Binary model: class 0 = BEARISH, class 1 = BULLISH (no NEUTRAL)
-            # Map to 3-class probability space for consistent handling
-            mapped_probs = np.array([probs[0], 0.0, probs[1]])  # [BEARISH, NEUTRAL, BULLISH]
-        else:
-            mapped_probs = probs
-        
-        # Get predicted class from mapped probabilities
-        raw_pred = int(np.argmax(mapped_probs))
-        direction = self.DIRECTION_MAP.get(raw_pred, "NEUTRAL")
-        
-        # Calculate confidence from probability distribution
-        confidence = float(np.max(mapped_probs))
+        raw_pred, direction, confidence, abstained = self._apply_abstain_rule(mapped_probs, underlying)
         
         # Apply feedback-based confidence adjustment
         adjusted_confidence = confidence * self.confidence_adjustment
@@ -279,7 +522,7 @@ class MLPredictor:
             "BULLISH": float(mapped_probs[2]),
         }
         
-        return MLPrediction(
+        prediction = MLPrediction(
             direction=direction,
             confidence=adjusted_confidence,
             probabilities=prob_dict,
@@ -288,42 +531,33 @@ class MLPredictor:
             timestamp=datetime.now(),
             raw_prediction=raw_pred,
         )
+        prediction.abstained = abstained
+        return prediction
     
-    def _ensemble_predict(self, X: np.ndarray) -> MLPrediction:
+    def _ensemble_predict(self, X: np.ndarray, underlying: Optional[str] = None) -> MLPrediction:
         """Make prediction with ensemble of models."""
         weights = self.model.get("weights", {})
         ensemble_probs = np.zeros(3)
         total_weight = 0
         
         for name, model in self.model.items():
-            if name in ["weights", "scaler"]:
+            if name in ["weights", "scaler", "class_labels"]:
                 continue
             
             weight = weights.get(name, 0.33)
-            
-            if hasattr(model, "predict_proba"):
-                probs = model.predict_proba(X)[0]
-                
-                # Handle binary vs multiclass
-                if len(probs) == 2:
-                    # Binary (0=bearish/down, 1=bullish/up): map directly
-                    # Class 0 = down = BEARISH, Class 1 = up = BULLISH
-                    # Use higher probability as confidence, no NEUTRAL class
-                    ensemble_probs[0] += weight * probs[0]  # BEARISH
-                    ensemble_probs[1] += weight * 0.0       # No NEUTRAL in binary
-                    ensemble_probs[2] += weight * probs[1]  # BULLISH
-                else:
-                    ensemble_probs += weight * probs
-                
+
+            try:
+                probs, classes = self._extract_model_probabilities(model, X)
+                mapped_probs = self._map_probabilities_to_direction_space(probs, classes)
+                ensemble_probs += weight * mapped_probs
                 total_weight += weight
+            except Exception as e:
+                logger.warning(f"Ensemble sub-model {name} failed: {e}")
         
         if total_weight > 0:
             ensemble_probs /= total_weight
         
-        # Get prediction
-        raw_pred = int(np.argmax(ensemble_probs))
-        direction = self.DIRECTION_MAP.get(raw_pred, "NEUTRAL")
-        confidence = float(np.max(ensemble_probs))
+        raw_pred, direction, confidence, abstained = self._apply_abstain_rule(ensemble_probs, underlying)
         
         # Apply feedback-based confidence adjustment
         adjusted_confidence = confidence * self.confidence_adjustment
@@ -336,15 +570,17 @@ class MLPredictor:
             "BULLISH": float(ensemble_probs[2]),
         }
         
-        return MLPrediction(
+        prediction = MLPrediction(
             direction=direction,
             confidence=adjusted_confidence,
             probabilities=prob_dict,
             model_version=self.model_version,
-            model_type="ensemble",
+            model_type=self.model_type or "ensemble",
             timestamp=datetime.now(),
             raw_prediction=raw_pred,
         )
+        prediction.abstained = abstained
+        return prediction
     
     def predict_with_guardrails(
         self,
