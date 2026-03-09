@@ -645,14 +645,39 @@ class PositionTracker:
         protection_pct = (100 - self.trailing_sl_percent) / 100
         new_trail_level = current_pnl * protection_pct
         
-        # Only ratchet upward - never lower the trail floor
+        self._ratchet_trailing_floor(
+            execution_id,
+            new_trail_level,
+            source="Trailing SL",
+            context=f"P&L: {current_pnl:.2f}, protect {protection_pct:.0%}",
+        )
+
+    def _ratchet_trailing_floor(
+        self,
+        execution_id: str,
+        new_floor: float,
+        source: str,
+        context: Optional[str] = None,
+    ) -> None:
+        """
+        Ratchet trailing profit floor upward only.
+
+        Args:
+            execution_id: Execution ID
+            new_floor: Candidate profit floor (P&L value)
+            source: Source tag for logging
+            context: Optional additional log context
+        """
+        if new_floor <= 0:
+            return
+
         current_trail = self.trailing_stop_levels.get(execution_id, 0)
-        if new_trail_level > current_trail:
-            self.trailing_stop_levels[execution_id] = new_trail_level
+        if new_floor > current_trail:
+            self.trailing_stop_levels[execution_id] = new_floor
+            suffix = f" ({context})" if context else ""
             logger.info(
-                f"Trailing SL updated for {execution_id}: "
-                f"lock in Rs.{new_trail_level:.2f} (P&L: {current_pnl:.2f}, "
-                f"protect {protection_pct:.0%})"
+                f"{source} floor updated for {execution_id}: "
+                f"Rs.{current_trail:.2f} -> Rs.{new_floor:.2f}{suffix}"
             )
     
     def _check_greeks_exit(
@@ -731,29 +756,32 @@ class PositionTracker:
                 gamma = abs(current_greeks.get("gamma", 0))
                 
                 if gamma > config.get("gamma_threshold", 0.05):
-                    # Tighten stop loss when gamma is high (fast-moving delta)
+                    # Tighten profit floor when gamma is high (fast-moving delta)
                     tighten_pct = config.get("gamma_sl_tighten_percent", 20) / 100
                     new_sl_distance = signal.stop_loss * (1 - tighten_pct)
                     
-                    # Create tighter floor
-                    tighter_sl = current_pnl - new_sl_distance
-                    if tighter_sl > 0 and tighter_sl > signal.stop_loss:
-                        old_sl = signal.stop_loss
-                        signal.stop_loss = tighter_sl
-                        logger.debug(f"Gamma-tightened SL for {execution_id}: {old_sl:.2f} -> {tighter_sl:.2f}")
+                    # Create tighter trailing floor in P&L terms
+                    tighter_floor = current_pnl - new_sl_distance
+                    self._ratchet_trailing_floor(
+                        execution_id,
+                        tighter_floor,
+                        source="Gamma-tightened",
+                        context=f"gamma={gamma:.4f}",
+                    )
             
             # 5. PROFIT LOCK (Dynamic Floor)
             if config.get("profit_lock_enabled", False):
                 profit_ratio = current_pnl / signal.target if signal.target > 0 else 0
                 
                 if profit_ratio >= config.get("profit_lock_threshold", 0.5):
-                    # Lock a percentage of profit
+                    # Lock a percentage of profit as trailing floor
                     locked_profit = current_pnl * config.get("profit_lock_percent", 0.3)
-                    
-                    if locked_profit > signal.stop_loss:
-                        old_sl = signal.stop_loss
-                        signal.stop_loss = locked_profit
-                        logger.debug(f"Profit-locked SL for {execution_id}: {old_sl:.2f} -> {locked_profit:.2f}")
+                    self._ratchet_trailing_floor(
+                        execution_id,
+                        locked_profit,
+                        source="Profit-lock",
+                        context=f"profit_ratio={profit_ratio:.2f}",
+                    )
             
         except Exception as e:
             logger.debug(f"Greeks exit check failed for {execution_id}: {e}")

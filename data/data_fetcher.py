@@ -340,41 +340,72 @@ class DataFetcher:
                     if _normalize_expiry(o["expiry"]) is not None
                 })
                 if expiries:
+                    today = datetime.now().date()
+                    from config.settings import STRATEGY_PARAMS
+                    min_dte = STRATEGY_PARAMS.get("min_days_to_expiry", 2)
+
                     if use_monthly:
-                        # Find monthly expiry (last Thursday of each month)
+                        # For stocks: skip current month's expiry, use next month
+                        # Filter out expiries in the current calendar month
+                        next_month_expiries = [
+                            exp for exp in expiries
+                            if exp.month != today.month or exp.year != today.year
+                        ]
+                        candidate_expiries = next_month_expiries if next_month_expiries else expiries
+
                         from core.utils import get_monthly_expiry_date
+                        # get_monthly_expiry_date returns current month's last Thursday;
+                        # we need next month's, so step forward if current month is filtered out
                         monthly_expiry = get_monthly_expiry_date()
-                        
-                        # Find the expiry closest to monthly expiry date
+                        if monthly_expiry.date().month == today.month and monthly_expiry.date().year == today.year:
+                            # Advance to next month's last Thursday
+                            next_m = today.month + 1
+                            next_y = today.year
+                            if next_m > 12:
+                                next_m = 1
+                                next_y += 1
+                            if next_m == 12:
+                                _nm = datetime(next_y + 1, 1, 1)
+                            else:
+                                _nm = datetime(next_y, next_m + 1, 1)
+                            _last_day = _nm - timedelta(days=1)
+                            _dst = (_last_day.weekday() - 3) % 7
+                            monthly_expiry = _last_day - timedelta(days=_dst)
+
                         target_expiry = None
-                        for exp in expiries:
-                            if exp == monthly_expiry.date():
+                        me_date = monthly_expiry.date() if isinstance(monthly_expiry, datetime) else monthly_expiry
+                        for exp in candidate_expiries:
+                            if exp == me_date:
                                 target_expiry = exp
                                 break
-                        
-                        # If exact match not found, use closest expiry >= monthly
+
                         if not target_expiry:
-                            for exp in expiries:
-                                if exp >= monthly_expiry.date():
+                            for exp in candidate_expiries:
+                                if exp >= me_date:
                                     target_expiry = exp
                                     break
-                        
-                        # Fallback to nearest expiry if no monthly found
+
                         if not target_expiry:
-                            target_expiry = expiries[0]
+                            target_expiry = candidate_expiries[0]
                             logger.warning(
                                 f"Monthly expiry not found for {underlying}, using nearest: {target_expiry}"
                             )
                         else:
-                            logger.debug(f"Using monthly expiry for {underlying}: {target_expiry}")
-                        
+                            logger.debug(f"Using next-month expiry for {underlying}: {target_expiry}")
+
                         options = [
                             o for o in options
                             if _normalize_expiry(o["expiry"]) == target_expiry
                         ]
                     else:
-                        # Use nearest expiry (weekly) for indices — faster theta decay
-                        nearest_expiry = expiries[0]
+                        # Use nearest weekly expiry for indices — but enforce min_days_to_expiry
+                        valid_expiries = [
+                            exp for exp in expiries
+                            if (exp - today).days >= min_dte
+                        ]
+                        if not valid_expiries:
+                            valid_expiries = expiries  # fallback if all are too close
+                        nearest_expiry = valid_expiries[0]
                         logger.debug(f"Using weekly expiry for INDEX {underlying}: {nearest_expiry}")
                         options = [
                             o for o in options
@@ -1196,8 +1227,8 @@ class DataFetcher:
             symbol = underlying
         hist_exchange = asset_config.get("exchange", "NSE") if asset_config else "NSE"
 
-        # Fetch 5-minute candles for today + yesterday (need prior data for pre-market indicators)
-        intraday = self.get_historical_data(symbol, "5minute", days=2, exchange=hist_exchange)
+        # Fetch 5-minute candles (days=5 to cover weekends + holidays up to 3 consecutive days)
+        intraday = self.get_historical_data(symbol, "5minute", days=5, exchange=hist_exchange)
 
         if intraday.empty or len(intraday) < 10:
             logger.debug(f"Insufficient intraday data for {underlying} ({len(intraday)} candles)")
@@ -1266,10 +1297,14 @@ class DataFetcher:
             returns = intraday["close"].pct_change()
             gains = returns.clip(lower=0)
             losses = (-returns).clip(lower=0)
-            avg_gain = gains.rolling(14).mean().iloc[-1]
-            avg_loss = losses.rolling(14).mean().iloc[-1]
+            avg_gain_s = gains.rolling(14).mean()
+            avg_loss_s = losses.rolling(14).mean()
+            avg_gain = avg_gain_s.iloc[-1] if len(avg_gain_s) >= 14 else float("nan")
+            avg_loss = avg_loss_s.iloc[-1] if len(avg_loss_s) >= 14 else float("nan")
 
-            if avg_loss > 0:
+            if pd.isna(avg_gain) or pd.isna(avg_loss):
+                rsi_5m = 50.0  # Default neutral when insufficient data
+            elif avg_loss > 0:
                 rs = avg_gain / avg_loss
                 rsi_5m = 100 - (100 / (1 + rs))
             else:
@@ -1284,7 +1319,7 @@ class DataFetcher:
                 result["rsi_5m_signal"] = "NEUTRAL"
 
             # ---------- Intraday momentum (last 5 vs previous 5 candles) ----------
-            if len(intraday) >= 10:
+            if len(intraday) >= 11:
                 recent_5_ret = (intraday["close"].iloc[-1] / intraday["close"].iloc[-6] - 1) * 100
                 prev_5_ret = (intraday["close"].iloc[-6] / intraday["close"].iloc[-11] - 1) * 100
                 result["recent_5c_return_pct"] = round(recent_5_ret, 3)

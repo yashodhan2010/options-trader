@@ -40,8 +40,8 @@ TRADING_CONFIG = {
     "default_sl_percent": 30,  # Stop loss percentage
     "default_target_percent": 50,  # Target percentage
     "trailing_sl_enabled": True,
-    "trailing_sl_percent": 30,        # Trail at 30% below peak profit (protect 70%)
-    "trailing_sl_activation_pct": 0.3,  # Start trailing after 30% of target reached
+    "trailing_sl_percent": 60,        # Trail at 60% below peak profit (protect 40%, allow trend room)
+    "trailing_sl_activation_pct": 0.6,  # Start trailing after 60% of target reached
 }
 
 # Market Hours Configuration
@@ -124,12 +124,12 @@ GREEKS_EXIT_CONFIG = {
     "iv_drop_percent": 20,              # Exit if IV drops more than 20% from entry
     
     # Gamma-based stop tightening
-    "gamma_tighten_enabled": True,
+    "gamma_tighten_enabled": False,
     "gamma_threshold": 0.05,            # When gamma > threshold, tighten stops
     "gamma_sl_tighten_percent": 20,     # Reduce SL distance by 20% when gamma is high
     
     # Combined profit protection
-    "profit_lock_enabled": True,
+    "profit_lock_enabled": False,
     "profit_lock_threshold": 0.5,       # When profit reaches 50% of target
     "profit_lock_percent": 0.3,         # Lock 30% of unrealized profit as new floor
 }
@@ -231,8 +231,6 @@ LOGGING_CONFIG = {
     "level": "INFO",
     "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     "file_path": LOGS_DIR / "trading_bot.log",
-    "max_bytes": 10485760,  # 10MB
-    "backup_count": 5,
 }
 
 # Database Configuration (SQLite for simplicity)
