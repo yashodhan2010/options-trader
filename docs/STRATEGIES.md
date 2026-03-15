@@ -425,11 +425,17 @@ The bot automatically selects strategies based on:
 4. **Expiry Selection**:
    - **Indices** (NIFTY, BANKNIFTY, FINNIFTY): Weekly expiry (faster theta decay, tighter strikes)
    - **Stocks** (AXISBANK, HDFCBANK, etc.): Monthly expiry (more liquidity, wider availability)
+   - **Multi-Expiry Evaluation**: All valid expiries within 5–45 DTE are evaluated; ML picks the best by confidence
 
 5. **Spread Width** (ATR-based):
    - Spread width is dynamically set using the 14-period ATR of the underlying
    - Higher volatility → wider spreads, lower volatility → tighter spreads
    - Replaces fixed-width spread selection for better risk/reward adaptation
+
+6. **Confidence-Gated DTE Floor**:
+   - ML confidence ≥ 80% → minimum 5 DTE allowed (higher conviction, shorter-dated)
+   - ML confidence < 80% → minimum 20 DTE required (more time buffer for lower conviction)
+   - Enforced at order execution as defense-in-depth
 
 ---
 
@@ -468,8 +474,9 @@ Minimum Confidence for Trade: 0.60 (0.70 for sell strategies)
 
 ### Position Sizing
 - Default: 1 lot per trade
-- Max positions: 5 (live), 15 (paper trading)
-- Capital per trade: ₹1,50,000
+- Max positions: 3 (live), 15 (paper trading)
+- Capital per trade: ₹50,000 (sized for ~₹1L account)
+- Duplicate blocking: same underlying + same strategy type rejected; different strategies on same underlying allowed
 
 ### Stop Loss Rules
 | Strategy Type | Stop Loss Logic |
@@ -505,4 +512,4 @@ For traders who prefer **collecting premium** (theta decay):
 
 ---
 
-*Last Updated: February 2026*
+*Last Updated: March 2026*

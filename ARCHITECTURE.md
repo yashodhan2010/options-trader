@@ -1,6 +1,6 @@
 # Options Trader — Complete Architecture Reference
 
-> **Last updated:** 2026-03-02  
+> **Last updated:** 2026-03-16  
 > **Total files:** ~55 Python files | **~25,500 lines**  
 > **Runtime:** Python 3.x + Conda (`options-trader` env)
 
@@ -11,6 +11,8 @@
 An ML-driven options trading bot for Indian markets (NSE/BSE) via Zerodha Kite Connect. Runs in two modes:
 - **Bot mode** (`python run.py --bot --paper`) — Automated scanning, signal generation, order execution
 - **CLI mode** (`python run.py --cli`) — Interactive command shell for manual analysis and trading
+
+Paper and live trading can run **in parallel** (separate processes, same SQLite DB, isolated by `trading_mode` column).
 
 ### Core Data Flow (Live Trading)
 
@@ -53,7 +55,7 @@ An ML-driven options trading bot for Indian markets (NSE/BSE) via Zerodha Kite C
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `run.py` | 46 | Argparse entry: `--bot` / `--paper` / `--cli` |
+| `run.py` | 46 | Argparse entry: `--bot` / `--paper` / `--live` / `--cli`; signal handlers (SIGTERM/SIGINT/SIGBREAK) for clean Task Scheduler shutdown |
 | `bot.py` | 901 | **Main orchestrator** — login → scan loop → signals → orders → monitoring |
 | `cli.py` | 2,498 | Interactive `cmd.Cmd` shell: market analysis, manual trading, ML training |
 | `demo_signal.py` | 149 | Demo script showing paper trade signal format |
@@ -88,12 +90,12 @@ An ML-driven options trading bot for Indian markets (NSE/BSE) via Zerodha Kite C
 | Config Block | Key Values |
 |---|---|
 | `KITE_CONFIG` | API key/secret from `.env` |
-| `TRADING_CONFIG` | `max_positions=5`, `paper_max_positions=15`, `capital_per_trade=₹1.5L`, `max_loss_per_day=₹10K`, SL=30%, target=50%, trailing SL enabled |
+| `TRADING_CONFIG` | `max_positions=3`, `paper_max_positions=15`, `capital_per_trade=₹50K` (sized for ~₹1L account), `max_loss_per_day=₹10K`, SL=30%, target=50%, trailing SL enabled, LIMIT entries with timeout+fallback, GTT stop-loss |
 | `MARKET_HOURS` | `trading_start=10:00`, `trading_end=15:00`, `carry_overnight=True`, `auto_square_off=False`, skip first 105min (until 11:00) |
 | `BOT_CONFIG` | `signal_scan_interval=300s`, `position_poll_interval=5s` (batched), `signal_exit_enabled=True`, `use_websocket=True` |
 | `GREEKS_EXIT_CONFIG` | Delta/theta/vega/gamma exit thresholds, DTE exit at 2 days |
 | `UNDERLYING_ASSETS` | NIFTY (lot=25, 50pt), BANKNIFTY (lot=15, 100pt), FINNIFTY (lot=25, 50pt), SENSEX (lot=10, 100pt, BFO) |
-| `STRATEGY_CONFIG` | 10 enabled strategies, `otm_offset=1` |
+| `STRATEGY_CONFIG` | 10 enabled strategies, `otm_offset=1`, `min_days_to_expiry=20`, `max_days_to_expiry=45`, `high_confidence_min_dte=5`, `high_confidence_threshold=0.80` |
 | `LIQUIDITY_GUARD` | Min volume (1000 idx / 500 stock), min OI (5000 idx / 1000 stock), max spread 5% |
 | `EVENT_REGIME_CONFIG` | Risk-off breadth + intraday shock + put/call volume spike scoring, with configurable `flip_mode`, hysteresis thresholds, and confidence penalty |
 | `ML_CONFIG` | `training_symbols`: NIFTY, BANKNIFTY, SENSEX, AXISBANK, HDFCBANK, RELIANCE, SBIN; `model_type=ensemble`, `optuna_trials=50`, guardrails, feedback, auto-retrain configs |
@@ -137,7 +139,7 @@ Defines stock-specific lot sizes, instrument tokens, equity tokens for historica
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `data_fetcher.py` | ~1,360 | **Central data hub** — Kite API with rate limiting (3 req/sec) |
+| `data_fetcher.py` | ~1,360 | **Central data hub** — Kite API with rate limiting (3 req/sec); includes `get_options_chains_multi_expiry()` for batched multi-expiry chain fetching |
 | `websocket_manager.py` | 532 | Kite WebSocket for real-time tick streaming |
 | `nse_bhavcopy.py` | 608 | NSE bhavcopy historical data via `jugaad-data` |
 | `nse_downloader.py` | 348 | Direct HTTP download from NSE archives |
@@ -150,6 +152,7 @@ Defines stock-specific lot sizes, instrument tokens, equity tokens for historica
 | `get_ltp(symbol)` | float | Position tracker (single) |
 | `get_ltp_batch(symbols)` | Dict[str→float] | **Position tracker (batched polling)** |
 | `get_options_chain(underlying)` | DataFrame | Strategy analysis, signal gen |
+| `get_options_chains_multi_expiry(underlying)` | Dict[date→DataFrame] | **Multi-expiry signal eval** — single batched API call across all valid expiries (5–45 DTE) |
 | `get_options_chain_with_greeks()` | DataFrame + Greeks | CLI display |
 | `get_oi_data(underlying)` | Dict (PCR, max pain, sentiment, total call/put volume, put/call volume ratio) | Signal gen, event overlay, strategies |
 | `get_historical_data(symbol, interval, days)` | DataFrame | Analysis, ML features |
@@ -176,9 +179,10 @@ Defines stock-specific lot sizes, instrument tokens, equity tokens for historica
 
 #### `OrderManager`
 - `execute_signal(signal, paper)` → places orders for each leg
+- **Confidence-gated DTE check**: ≥80% confidence → min 5 DTE, <80% → min 20 DTE; rejects trade if any leg below floor
 - Paper mode: simulates fill at LTP ± slippage
-- Live mode: `kite.place_order()` with limit/market
-- `has_duplicate_position(signal)` — prevents re-entry
+- Live mode: `kite.place_order()` with LIMIT (15s timeout → MARKET fallback) + GTT stop-loss
+- `has_duplicate_position(signal)` — blocks same underlying + same strategy type; different strategies on same underlying allowed
 - Tracks `active_executions: Dict[str, TradeExecution]`
 
 #### `PositionTracker` — Architecture
@@ -231,18 +235,20 @@ Defines stock-specific lot sizes, instrument tokens, equity tokens for historica
 ```
 For each symbol in (UNDERLYING_ASSETS + watchlist):
   1. get_spot_price() ───────────────────────── current price
-  2. get_options_chain() ────────────────────── strikes, premiums, OI
+  2. get_options_chains_multi_expiry() ──────── ALL valid expiry chains (5–45 DTE)
   3. get_oi_data() ──────────────────────────── PCR, max pain, sentiment
   4. get_volatility_metrics() ───────────────── IV, HV, percentile, regime
   5. get_historical_analysis() ──────────────── daily SMA, RSI, ATR, trend
-  6. feature_engineer.extract_features() ────── 61 features
+  6. feature_engineer.extract_features() ────── 61 features (from nearest chain)
   7. predictor.predict() ────────────────────── BULLISH/NEUTRAL/BEARISH + confidence
   8. _build_global_event_context() ──────────── breadth + shock + put/call volume spike state
   9. _apply_event_regime_overlay() ──────────── flip/block/penalize confidence on risk-off regime
   10. _confirm_trend() ───────────────────────── check last 5 DB labels align
   11. get_intraday_analysis() ────────────────── VWAP/EMA/RSI5m → intraday bias
   12. DIRECTION_STRATEGY_MAP lookup ──────────── pick strategy by direction × IV
-  13. strategy.analyze() ─────────────────────── construct StrategySignal with legs
+  13. Loop ALL expiry chains:
+      └─ strategy.analyze(chain) per expiry ─── StrategySignal with legs
+  14. Sort all signals by confidence descending
 ```
 
 #### Event-Regime Overlay (MVP)
@@ -455,8 +461,8 @@ The bot uses a **two-layer scan** approach:
 
 | Parameter | Location | Current Value | What It Controls |
 |---|---|---|---|
-| `max_positions` | `TRADING_CONFIG` | 5 (live), 15 (paper) | Max concurrent trades |
-| `capital_per_trade` | `TRADING_CONFIG` | ₹1.5L | Position sizing |
+| `max_positions` | `TRADING_CONFIG` | 3 (live), 15 (paper) | Max concurrent trades |
+| `capital_per_trade` | `TRADING_CONFIG` | ₹50K | Position sizing (sized for ~₹1L account) |
 | `max_loss_per_day` | `TRADING_CONFIG` | ₹10K | Daily circuit breaker |
 | `default_sl_percent` | `TRADING_CONFIG` | 30% | Stop loss on premium |
 | `default_target_percent` | `TRADING_CONFIG` | 50% | Target profit on premium |
@@ -469,6 +475,9 @@ The bot uses a **two-layer scan** approach:
 | `no_trade_after` | `MARKET_HOURS` | 14:00 | No new trades after 2 PM |
 | `entry_threshold` / `exit_threshold` | `EVENT_REGIME_CONFIG.risk_off` | 1.0 / 0.8 | Risk-off regime activation/deactivation hysteresis |
 | `flip_mode` | `EVENT_REGIME_CONFIG` | `flip_or_block` | Event handling policy (flip/block/penalize) |
+| `min_days_to_expiry` | `STRATEGY_CONFIG` | 20 | Default minimum DTE for entry |
+| `high_confidence_min_dte` | `STRATEGY_CONFIG` | 5 | Min DTE when ML confidence ≥ 80% |
+| `max_days_to_expiry` | `STRATEGY_CONFIG` | 45 | Maximum DTE for entry |
 
 ---
 
@@ -495,3 +504,40 @@ Three-phase capital scaling plan to reach ₹1L/month target:
 | `options_trader/` package (planned restructure) | Never implemented | Current flat structure works fine |
 | BSE instruments limited chain | BullPutSpread for SENSEX | "Strikes not found" when ATR pushes too far OTM |
 | Model confidence low (~51%) | Most symbols | Signals generated but skipped below 52% threshold |
+
+---
+
+### 14. Paper/Live Trading Isolation
+
+All database tables include a `trading_mode` column (`PAPER` or `LIVE`). Both modes can run in parallel:
+
+| Component | Isolation |
+|---|---|
+| Database tables | `trading_mode` column on `trades`, `orders`, `signals`, `daily_pnl`, `position_status_log` |
+| CLI queries | `trades --paper`, `trades --live`, `pnl --paper`, `pnl --live` |
+| Logs & notifications | Tagged with `[PAPER]` or `[LIVE]` prefix |
+| Processes | Scheduler runs `start_bot.bat` (paper); live runs manually via `python run.py --bot --live --auto-trade` |
+
+### 15. DTE Protection (3-Layer)
+
+| Layer | Location | Behavior |
+|---|---|---|
+| 1. Chain fetch (index) | `data_fetcher.get_options_chain()` | Selects expiry ≥ `min_days_to_expiry` |
+| 2. Chain fetch (stock) | `data_fetcher.get_options_chain()` | Monthly expiry bumped if < `min_days_to_expiry` |
+| 3. Execute gate | `order_manager.execute_signal()` | Confidence-gated: ≥80% → 5 DTE min, <80% → 20 DTE min |
+
+### 16. Multi-Expiry Signal Generation
+
+`get_options_chains_multi_expiry()` loads instruments once, filters to the configured DTE range [5, 45], builds symbols for all strikes × expiries, and makes a **single batched `kite.quote()` call**. Returns `Dict[date, DataFrame]`.
+
+`_generate_ml_signals()` runs ML prediction once per underlying, then evaluates strategies on **every** returned expiry chain. All signals are returned sorted by confidence descending.
+
+### 17. Duplicate Position Check
+
+`has_duplicate_position()` checks **underlying + strategy_type** only:
+- Same underlying + same strategy → **blocked** (prevents capital tie-up)
+- Same underlying + different strategy → **allowed** (different risk/reward profiles)
+
+### 18. Clean Shutdown
+
+`run.py` registers SIGTERM, SIGINT, and SIGBREAK handlers that call `bot.stop()` + `sys.exit(0)`. `start_bot.bat` adds a `taskkill` safety net for orphaned python processes after Task Scheduler terminates.

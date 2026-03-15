@@ -2,7 +2,7 @@
 
 A comprehensive, modular options trading bot for Indian markets using Zerodha Kite Connect API. This bot provides automated trading capabilities with support for multiple options strategies, **ML-driven signal generation**, advanced Greeks calculation, and robust risk management.
 
-**v2.0: ML-Only Mode** - All trading signals are now derived exclusively from ML model predictions.
+**v2.1: Multi-Expiry & Live Trading Ready** - ML-only signals, multi-expiry evaluation, confidence-gated DTE, paper/live isolation.
 
 ## Features
 
@@ -47,14 +47,19 @@ A comprehensive, modular options trading bot for Indian markets using Zerodha Ki
 
 ### ⚡ Execution
 - Automated order placement via Kite Connect
+- **LIMIT orders** with timeout + MARKET fallback for entries
+- **GTT stop-loss** orders for exchange-level crash protection
 - Stop Loss and Target management
 - **High-Watermark Trailing Stop Loss** with activation threshold and profit protection
 - Separate logging for trailing SL vs hard SL exits
 - Position tracking and monitoring
-- Paper trading mode for testing
+- **Paper/Live mode isolation** — `trading_mode` column on all DB tables, tagged logs/notifications
 - **Real-time WebSocket monitoring** for instant exit signals
 - **Position persistence** for overnight recovery
 - **Audit Persistence Enhancements**: trade `exit_reason` capture, per-leg order persistence, ML outcome feedback on close
+- **Duplicate position check**: blocks same underlying + same strategy, allows different strategies on same underlying
+- **Confidence-gated DTE**: ≥80% ML confidence → 5 DTE min, <80% → 20 DTE min
+- **Signal handlers** (SIGTERM/SIGINT/SIGBREAK) for clean Task Scheduler shutdown
 
 ### 🛡️ Risk Management
 - Configurable stop loss and target percentages
@@ -69,6 +74,7 @@ A comprehensive, modular options trading bot for Indian markets using Zerodha Ki
 - **RSI Momentum vs Reversion**: Stocks use momentum (RSI trend-following), indices use mean-reversion
 - **Liquidity Guard**: Volume, OI, and bid-ask spread checks per leg before entry
 - **ATR-Based Dynamic Spread Width**: Spread widths adapt to current volatility via ATR
+- **Multi-Expiry Evaluation**: Signals evaluated across ALL valid expiries (5–45 DTE) in a single batched API call
 - **Expiry Selection**: Weekly expiry for indices, monthly expiry for stocks
 
 ### 📋 Stock Watchlist
@@ -96,7 +102,7 @@ options-trader/
 │   └── utils.py              # Helper functions
 ├── data/
 │   ├── __init__.py
-│   ├── data_fetcher.py       # Market data fetching
+│   ├── data_fetcher.py       # Market data fetching (incl. multi-expiry chains)
 │   └── websocket_manager.py  # Real-time WebSocket streaming
 ├── docs/
 │   ├── STRATEGIES.md         # Strategy documentation
@@ -107,7 +113,7 @@ options-trader/
 │   └── position_tracker.py   # Position monitoring with WebSocket
 ├── signals/
 │   ├── __init__.py           # Package exports
-│   ├── ml_signal_generator.py # ML-Only signal generator (PRIMARY)
+│   ├── ml_signal_generator.py # ML-Only signal generator (multi-expiry)
 │   ├── signal_generator.py   # Legacy rule-based (DEPRECATED)
 │   └── exit_signal_generator.py # Exit signals
 ├── ml/                       # Machine Learning module
@@ -299,16 +305,16 @@ Available commands:
 
 ```bash
 # Paper trading (default)
-python bot.py --auto-trade
+python run.py --bot --paper --auto-trade
 
 # Live trading
-python bot.py --auto-trade --live
+python run.py --bot --live --auto-trade
 
-# Specific underlyings
-python bot.py --underlyings NIFTY BANKNIFTY --auto-trade
+# Via CLI (interactive)
+python run.py --cli
+# Then: login → paper off → trade
 
-# Market overview only
-python bot.py --overview
+# Paper & live can run in parallel (separate processes, same DB, tagged by mode)
 ```
 
 ## Strategies
@@ -375,17 +381,26 @@ The primary signal path (`signals/ml_signal_generator.py`) uses:
     - Ternary output: BULLISH / NEUTRAL / BEARISH
     - Confidence score with guardrails
 
-2. **OI + Volume Context**
+2. **Multi-Expiry Chain Evaluation**
+    - Fetches ALL valid expiry chains (5–45 DTE) in one batched Kite API call
+    - Strategies evaluated per-expiry → best signal by confidence selected
+    - Falls back to single-expiry if multi-expiry fails
+
+3. **OI + Volume Context**
     - PCR, max pain, OI sentiment
     - Put/Call volume ratio and sudden put-volume pressure
 
-3. **Event-Regime Overlay**
+4. **Event-Regime Overlay**
     - Breadth risk-off and intraday shock scoring
     - Flip/block/confidence-penalty logic based on config
 
-4. **Trend & Timing Confirmation**
+5. **Trend & Timing Confirmation**
     - Daily trend alignment checks
     - Intraday VWAP/EMA/RSI timing filter before strategy mapping
+
+6. **Execution DTE Gate**
+    - Confidence-gated: ≥80% confidence → min 5 DTE, <80% → min 20 DTE
+    - Applied at order execution as final defense-in-depth layer
 
 ## Options Pricing & Greeks
 
@@ -456,9 +471,10 @@ Configure stocks in `config/watchlist.json`:
 - Customizable percentages in config
 
 ### Position Limits
-- Maximum concurrent positions
-- Capital allocation per trade
-- Daily loss limit
+- Maximum 3 concurrent positions (live), 15 (paper)
+- Capital per trade: ₹50,000 (sized for ~₹1L account)
+- Daily loss limit: ₹10,000
+- Duplicate blocking: same underlying + same strategy type rejected
 
 ### Greeks-Based Exit Management (NEW)
 
@@ -594,9 +610,16 @@ print(f"ML Accuracy: {stats['accuracy']:.1%}")
 
 MIT License - see LICENSE file for details
 
-## Deployment Roadmap (Planned)
+## Deployment Roadmap
 
-Three-phase capital scaling plan. No code changes yet — to be implemented starting week of 2026-02-23.
+Currently live-ready with ₹1L account. Paper and live trading run in parallel via separate processes.
+
+| Setting | Value |
+|---|---|
+| Capital per trade | ₹50,000 |
+| Max live positions | 3 |
+| DTE range | 5–45 days (confidence-gated) |
+| Duplicate check | Underlying + strategy type |
 
 ### Phase 1 — Testing & Validation (₹2-3L)
 - **Goal**: Validate edge, understand bot behaviour. Not for profit targets.

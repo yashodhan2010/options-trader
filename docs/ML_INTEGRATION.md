@@ -44,23 +44,27 @@ Key features:
 ### How It Works (ML-Only Mode)
 
 ```
-Market Data --> Feature Engineering --> ML Prediction --> Strategy Selection --> Trade Signal
-                                              |
-                                              v
-                                    Direction: BULLISH/NEUTRAL/BEARISH (ternary)
-                                    Confidence: 0.0 to 1.0
-                                    Threshold: Optuna-optimized per symbol
+Market Data --> Feature Engineering --> ML Prediction --> Multi-Expiry Evaluation --> Trade Signal
+                                              |                    |
+                                              v                    v
+                                    Direction: BULLISH/     Strategies evaluated
+                                    NEUTRAL/BEARISH         across ALL expiries
+                                    Confidence: 0.0-1.0     (5-45 DTE range)
+                                    Threshold: Optuna-opt   Best signal by confidence
 ```
 
 The ML system:
 1. Predicts market direction using **ternary labels** (BEARISH=0, NEUTRAL=1, BULLISH=2)
 2. The NEUTRAL dead-zone threshold is Optuna-optimized per symbol (range: 0.1%–2.0%)
-3. Maps direction to appropriate strategy based on IV regime
-4. Generates option legs using strategy execution
-5. Filters trades below minimum confidence threshold
-6. NEUTRAL predictions are explicitly skipped (no trade)
+3. Fetches options chains for **ALL valid expiries** (5–45 DTE) in a single batched API call
+4. Maps direction to appropriate strategy based on IV regime
+5. Evaluates strategy on **every** expiry chain — generates signals per-expiry
+6. Sorts all signals by confidence descending; best signal selected
+7. **Confidence-gated DTE check** at execution: ≥80% → min 5 DTE, <80% → min 20 DTE
+8. Filters trades below minimum confidence threshold
+9. NEUTRAL predictions are explicitly skipped (no trade)
 
-**No rule-based signals** - if ML model is not loaded, no signals are generated.
+**No rule-based signals** — if ML model is not loaded, no signals are generated.
 
 ---
 
@@ -111,10 +115,23 @@ ml/
 +--------+---------+    +-------------------+    +------------------+
          |
          v
++------------------+    +-------------------+
+| Multi-Expiry     |--->| Strategy Eval     |
+| Chain Fetch      |    | (per expiry)      |
+| (batched API)    |    | Best by confidence|
++--------+---------+    +--------+----------+
+         |                       |
+         v                       v
 +------------------+    +-------------------+    +------------------+
-|   Execution      |--->|Feedback Collector |--->|  Drift Detection |
-|                  |    | (log outcomes)    |    | (retrain alert)  |
-+------------------+    +-------------------+    +------------------+
+| DTE Gate         |--->|   Execution       |--->|Feedback Collector|
+| (confidence-     |    | (paper/live)      |    | (log outcomes)   |
+|  gated)          |    |                   |    +--------+---------+
++------------------+    +-------------------+             |
+                                                         v
+                                                +------------------+
+                                                |  Drift Detection |
+                                                | (retrain alert)  |
+                                                +------------------+
 ```
 
 ---
@@ -216,6 +233,12 @@ ML_CONFIG = {
         "drawdown_alert_pct": 0.10,  # Alert at 10% drawdown
         "win_rate_alert": 0.40,  # Alert if win rate < 40%
     },
+    
+    # DTE configuration (in STRATEGY_CONFIG, not ML_CONFIG)
+    # min_days_to_expiry: 20          # Default DTE floor
+    # high_confidence_min_dte: 5      # Lower DTE floor for >= 80% confidence
+    # high_confidence_threshold: 0.80 # Confidence gate for DTE relaxation
+    # max_days_to_expiry: 45          # Maximum DTE for entry
     
     # Feedback loop
     "feedback": {
