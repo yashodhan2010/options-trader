@@ -821,7 +821,11 @@ class PositionTracker:
         """
         logger.info(f"Triggering exit for {execution_id}: {reason}")
         
-        success = order_manager.close_position(execution_id, OrderType.MARKET, reason=reason)
+        # Use configured exit order type (default MARKET for guaranteed fill)
+        exit_type_str = TRADING_CONFIG.get("exit_order_type", "MARKET")
+        exit_order_type = OrderType.LIMIT if exit_type_str == "LIMIT" else OrderType.MARKET
+        
+        success = order_manager.close_position(execution_id, exit_order_type, reason=reason)
         
         if success:
             self._notify("position_closed", execution_id, pnl, reason)
@@ -949,7 +953,7 @@ class PositionTracker:
                 trade_logger.info(f"Underlying:   {signal.underlying}")
                 trade_logger.info(f"Reason:       {reason}")
                 trade_logger.info(f"Duration:     {time_str}")
-                trade_logger.info(f"Mode:         {'PAPER' if order_manager.is_paper_trading else 'LIVE'}")
+                trade_logger.info(f"Mode:         {order_manager.trading_mode}")
                 trade_logger.info("-" * 40)
                 trade_logger.info("LEGS:")
                 for leg in signal.legs:
@@ -1067,6 +1071,7 @@ class PositionTracker:
                     stop_loss=signal.stop_loss,
                     target=signal.target,
                     status="ACTIVE",
+                    trading_mode=order_manager.trading_mode,
                 )
             
             # Notify callbacks
@@ -1111,7 +1116,7 @@ class PositionTracker:
             return
         
         try:
-            active_trades = database.get_active_trades()
+            active_trades = database.get_active_trades(trading_mode=order_manager.trading_mode)
             
             if not active_trades:
                 logger.info("No persisted positions to load")

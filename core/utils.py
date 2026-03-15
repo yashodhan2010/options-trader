@@ -335,13 +335,18 @@ def should_square_off() -> bool:
     return now.time() >= square_off_time
 
 
-def should_auto_exit() -> bool:
+def should_auto_exit(bot_start_date=None) -> bool:
     """
     Check if the bot should auto-exit (shutdown) after market hours.
     Returns True if:
-    - auto_exit_after_close is enabled
-    - Current time is past market_close + buffer_minutes
+    - auto_exit_after_close is enabled AND
+      - Current time is past market_close + buffer_minutes, OR
+      - The date has changed since bot started (survived overnight via system sleep)
     - It's a weekday
+    
+    Args:
+        bot_start_date: The date when the bot was started (date object).
+                        If provided, triggers auto-exit when today != start date.
     
     Returns:
         True if bot should shutdown
@@ -357,6 +362,11 @@ def should_auto_exit() -> bool:
     # Don't auto-exit on weekends (bot shouldn't be running anyway)
     if now.weekday() >= 5:
         return False
+    
+    # If the date has changed since launch, the bot survived overnight
+    # (e.g. system sleep/suspend). Exit immediately so a fresh session can start.
+    if bot_start_date is not None and now.date() != bot_start_date:
+        return True
     
     # Get market close time and add buffer
     market_close_str = MARKET_HOURS.get("market_close", "15:30")

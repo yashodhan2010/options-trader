@@ -76,6 +76,8 @@ class TradeExecution:
     orders: List[Order] = field(default_factory=list)
     sl_orders: List[Order] = field(default_factory=list)
     target_orders: List[Order] = field(default_factory=list)
+    gtt_order_ids: List[int] = field(default_factory=list)
+    trading_mode: str = "PAPER"
     status: str = "PENDING"
     entry_time: Optional[datetime] = None
     exit_time: Optional[datetime] = None
@@ -100,6 +102,11 @@ class OrderManager:
         self.order_history: List[Order] = []
         self.is_paper_trading: bool = True  # Start with paper trading
     
+    @property
+    def trading_mode(self) -> str:
+        """Return 'PAPER' or 'LIVE' based on current mode."""
+        return "PAPER" if self.is_paper_trading else "LIVE"
+    
     def _ensure_connected(self) -> bool:
         """Ensure Kite connection is established."""
         if not self.kite:
@@ -112,10 +119,68 @@ class OrderManager:
         self.is_paper_trading = enabled
         logger.info(f"Paper trading mode: {'enabled' if enabled else 'disabled'}")
     
+    def _check_margin_available(self, signal: StrategySignal) -> bool:
+        """
+        Check if sufficient margin is available before placing live orders.
+        Estimates required margin and compares against available balance.
+        
+        Args:
+            signal: The strategy signal to check
+            
+        Returns:
+            True if margin is sufficient
+        """
+        if not self._ensure_connected():
+            logger.error("Cannot check margin - not connected")
+            return False
+        
+        try:
+            from auth.kite_auth import get_margins
+            
+            margins = get_margins()
+            if not margins:
+                logger.error("Could not fetch account margins")
+                return False
+            
+            equity_margin = margins.get("equity", {})
+            available = equity_margin.get("available", {}).get("live_balance", 0)
+            
+            # Estimate required margin: sum of (price * quantity) for all buy legs
+            # For sell legs, use Kite's SPAN margin (conservative estimate)
+            estimated_cost = 0
+            for leg in signal.legs:
+                leg_cost = (leg.entry_price or 0) * leg.quantity
+                if leg.is_long:
+                    estimated_cost += leg_cost  # Premium outflow
+                # For short legs in a spread, margin is roughly the spread width * qty
+                # We don't subtract short premium here to be conservative
+            
+            # Add 20% buffer for margin fluctuations
+            required_with_buffer = estimated_cost * 1.2
+            
+            if available < required_with_buffer:
+                logger.warning(
+                    f"Insufficient margin: available Rs.{available:,.2f}, "
+                    f"estimated required Rs.{required_with_buffer:,.2f} "
+                    f"(cost Rs.{estimated_cost:,.2f} + 20% buffer)"
+                )
+                return False
+            
+            logger.info(
+                f"Margin check passed: available Rs.{available:,.2f}, "
+                f"estimated cost Rs.{estimated_cost:,.2f}"
+            )
+            return True
+            
+        except Exception as e:
+            logger.error(f"Margin check failed: {e}")
+            return False
+    
     def has_duplicate_position(self, signal: StrategySignal) -> bool:
         """
-        Check if there's already an open position with same underlying, 
-        strategy type, and strike prices.
+        Check if there's already an open position with the same underlying
+        AND same strategy type. Different strategies on the same underlying
+        are allowed (different risk/reward profiles).
         
         Args:
             signal: The signal to check for duplicates
@@ -123,38 +188,33 @@ class OrderManager:
         Returns:
             True if duplicate exists, False otherwise
         """
-        # Get strikes from the new signal
-        new_strikes = set(leg.strike for leg in signal.legs)
-        
         for exec_id, execution in self.active_executions.items():
             if execution.status != "ACTIVE":
                 continue
             
             existing_signal = execution.signal
             
-            # Check if same underlying and strategy type
-            if (existing_signal.underlying == signal.underlying and 
+            if (existing_signal.underlying == signal.underlying and
                 existing_signal.strategy_type == signal.strategy_type):
-                
-                # Check if same strikes
-                existing_strikes = set(leg.strike for leg in existing_signal.legs)
-                
-                if new_strikes == existing_strikes:
-                    logger.warning(
-                        f"Duplicate position exists: {exec_id} "
-                        f"({signal.underlying} {signal.strategy_type.value} @ {sorted(new_strikes)})"
-                    )
-                    return True
+                logger.warning(
+                    f"Duplicate position exists: {exec_id} "
+                    f"({signal.underlying} {signal.strategy_type.value})"
+                )
+                return True
         
         return False
     
     def execute_signal(
         self,
         signal: StrategySignal,
-        order_type: OrderType = OrderType.MARKET,
+        order_type: OrderType = None,
     ) -> TradeExecution:
         """
         Execute a trading signal by placing orders for all legs.
+        
+        For live trading, uses the order type from TRADING_CONFIG:
+        - LIMIT (default): Places limit order at LTP + slippage tolerance for better fills
+        - MARKET: Immediate fill but no price control
         
         Args:
             signal: The strategy signal to execute
@@ -164,7 +224,7 @@ class OrderManager:
             TradeExecution object with order details
         """
         execution_id = f"{signal.strategy_type.value}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-        execution = TradeExecution(signal=signal, execution_id=execution_id)
+        execution = TradeExecution(signal=signal, execution_id=execution_id, trading_mode=self.trading_mode)
         
         # Check for duplicate positions
         if self.has_duplicate_position(signal):
@@ -172,9 +232,59 @@ class OrderManager:
             logger.warning(f"Skipping duplicate trade: {signal.strategy_type.value} for {signal.underlying}")
             return execution
         
-        logger.info(f"Executing signal: {signal.strategy_type.value} for {signal.underlying}")
+        # Determine order type: use config default for live, MARKET for paper
+        if order_type is None:
+            if self.is_paper_trading:
+                order_type = OrderType.MARKET
+            else:
+                entry_type_str = TRADING_CONFIG.get("entry_order_type", "LIMIT")
+                order_type = OrderType.LIMIT if entry_type_str == "LIMIT" else OrderType.MARKET
+        
+        # For LIMIT orders in live mode, adjust entry prices with slippage tolerance
+        if not self.is_paper_trading and order_type == OrderType.LIMIT:
+            slippage_pct = TRADING_CONFIG.get("limit_slippage_pct", 1.0) / 100
+            for leg in signal.legs:
+                if leg.entry_price and leg.entry_price > 0:
+                    if leg.is_long:
+                        # Buying: willing to pay up to slippage% above LTP
+                        leg.entry_price = round(leg.entry_price * (1 + slippage_pct), 2)
+                    else:
+                        # Selling: willing to accept slippage% below LTP
+                        leg.entry_price = round(leg.entry_price * (1 - slippage_pct), 2)
+                    # Kite NFO tick size is 0.05
+                    leg.entry_price = round(leg.entry_price / 0.05) * 0.05
+        
+        logger.info(f"Executing signal: {signal.strategy_type.value} for {signal.underlying} (order_type={order_type.value})")
         
         try:
+            # Pre-flight DTE check — reject trades with insufficient days to expiry
+            # High-confidence signals (>= 80%) get a lower DTE floor (5 days)
+            from config.settings import STRATEGY_CONFIG
+            confidence = signal.confidence if hasattr(signal, 'confidence') else 0
+            high_conf_threshold = STRATEGY_CONFIG.get("high_confidence_threshold", 0.80)
+            if confidence >= high_conf_threshold:
+                min_dte = STRATEGY_CONFIG.get("high_confidence_min_dte", 5)
+            else:
+                min_dte = STRATEGY_CONFIG.get("min_days_to_expiry", 20)
+            today = datetime.now().date()
+            for leg in signal.legs:
+                leg_expiry = leg.expiry.date() if isinstance(leg.expiry, datetime) else leg.expiry
+                dte = (leg_expiry - today).days
+                if dte < min_dte:
+                    execution.status = "FAILED"
+                    logger.warning(
+                        f"DTE too low for {leg.symbol}: {dte} days "
+                        f"(min: {min_dte}, confidence: {confidence:.0%}). Rejecting trade."
+                    )
+                    return execution
+
+            # Pre-flight margin check for live trading
+            if not self.is_paper_trading:
+                if not self._check_margin_available(signal):
+                    execution.status = "FAILED"
+                    logger.error(f"Insufficient margin for {signal.strategy_type.value} on {signal.underlying}")
+                    return execution
+            
             # Determine the correct F&O exchange for this signal's underlying
             signal_exchange = get_options_exchange(signal.underlying)
             
@@ -192,7 +302,30 @@ class OrderManager:
             
             # Wait for orders to complete
             if not self.is_paper_trading:
-                self._wait_for_completion(execution)
+                limit_timeout = TRADING_CONFIG.get("limit_timeout_seconds", 15)
+                self._wait_for_completion(execution, timeout=limit_timeout if order_type == OrderType.LIMIT else 30)
+                
+                # If LIMIT orders didn't fill, cancel and retry as MARKET
+                if order_type == OrderType.LIMIT and not execution.is_complete():
+                    unfilled = [o for o in execution.orders if o.status == OrderStatus.PLACED]
+                    if unfilled:
+                        logger.warning(f"{len(unfilled)} LIMIT order(s) unfilled after {limit_timeout}s — converting to MARKET")
+                        for order in unfilled:
+                            self._cancel_order(order.order_id)
+                            order.status = OrderStatus.CANCELLED
+                        
+                        # Re-place unfilled legs as MARKET
+                        for order in unfilled:
+                            leg = signal.legs[order.leg_index]
+                            market_order = self._place_leg_order(
+                                leg, OrderType.MARKET, execution_id, order.leg_index, exchange=signal_exchange
+                            )
+                            # Replace the cancelled order in the list
+                            idx = execution.orders.index(order)
+                            execution.orders[idx] = market_order
+                        
+                        # Wait for MARKET orders
+                        self._wait_for_completion(execution, timeout=30)
             
             if execution.is_complete() or self.is_paper_trading:
                 execution.status = "ACTIVE"
@@ -336,6 +469,7 @@ class OrderManager:
                         "status": order.status.value,
                         "order_type": order.order_type.value,
                         "placed_at": order.placed_at or datetime.now(),
+                        "trading_mode": self.trading_mode,
                     })
             except Exception as e:
                 logger.debug(f"Failed to persist order {order.order_id}: {e}")
@@ -387,13 +521,87 @@ class OrderManager:
         return None
     
     def _place_sl_target_orders(self, execution: TradeExecution) -> None:
-        """Place stop loss and target orders for an execution."""
+        """
+        Place exchange-level GTT stop-loss orders for crash protection.
+        
+        GTT orders sit on the exchange and trigger even if the bot is down.
+        The bot's software-based SL/target monitoring (position_tracker) handles
+        normal exits; GTT is a safety net for catastrophic scenarios only.
+        
+        Converts the strategy-level SL (absolute Rs P&L) to per-leg price triggers.
+        """
         signal = execution.signal
         
-        # For now, we'll monitor SL/target in the position tracker
-        # In production, you might want to place GTT orders
+        if self.is_paper_trading:
+            logger.info(f"[PAPER] SL: {signal.stop_loss:.2f}, Target: {signal.target:.2f}")
+            return
         
-        logger.info(f"SL: {signal.stop_loss:.2f}, Target: {signal.target:.2f}")
+        if not TRADING_CONFIG.get("place_gtt_stop_loss", True):
+            logger.info(f"GTT SL disabled. Software SL: {signal.stop_loss:.2f}, Target: {signal.target:.2f}")
+            return
+        
+        if not self._ensure_connected():
+            logger.error("Cannot place GTT orders — Kite not connected")
+            return
+        
+        buffer_pct = TRADING_CONFIG.get("gtt_sl_buffer_pct", 2.0) / 100
+        exchange = get_options_exchange(signal.underlying)
+        num_legs = max(len(signal.legs), 1)
+        
+        for leg in signal.legs:
+            if not leg.entry_price or leg.entry_price <= 0:
+                continue
+            
+            # Strategy SL is total Rs. Divide equally among legs to get per-leg SL.
+            sl_per_leg = signal.stop_loss / num_legs
+            sl_price_change = sl_per_leg / max(leg.quantity, 1)
+            
+            if leg.is_long:
+                # Long leg loses when price drops → GTT SELL to close
+                trigger_price = leg.entry_price - sl_price_change * (1 + buffer_pct)
+                trigger_price = max(round(trigger_price / 0.05) * 0.05, 0.05)
+                # LIMIT price slightly below trigger for fill certainty
+                order_price = max(trigger_price - 0.05, 0.05)
+                txn_type = "SELL"
+            else:
+                # Short leg loses when price rises → GTT BUY to close
+                trigger_price = leg.entry_price + sl_price_change * (1 + buffer_pct)
+                trigger_price = round(trigger_price / 0.05) * 0.05
+                # LIMIT price slightly above trigger for fill certainty
+                order_price = trigger_price + 0.05
+                txn_type = "BUY"
+            
+            try:
+                gtt_response = self.kite.place_gtt(
+                    trigger_type="single",
+                    tradingsymbol=leg.symbol,
+                    exchange=exchange,
+                    trigger_values=[trigger_price],
+                    last_price=leg.entry_price,
+                    orders=[{
+                        "exchange": exchange,
+                        "tradingsymbol": leg.symbol,
+                        "transaction_type": txn_type,
+                        "quantity": leg.quantity,
+                        "order_type": "LIMIT",
+                        "product": "NRML",
+                        "price": order_price,
+                    }]
+                )
+                gtt_id = gtt_response.get("trigger_id")
+                if gtt_id:
+                    execution.gtt_order_ids.append(gtt_id)
+                    logger.info(
+                        f"GTT SL placed for {leg.symbol}: trigger={trigger_price:.2f}, "
+                        f"{txn_type} {leg.quantity} @ {order_price:.2f} (GTT ID: {gtt_id})"
+                    )
+            except Exception as e:
+                logger.error(f"Failed to place GTT for {leg.symbol}: {e}")
+        
+        logger.info(
+            f"SL: {signal.stop_loss:.2f}, Target: {signal.target:.2f} "
+            f"(GTT IDs: {execution.gtt_order_ids})"
+        )
     
     def _persist_trade_to_db(self, execution_id: str, signal: StrategySignal) -> None:
         """
@@ -418,6 +626,7 @@ class OrderManager:
                     strategy_type=signal.strategy_type.value,
                     signal_data=signal_data,
                     status="ACTIVE",
+                    trading_mode=self.trading_mode,
                 )
                 logger.debug(f"Trade persisted to database: {execution_id}")
         except Exception as e:
@@ -480,6 +689,25 @@ class OrderManager:
             logger.error(f"Failed to cancel order {order_id}: {e}")
             return False
     
+    def _cancel_gtt_orders(self, execution: TradeExecution) -> None:
+        """Cancel all GTT orders for an execution to prevent double exits."""
+        if self.is_paper_trading or not execution.gtt_order_ids:
+            return
+        
+        if not self._ensure_connected():
+            logger.error("Cannot cancel GTT orders — Kite not connected")
+            return
+        
+        for gtt_id in execution.gtt_order_ids:
+            try:
+                self.kite.delete_gtt(gtt_id)
+                logger.info(f"GTT cancelled: {gtt_id}")
+            except Exception as e:
+                # GTT may have already triggered or expired
+                logger.warning(f"Failed to cancel GTT {gtt_id}: {e}")
+        
+        execution.gtt_order_ids.clear()
+    
     def close_position(
         self,
         execution_id: str,
@@ -503,9 +731,15 @@ class OrderManager:
         
         logger.info(f"Closing position: {execution_id}")
         
+        # Cancel any GTT orders first to prevent double execution
+        self._cancel_gtt_orders(execution)
+        
         try:
             # Determine exchange from the signal's underlying
             exit_exchange = get_options_exchange(execution.signal.underlying)
+            
+            exit_orders = []
+            any_failed = False
             
             # Place exit orders for each leg (opposite direction)
             for i, leg in enumerate(execution.signal.legs):
@@ -522,14 +756,33 @@ class OrderManager:
                 )
                 
                 order = self._place_leg_order(exit_leg, order_type, f"{execution_id}_exit", i, exchange=exit_exchange)
+                exit_orders.append((order, leg))
                 
-                if order.status in [OrderStatus.COMPLETE, OrderStatus.PLACED]:
-                    # Calculate P&L
-                    if leg.entry_price and order.filled_price:
-                        pnl = (order.filled_price - leg.entry_price) * leg.quantity
-                        if leg.is_short:
-                            pnl = -pnl
-                        execution.realized_pnl += pnl
+                if order.status in [OrderStatus.FAILED, OrderStatus.REJECTED]:
+                    logger.error(f"Exit order FAILED for {leg.symbol}: {order.message}")
+                    any_failed = True
+            
+            # In live mode, wait for exit orders to fill before calculating P&L
+            if not self.is_paper_trading:
+                exit_execution = TradeExecution(signal=execution.signal, execution_id=f"{execution_id}_exit")
+                exit_execution.orders = [o for o, _ in exit_orders]
+                self._wait_for_completion(exit_execution, timeout=60)
+            
+            # Calculate P&L from actual fill prices
+            for order, leg in exit_orders:
+                if order.status == OrderStatus.COMPLETE and leg.entry_price and order.filled_price:
+                    pnl = (order.filled_price - leg.entry_price) * leg.quantity
+                    if leg.is_short:
+                        pnl = -pnl
+                    execution.realized_pnl += pnl
+                elif order.status not in [OrderStatus.COMPLETE]:
+                    any_failed = True
+                    logger.error(f"Exit order not filled for {leg.symbol}: status={order.status.value}")
+            
+            if any_failed:
+                # Don't remove position from tracking if exit orders failed
+                logger.error(f"Some exit orders failed for {execution_id} — position kept in active tracking")
+                return False
             
             execution.status = "CLOSED"
             execution.exit_time = datetime.now()
@@ -544,7 +797,7 @@ class OrderManager:
             return True
             
         except Exception as e:
-            logger.error(f"Error closing position: {e}")
+            logger.error(f"Error closing position {execution_id}: {e}")
             return False
     
     def get_active_positions(self) -> List[Dict]:

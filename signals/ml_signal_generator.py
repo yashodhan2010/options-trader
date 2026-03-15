@@ -238,15 +238,19 @@ class MLSignalGenerator:
             logger.warning(f"Could not get spot price for {underlying}")
             return []
         
-        # Get options chain
-        options_chain = data_fetcher.get_options_chain(
+        # Get options chains across ALL valid expiries (DTE range from config)
+        expiry_chains = data_fetcher.get_options_chains_multi_expiry(
             underlying,
-            num_strikes=15,  # 15 strikes each side: enough depth for credit spread OTM + hedge
+            num_strikes=15,
         )
         
-        if options_chain.empty:
-            logger.warning(f"Empty options chain for {underlying}")
-            return []
+        if not expiry_chains:
+            # Fallback to single-expiry method for backward compatibility
+            single_chain = data_fetcher.get_options_chain(underlying, num_strikes=15)
+            if single_chain.empty:
+                logger.warning(f"Empty options chain for {underlying}")
+                return []
+            expiry_chains = {None: single_chain}
         
         # Get market metrics
         oi_data = data_fetcher.get_oi_data(underlying)
@@ -260,12 +264,15 @@ class MLSignalGenerator:
             "historical": historical,
         }
         
+        # Use nearest expiry chain for ML feature extraction (direction prediction)
+        nearest_chain = next(iter(expiry_chains.values()))
+        
         # Extract features for ML prediction
         features = self._feature_engineer.extract_features(
             underlying=underlying,
             spot_price=spot,
             historical_data=historical.get("df") if isinstance(historical, dict) else historical,
-            options_chain=options_chain,
+            options_chain=nearest_chain,
             oi_analysis=oi_data,
             volatility_data=volatility,
         )
@@ -393,49 +400,39 @@ class MLSignalGenerator:
                 is_index=is_index,
             )
         
-        # Generate signals for selected strategies
+        # Generate signals for selected strategies across ALL expiry chains
         signals = []
         catalogue = self.catalogues.get(underlying)
         
         if not catalogue:
             return []
         
-        for strategy_type in strategy_types:
-            strategy = catalogue.get_strategy(strategy_type)
-            if not strategy:
-                logger.info(f"  Strategy {strategy_type.value} not found in catalogue for {underlying}")
-                continue
+        for expiry_date, options_chain in expiry_chains.items():
+            dte_label = f" (DTE: {(expiry_date - datetime.now().date()).days})" if expiry_date else ""
             
-            try:
-                # ML is driving the signal - skip strategy-level OI sentiment
-                # and confidence gates (ML already validated direction & confidence)
-                strategy.ml_override = True
+            for strategy_type in strategy_types:
+                strategy = catalogue.get_strategy(strategy_type)
+                if not strategy:
+                    continue
                 
-                # Analyze with strategy
-                signal = strategy.analyze(options_chain, market_data)
-                
-                # Reset override
-                strategy.ml_override = False
-                
-                if signal:
-                    # Override confidence with ML confidence
-                    ml_signal = self._create_ml_signal(signal, prediction)
-                    signals.append(ml_signal)
-                    logger.info(
-                        f"  Signal generated: {strategy_type.value} for {underlying} "
-                        f"(ML confidence: {prediction.confidence:.1%})"
-                    )
-                else:
-                    logger.info(
-                        f"  Strategy {strategy_type.value} returned no signal for {underlying} "
-                        f"(strategy conditions not met)"
-                    )
+                try:
+                    strategy.ml_override = True
+                    signal = strategy.analyze(options_chain, market_data)
+                    strategy.ml_override = False
                     
-            except Exception as e:
-                logger.error(f"Strategy {strategy_type.value} failed: {e}")
-                import traceback
-                traceback.print_exc()
-                strategy.ml_override = False
+                    if signal:
+                        ml_signal = self._create_ml_signal(signal, prediction)
+                        signals.append(ml_signal)
+                        logger.info(
+                            f"  Signal generated: {strategy_type.value} for {underlying}{dte_label} "
+                            f"(ML confidence: {prediction.confidence:.1%})"
+                        )
+                    
+                except Exception as e:
+                    logger.error(f"Strategy {strategy_type.value} failed for {underlying}{dte_label}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    strategy.ml_override = False
         
         return signals
 

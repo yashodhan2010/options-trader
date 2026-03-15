@@ -51,6 +51,7 @@ class OptionsTradingBot:
         self.scan_interval = BOT_CONFIG.get("signal_scan_interval", 60)  # From config
         self.use_websocket = use_websocket
         self.websocket_manager: Optional[WebSocketTicker] = None
+        self.start_date = datetime.now().date()  # Track start date for auto-exit
         
         # Set trading mode
         order_manager.set_paper_trading(paper_trading)
@@ -72,8 +73,9 @@ class OptionsTradingBot:
     
     def _on_sl_hit(self, execution_id: str, pnl: float) -> None:
         """Handle hard stop loss hit (always a loss)."""
-        logger.warning(f"[SL HIT] {execution_id}, Loss: Rs.{abs(pnl):.2f}")
-        self._send_notification(f"Stop Loss Hit!\nPosition: {execution_id}\nLoss: Rs.{abs(pnl):.2f}")
+        mode = self._mode_tag()
+        logger.warning(f"[{mode}] [SL HIT] {execution_id}, Loss: Rs.{abs(pnl):.2f}")
+        self._send_notification(f"[{mode}] Stop Loss Hit!\nPosition: {execution_id}\nLoss: Rs.{abs(pnl):.2f}")
         
         # Log to trade file
         trade_logger.info("=" * 80)
@@ -81,6 +83,7 @@ class OptionsTradingBot:
         trade_logger.info(f"Execution ID: {execution_id}")
         trade_logger.info(f"P&L:          Rs.{pnl:.2f}")
         trade_logger.info(f"Result:       LOSS")
+        trade_logger.info(f"Mode:         {mode}")
         trade_logger.info("=" * 80)
         trade_logger.info("")
     
@@ -89,10 +92,11 @@ class OptionsTradingBot:
         result = "PROFIT" if pnl >= 0 else "LOSS"
         pnl_label = "Profit" if pnl >= 0 else "Loss"
         log_fn = logger.info if pnl >= 0 else logger.warning
+        mode = self._mode_tag()
         
-        log_fn(f"[TRAILING SL] {execution_id}, {pnl_label}: Rs.{abs(pnl):.2f} (floor: {trail_level:.2f})")
+        log_fn(f"[{mode}] [TRAILING SL] {execution_id}, {pnl_label}: Rs.{abs(pnl):.2f} (floor: {trail_level:.2f})")
         self._send_notification(
-            f"Trailing SL Hit!\nPosition: {execution_id}\n"
+            f"[{mode}] Trailing SL Hit!\nPosition: {execution_id}\n"
             f"{pnl_label}: Rs.{abs(pnl):.2f}\nTrail Floor: Rs.{trail_level:.2f}"
         )
         
@@ -103,13 +107,15 @@ class OptionsTradingBot:
         trade_logger.info(f"P&L:          Rs.{pnl:.2f}")
         trade_logger.info(f"Trail Floor:  Rs.{trail_level:.2f}")
         trade_logger.info(f"Result:       {result}")
+        trade_logger.info(f"Mode:         {mode}")
         trade_logger.info("=" * 80)
         trade_logger.info("")
     
     def _on_target_hit(self, execution_id: str, pnl: float) -> None:
         """Handle target hit."""
-        logger.info(f"[TARGET HIT] {execution_id}, Profit: Rs.{pnl:.2f}")
-        self._send_notification(f"Target Hit!\nPosition: {execution_id}\nProfit: Rs.{pnl:.2f}")
+        mode = self._mode_tag()
+        logger.info(f"[{mode}] [TARGET HIT] {execution_id}, Profit: Rs.{pnl:.2f}")
+        self._send_notification(f"[{mode}] Target Hit!\nPosition: {execution_id}\nProfit: Rs.{pnl:.2f}")
         
         # Log to trade file
         trade_logger.info("=" * 80)
@@ -117,12 +123,14 @@ class OptionsTradingBot:
         trade_logger.info(f"Execution ID: {execution_id}")
         trade_logger.info(f"P&L:          Rs.{pnl:.2f}")
         trade_logger.info(f"Result:       PROFIT")
+        trade_logger.info(f"Mode:         {mode}")
         trade_logger.info("=" * 80)
         trade_logger.info("")
     
     def _on_position_closed(self, execution_id: str, pnl: float, reason: str) -> None:
         """Handle position closed."""
-        logger.info(f"Position Closed: {execution_id}, P&L: Rs.{pnl:.2f}, Reason: {reason}")
+        mode = self._mode_tag()
+        logger.info(f"[{mode}] Position Closed: {execution_id}, P&L: Rs.{pnl:.2f}, Reason: {reason}")
 
         # Log ML outcome for continuous feedback
         try:
@@ -170,17 +178,19 @@ class OptionsTradingBot:
         trade_logger.info(f"Reason:       {reason}")
         trade_logger.info(f"P&L:          Rs.{pnl:.2f}")
         trade_logger.info(f"Result:       {result}")
+        trade_logger.info(f"Mode:         {mode}")
         trade_logger.info("=" * 80)
         trade_logger.info("")
     
     def _on_signal_exit(self, execution_id: str, pnl: float, exit_signal) -> None:
         """Handle intelligent signal-based exit."""
+        mode = self._mode_tag()
         reason_str = exit_signal.reason.value if hasattr(exit_signal.reason, 'value') else str(exit_signal.reason)
-        logger.info(f"[SIGNAL EXIT] {execution_id}, P&L: Rs.{pnl:.2f}, Reason: {reason_str}")
+        logger.info(f"[{mode}] [SIGNAL EXIT] {execution_id}, P&L: Rs.{pnl:.2f}, Reason: {reason_str}")
         
         # Send notification
         self._send_notification(
-            f"Signal Exit Triggered!\n"
+            f"[{mode}] Signal Exit Triggered!\n"
             f"Position: {execution_id}\n"
             f"Reason: {reason_str}\n"
             f"Confidence: {exit_signal.confidence:.1%}\n"
@@ -198,11 +208,15 @@ class OptionsTradingBot:
         trade_logger.info(f"Urgency:      {exit_signal.urgency}")
         trade_logger.info(f"P&L:          Rs.{pnl:.2f}")
         trade_logger.info(f"Result:       {result}")
-        trade_logger.info(f"Mode:         {'PAPER' if order_manager.is_paper_trading else 'LIVE'}")
+        trade_logger.info(f"Mode:         {mode}")
         trade_logger.info("-" * 40)
         trade_logger.info(f"Rationale:    {exit_signal.rationale}")
         trade_logger.info("=" * 80)
         trade_logger.info("")
+
+    def _mode_tag(self) -> str:
+        """Return 'PAPER' or 'LIVE' based on current mode."""
+        return "PAPER" if self.paper_trading else "LIVE"
 
     def _send_notification(self, message: str) -> None:
         """Send notification via configured channels (Telegram, WhatsApp)."""
@@ -413,9 +427,12 @@ class OptionsTradingBot:
                 else:
                     # Market is closed
                     # Check if we should auto-exit the bot
-                    if should_auto_exit():
+                    if should_auto_exit(bot_start_date=self.start_date):
                         logger.info("=" * 60)
-                        logger.info("[AUTO-EXIT] Market closed and auto-exit time reached.")
+                        if datetime.now().date() != self.start_date:
+                            logger.info("[AUTO-EXIT] Bot survived overnight (system sleep?). Shutting down stale session...")
+                        else:
+                            logger.info("[AUTO-EXIT] Market closed and auto-exit time reached.")
                         logger.info("[AUTO-EXIT] Shutting down bot gracefully...")
                         logger.info("=" * 60)
                         break  # Exit the main loop
@@ -584,7 +601,7 @@ class OptionsTradingBot:
         trade_logger.info(f"Underlying:   {signal.underlying}")
         trade_logger.info(f"Confidence:   {signal.confidence:.1%}")
         trade_logger.info(f"Risk/Reward:  {signal.risk_reward_ratio:.2f}")
-        trade_logger.info(f"Mode:         {'PAPER' if order_manager.is_paper_trading else 'LIVE'}")
+        trade_logger.info(f"Mode:         {self._mode_tag()}")
         trade_logger.info("-" * 40)
         trade_logger.info("LEGS:")
         for leg in signal.legs:
@@ -971,6 +988,19 @@ def main():
     
     # Determine paper trading mode
     paper_trading = not args.live
+    
+    # Safety confirmation for live trading
+    if not paper_trading:
+        print("\n" + "=" * 60)
+        print("[WARNING] LIVE TRADING MODE")
+        print("=" * 60)
+        print("You are about to start the bot with REAL MONEY.")
+        print(f"Auto-trade: {'ENABLED' if args.auto_trade else 'DISABLED'}")
+        print("=" * 60)
+        confirm = input("Type 'YES' to confirm live trading: ").strip()
+        if confirm != "YES":
+            print("Cancelled. Use --paper for paper trading.")
+            return
     
     # Create bot
     bot = OptionsTradingBot(

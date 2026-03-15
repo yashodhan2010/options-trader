@@ -33,8 +33,16 @@ cd /d C:\Users\Yashodhan\OneDrive\Documents\Algo\OptionsTrader\options-trader
 REM Log startup
 echo [%date% %time%] Bot starting... >> logs\scheduler.log
 
+REM Save the PID so we can kill it if needed
 REM Run the bot (paper trading mode)
-python run.py --bot --paper >> logs\scheduler.log 2>&1
+start /b /wait python run.py --bot --paper >> logs\scheduler.log 2>&1
+set BOT_EXIT_CODE=%ERRORLEVEL%
+
+REM Kill any leftover python processes for THIS bot (safety net)
+tasklist /fi "windowtitle eq Options Trading Bot*" /fo csv 2>nul | find /i "python" >nul && (
+    echo [%date% %time%] Cleaning up orphaned python process... >> logs\scheduler.log
+    taskkill /f /fi "windowtitle eq Options Trading Bot*" >nul 2>&1
+)
 
 REM Log exit
-echo [%date% %time%] Bot exited with code %ERRORLEVEL% >> logs\scheduler.log
+echo [%date% %time%] Bot exited with code %BOT_EXIT_CODE% >> logs\scheduler.log

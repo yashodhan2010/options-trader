@@ -32,16 +32,24 @@ KITE_CONFIG = {
 TRADING_CONFIG = {
     "exchange": "NFO",  # NFO for options
     "default_quantity": 1,  # Lot size multiplier (for stocks)
-    "index_quantity_multiplier": 2,  # Lot multiplier for index options (NIFTY/BANKNIFTY/FINNIFTY/SENSEX)
-    "max_positions": 5,
+    "index_quantity_multiplier": 1,  # Lot multiplier for index options (NIFTY/BANKNIFTY/FINNIFTY/SENSEX)
+    "max_positions": 3,
     "paper_max_positions": 15,  # Relaxed cap for paper trading (set higher than live)
-    "capital_per_trade": 150000,  # INR
+    "capital_per_trade": 50000,  # INR (sized for ~1L account)
     "max_loss_per_day": 10000,  # INR
     "default_sl_percent": 30,  # Stop loss percentage
     "default_target_percent": 50,  # Target percentage
     "trailing_sl_enabled": True,
     "trailing_sl_percent": 60,        # Trail at 60% below peak profit (protect 40%, allow trend room)
     "trailing_sl_activation_pct": 0.6,  # Start trailing after 60% of target reached
+    
+    # Live order execution settings
+    "entry_order_type": "LIMIT",      # MARKET or LIMIT for entries (LIMIT gives price control)
+    "exit_order_type": "MARKET",      # MARKET or LIMIT for exits (MARKET for guaranteed fill)
+    "limit_slippage_pct": 1.0,        # Max slippage % for LIMIT orders (e.g. 1% above LTP for buys)
+    "limit_timeout_seconds": 15,      # Cancel unfilled LIMIT order after this many seconds
+    "place_gtt_stop_loss": True,      # Place exchange-level GTT SL order for crash protection
+    "gtt_sl_buffer_pct": 2.0,         # GTT trigger slightly beyond SL (e.g. SL at -30%, GTT at -32%)
 }
 
 # Market Hours Configuration
@@ -205,8 +213,10 @@ STRATEGY_CONFIG = {
         "strangle",
     ],
     "default_days_to_expiry": 7,
-    "min_days_to_expiry": 2,
-    "max_days_to_expiry": 30,
+    "min_days_to_expiry": 20,
+    "high_confidence_min_dte": 5,       # Lower DTE floor for signals with confidence >= threshold below
+    "high_confidence_threshold": 0.80,  # 80% ML confidence unlocks lower DTE
+    "max_days_to_expiry": 45,
     "strike_selection_mode": "atm",  # atm, otm, itm
     "otm_offset": 1,  # Number of strikes OTM
 }

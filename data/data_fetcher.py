@@ -268,6 +268,146 @@ class DataFetcher:
         logger.warning(f"No instrument token found for {symbol}")
         return None
     
+    def get_options_chains_multi_expiry(
+        self,
+        underlying: str,
+        num_strikes: int = 10,
+    ) -> Dict[date, pd.DataFrame]:
+        """
+        Get options chains for ALL valid expiries within the configured DTE range.
+        Returns a dict mapping each expiry date to its options chain DataFrame.
+
+        Instruments are loaded once; quotes are fetched in a single batched API
+        call across all expiries for efficiency.
+
+        Args:
+            underlying: The underlying asset
+            num_strikes: Number of strikes above and below ATM
+
+        Returns:
+            Dict of {expiry_date: DataFrame} sorted by expiry ascending
+        """
+        from config.settings import STRATEGY_CONFIG
+
+        min_dte = STRATEGY_CONFIG.get("high_confidence_min_dte", 5)
+        max_dte = STRATEGY_CONFIG.get("max_days_to_expiry", 45)
+
+        if not self._ensure_connected():
+            return {}
+
+        try:
+            spot_price = self.get_spot_price(underlying)
+            if not spot_price:
+                return {}
+
+            options_exchange = get_options_exchange(underlying)
+            instruments = self._load_instruments(options_exchange)
+
+            options = [
+                i for i in instruments
+                if i["name"] == underlying
+                and i["instrument_type"] in ["CE", "PE"]
+            ]
+
+            def _normalize_expiry(expiry_value):
+                if expiry_value is None:
+                    return None
+                if isinstance(expiry_value, datetime):
+                    return expiry_value.date()
+                if isinstance(expiry_value, date):
+                    return expiry_value
+                try:
+                    return datetime.fromisoformat(str(expiry_value)).date()
+                except Exception:
+                    return None
+
+            today = datetime.now().date()
+            all_expiries = sorted({
+                _normalize_expiry(o["expiry"])
+                for o in options
+                if _normalize_expiry(o["expiry"]) is not None
+            })
+
+            valid_expiries = [
+                exp for exp in all_expiries
+                if min_dte <= (exp - today).days <= max_dte
+            ]
+
+            if not valid_expiries:
+                logger.info(f"No expiries in DTE range [{min_dte}, {max_dte}] for {underlying}")
+                return {}
+
+            # Filter instruments to valid expiries
+            options = [
+                o for o in options
+                if _normalize_expiry(o["expiry"]) in valid_expiries
+            ]
+
+            # Strike filtering around ATM
+            strike_interval = get_strike_interval(underlying)
+            if underlying not in UNDERLYING_ASSETS:
+                strikes = sorted(set(o["strike"] for o in options))
+                if len(strikes) >= 2:
+                    diffs = [strikes[i + 1] - strikes[i] for i in range(len(strikes) - 1)]
+                    strike_interval = min(diffs) if diffs else 50
+                else:
+                    strike_interval = 50
+
+            atm_strike = round(spot_price / strike_interval) * strike_interval
+            min_strike = atm_strike - (num_strikes * strike_interval)
+            max_strike = atm_strike + (num_strikes * strike_interval)
+
+            options = [
+                o for o in options
+                if min_strike <= o["strike"] <= max_strike
+            ]
+
+            if not options:
+                return {}
+
+            # Single batched quote call for all expiries
+            symbols = [f"{options_exchange}:{o['tradingsymbol']}" for o in options]
+            self._throttle_api_call()
+            quotes = self.kite.quote(symbols)
+
+            # Build rows and group by expiry
+            result: Dict[date, list] = {}
+            for opt in options:
+                exp = _normalize_expiry(opt["expiry"])
+                symbol = f"{options_exchange}:{opt['tradingsymbol']}"
+                quote = quotes.get(symbol, {})
+                row = {
+                    "symbol": opt["tradingsymbol"],
+                    "strike": opt["strike"],
+                    "option_type": opt["instrument_type"],
+                    "expiry": opt["expiry"],
+                    "ltp": quote.get("last_price", 0),
+                    "bid": quote.get("depth", {}).get("buy", [{}])[0].get("price", 0),
+                    "ask": quote.get("depth", {}).get("sell", [{}])[0].get("price", 0),
+                    "oi": quote.get("oi", 0),
+                    "oi_change": quote.get("oi_day_high", 0) - quote.get("oi_day_low", 0),
+                    "volume": quote.get("volume", 0),
+                    "iv": self._calculate_iv(quote, spot_price, opt),
+                    "lot_size": opt["lot_size"],
+                    "instrument_token": opt["instrument_token"],
+                }
+                result.setdefault(exp, []).append(row)
+
+            chains: Dict[date, pd.DataFrame] = {}
+            for exp in sorted(result.keys()):
+                df = pd.DataFrame(result[exp]).sort_values(["strike", "option_type"])
+                chains[exp] = df
+
+            logger.info(
+                f"Fetched multi-expiry chains for {underlying}: "
+                f"{len(chains)} expiries, {sum(len(df) for df in chains.values())} options"
+            )
+            return chains
+
+        except Exception as e:
+            logger.error(f"Failed to get multi-expiry chains for {underlying}: {e}")
+            return {}
+    
     def get_options_chain(
         self,
         underlying: str,
@@ -341,8 +481,8 @@ class DataFetcher:
                 })
                 if expiries:
                     today = datetime.now().date()
-                    from config.settings import STRATEGY_PARAMS
-                    min_dte = STRATEGY_PARAMS.get("min_days_to_expiry", 2)
+                    from config.settings import STRATEGY_CONFIG
+                    min_dte = STRATEGY_CONFIG.get("min_days_to_expiry", 2)
 
                     if use_monthly:
                         # For stocks: skip current month's expiry, use next month
@@ -392,6 +532,16 @@ class DataFetcher:
                             )
                         else:
                             logger.debug(f"Using next-month expiry for {underlying}: {target_expiry}")
+
+                        # Enforce min_dte for stock options too
+                        if target_expiry and (target_expiry - today).days < min_dte:
+                            # Selected expiry is too close — bump to next available
+                            farther = [exp for exp in expiries if (exp - today).days >= min_dte]
+                            if farther:
+                                target_expiry = farther[0]
+                                logger.info(f"Stock expiry too close for {underlying}, bumped to {target_expiry} (min_dte={min_dte})")
+                            else:
+                                logger.warning(f"No expiry with DTE >= {min_dte} for {underlying}, using {target_expiry}")
 
                         options = [
                             o for o in options

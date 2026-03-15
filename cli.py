@@ -592,19 +592,28 @@ class TradingCLI(cmd.Cmd):
         print(f"{'='*80}")
     
     def do_pnl(self, arg):
-        """Show P&L summary for today"""
+        """Show P&L summary for today. Usage: pnl [--paper|--live]"""
         from core.database import database
+        
+        # Parse mode flag
+        trading_mode = None
+        for p in arg.strip().lower().split():
+            if p == '--paper':
+                trading_mode = 'PAPER'
+            elif p == '--live':
+                trading_mode = 'LIVE'
         
         # Get daily summary from database
         today = datetime.now().strftime('%Y-%m-%d')
+        mode_label = f" [{trading_mode}]" if trading_mode else ""
         
         print(f"\n{'='*60}")
-        print(f"P&L SUMMARY - {today}")
+        print(f"P&L SUMMARY{mode_label} - {today}")
         print(f"{'='*60}")
         
         # Realized P&L (closed trades)
         try:
-            trades = database.get_trades()
+            trades = database.get_trades(trading_mode=trading_mode)
             today_trades = [t for t in trades if t.get('exit_time', '').startswith(today)]
             realized_pnl = sum(t.get('pnl', 0) for t in today_trades)
             closed_count = len(today_trades)
@@ -645,23 +654,36 @@ class TradingCLI(cmd.Cmd):
         print(f"{'='*60}")
     
     def do_trades(self, arg):
-        """Show past trade history with P&L. Usage: trades [N] or trades all"""
+        """Show past trade history with P&L. Usage: trades [N|all] [--paper|--live]"""
         from core.database import database
         
-        # Parse argument: number of trades to show, default 10
-        arg = arg.strip().lower()
-        show_all = arg == 'all'
+        # Parse flags and arguments
+        parts = arg.strip().lower().split()
+        trading_mode = None
+        remaining = []
+        for p in parts:
+            if p == '--paper':
+                trading_mode = 'PAPER'
+            elif p == '--live':
+                trading_mode = 'LIVE'
+            else:
+                remaining.append(p)
+        
+        arg_str = remaining[0] if remaining else ''
+        show_all = arg_str == 'all'
         try:
-            limit = int(arg) if arg and not show_all else 10
+            limit = int(arg_str) if arg_str and not show_all else 10
         except ValueError:
             limit = 10
         
-        trades = database.get_trades(status="CLOSED")
+        trades = database.get_trades(status="CLOSED", trading_mode=trading_mode)
         
         if not trades:
-            print("No closed trades found in database.")
+            mode_label = f" ({trading_mode})" if trading_mode else ""
+            print(f"No closed trades{mode_label} found in database.")
             return
         
+        total_count = len(trades)
         if not show_all:
             trades = trades[:limit]
         
@@ -669,8 +691,9 @@ class TradingCLI(cmd.Cmd):
         wins = 0
         losses = 0
         
+        mode_label = f" [{trading_mode}]" if trading_mode else ""
         print(f"\n{'='*80}")
-        print(f"TRADE HISTORY (showing {'all' if show_all else f'last {len(trades)}'} of {len(database.get_trades(status='CLOSED'))} closed trades)")
+        print(f"TRADE HISTORY{mode_label} (showing {'all' if show_all else f'last {len(trades)}'} of {total_count} closed trades)")
         print(f"{'='*80}")
         
         for t in trades:

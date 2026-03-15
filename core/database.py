@@ -44,6 +44,7 @@ class Database:
                 status TEXT,
                 exit_reason TEXT,
                 realized_pnl REAL DEFAULT 0,
+                trading_mode TEXT DEFAULT 'PAPER',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -53,6 +54,10 @@ class Database:
         trade_columns = [row[1] for row in cursor.fetchall()]
         if "exit_reason" not in trade_columns:
             cursor.execute("ALTER TABLE trades ADD COLUMN exit_reason TEXT")
+        if "trading_mode" not in trade_columns:
+            cursor.execute("ALTER TABLE trades ADD COLUMN trading_mode TEXT DEFAULT 'PAPER'")
+            # Backfill all existing records as PAPER
+            cursor.execute("UPDATE trades SET trading_mode = 'PAPER' WHERE trading_mode IS NULL")
         
         # Orders table
         cursor.execute("""
@@ -70,10 +75,17 @@ class Database:
                 placed_at TIMESTAMP,
                 filled_at TIMESTAMP,
                 message TEXT,
+                trading_mode TEXT DEFAULT 'PAPER',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (execution_id) REFERENCES trades (execution_id)
             )
         """)
+
+        cursor.execute("PRAGMA table_info(orders)")
+        order_columns = [row[1] for row in cursor.fetchall()]
+        if "trading_mode" not in order_columns:
+            cursor.execute("ALTER TABLE orders ADD COLUMN trading_mode TEXT DEFAULT 'PAPER'")
+            cursor.execute("UPDATE orders SET trading_mode = 'PAPER' WHERE trading_mode IS NULL")
         
         # Signals table
         cursor.execute("""
@@ -84,22 +96,37 @@ class Database:
                 confidence REAL,
                 signal_data TEXT,
                 executed INTEGER DEFAULT 0,
+                trading_mode TEXT DEFAULT 'PAPER',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        cursor.execute("PRAGMA table_info(signals)")
+        signal_columns = [row[1] for row in cursor.fetchall()]
+        if "trading_mode" not in signal_columns:
+            cursor.execute("ALTER TABLE signals ADD COLUMN trading_mode TEXT DEFAULT 'PAPER'")
+            cursor.execute("UPDATE signals SET trading_mode = 'PAPER' WHERE trading_mode IS NULL")
         
         # Daily PnL table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS daily_pnl (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date DATE UNIQUE,
+                date DATE,
                 total_pnl REAL,
                 num_trades INTEGER,
                 num_winners INTEGER,
                 num_losers INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                trading_mode TEXT DEFAULT 'PAPER',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(date, trading_mode)
             )
         """)
+
+        cursor.execute("PRAGMA table_info(daily_pnl)")
+        dpnl_columns = [row[1] for row in cursor.fetchall()]
+        if "trading_mode" not in dpnl_columns:
+            cursor.execute("ALTER TABLE daily_pnl ADD COLUMN trading_mode TEXT DEFAULT 'PAPER'")
+            cursor.execute("UPDATE daily_pnl SET trading_mode = 'PAPER' WHERE trading_mode IS NULL")
         
         # Position Status Log table (for periodic updates)
         cursor.execute("""
@@ -115,10 +142,17 @@ class Database:
                 stop_loss REAL,
                 target REAL,
                 status TEXT,
+                trading_mode TEXT DEFAULT 'PAPER',
                 logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (execution_id) REFERENCES trades (execution_id)
             )
         """)
+
+        cursor.execute("PRAGMA table_info(position_status_log)")
+        psl_columns = [row[1] for row in cursor.fetchall()]
+        if "trading_mode" not in psl_columns:
+            cursor.execute("ALTER TABLE position_status_log ADD COLUMN trading_mode TEXT DEFAULT 'PAPER'")
+            cursor.execute("UPDATE position_status_log SET trading_mode = 'PAPER' WHERE trading_mode IS NULL")
         
         # ============================================================================
         # ML TABLES
@@ -324,6 +358,7 @@ class Database:
         strategy_type: str,
         signal_data: Dict,
         status: str = "ACTIVE",
+        trading_mode: str = "PAPER",
     ) -> bool:
         """
         Save a new trade to the database.
@@ -334,6 +369,7 @@ class Database:
             strategy_type: Type of strategy
             signal_data: Full signal data as dictionary
             status: Trade status
+            trading_mode: 'PAPER' or 'LIVE'
             
         Returns:
             True if successful
@@ -343,8 +379,8 @@ class Database:
             cursor = conn.cursor()
             
             cursor.execute("""
-                INSERT INTO trades (execution_id, underlying, strategy_type, signal_data, entry_time, status)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO trades (execution_id, underlying, strategy_type, signal_data, entry_time, status, trading_mode)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (
                 execution_id,
                 underlying,
@@ -352,6 +388,7 @@ class Database:
                 json.dumps(signal_data),
                 datetime.now().isoformat(),
                 status,
+                trading_mode,
             ))
             
             conn.commit()
@@ -461,8 +498,8 @@ class Database:
                 INSERT INTO orders (
                     order_id, execution_id, symbol, transaction_type,
                     quantity, order_type, price, filled_price, status,
-                    placed_at, filled_at, message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    placed_at, filled_at, message, trading_mode
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 order_data.get("order_id"),
                 order_data.get("execution_id"),
@@ -476,6 +513,7 @@ class Database:
                 order_data.get("placed_at"),
                 order_data.get("filled_at"),
                 order_data.get("message"),
+                order_data.get("trading_mode", "PAPER"),
             ))
             
             conn.commit()
@@ -493,6 +531,7 @@ class Database:
         confidence: float,
         signal_data: Dict,
         executed: bool = False,
+        trading_mode: str = "PAPER",
     ) -> bool:
         """
         Save a signal to the database.
@@ -503,6 +542,7 @@ class Database:
             confidence: Signal confidence
             signal_data: Full signal data
             executed: Whether signal was executed
+            trading_mode: 'PAPER' or 'LIVE'
             
         Returns:
             True if successful
@@ -512,14 +552,15 @@ class Database:
             cursor = conn.cursor()
             
             cursor.execute("""
-                INSERT INTO signals (underlying, strategy_type, confidence, signal_data, executed)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO signals (underlying, strategy_type, confidence, signal_data, executed, trading_mode)
+                VALUES (?, ?, ?, ?, ?, ?)
             """, (
                 underlying,
                 strategy_type,
                 confidence,
                 json.dumps(signal_data),
                 1 if executed else 0,
+                trading_mode,
             ))
             
             conn.commit()
@@ -536,6 +577,7 @@ class Database:
         underlying: Optional[str] = None,
         start_date: Optional[datetime] = None,
         end_date: Optional[datetime] = None,
+        trading_mode: Optional[str] = None,
     ) -> List[Dict]:
         """
         Get trades with optional filters.
@@ -545,6 +587,7 @@ class Database:
             underlying: Filter by underlying
             start_date: Filter from date
             end_date: Filter to date
+            trading_mode: Filter by 'PAPER' or 'LIVE' (None = all)
             
         Returns:
             List of trade dictionaries
@@ -571,6 +614,10 @@ class Database:
             if end_date:
                 query += " AND entry_time <= ?"
                 params.append(end_date.isoformat())
+            
+            if trading_mode:
+                query += " AND trading_mode = ?"
+                params.append(trading_mode)
             
             query += " ORDER BY created_at DESC"
             
@@ -603,36 +650,50 @@ class Database:
             
             # Get all closed trades for the day
             cursor.execute("""
-                SELECT realized_pnl FROM trades 
+                SELECT realized_pnl, trading_mode FROM trades 
                 WHERE DATE(entry_time) = ? AND status = 'CLOSED'
             """, (date_str,))
             
             rows = cursor.fetchall()
             conn.close()
             
-            pnls = [row["realized_pnl"] for row in rows]
+            # Separate by mode
+            paper_pnls = [row["realized_pnl"] for row in rows if row["trading_mode"] != "LIVE"]
+            live_pnls = [row["realized_pnl"] for row in rows if row["trading_mode"] == "LIVE"]
+            all_pnls = [row["realized_pnl"] for row in rows]
             
-            return {
-                "date": date_str,
-                "total_pnl": sum(pnls),
-                "num_trades": len(pnls),
-                "num_winners": len([p for p in pnls if p > 0]),
-                "num_losers": len([p for p in pnls if p < 0]),
-                "win_rate": len([p for p in pnls if p > 0]) / len(pnls) * 100 if pnls else 0,
-                "avg_winner": sum([p for p in pnls if p > 0]) / len([p for p in pnls if p > 0]) if [p for p in pnls if p > 0] else 0,
-                "avg_loser": sum([p for p in pnls if p < 0]) / len([p for p in pnls if p < 0]) if [p for p in pnls if p < 0] else 0,
-            }
+            def _stats(pnls):
+                winners = [p for p in pnls if p > 0]
+                losers = [p for p in pnls if p < 0]
+                return {
+                    "total_pnl": sum(pnls),
+                    "num_trades": len(pnls),
+                    "num_winners": len(winners),
+                    "num_losers": len(losers),
+                    "win_rate": len(winners) / len(pnls) * 100 if pnls else 0,
+                    "avg_winner": sum(winners) / len(winners) if winners else 0,
+                    "avg_loser": sum(losers) / len(losers) if losers else 0,
+                }
+            
+            result = {"date": date_str}
+            result["all"] = _stats(all_pnls)
+            result["paper"] = _stats(paper_pnls)
+            result["live"] = _stats(live_pnls)
+            # Backwards compat: top-level keys from "all"
+            result.update(result["all"])
+            return result
             
         except Exception as e:
             logger.error(f"Failed to get daily stats: {e}")
             return {}
     
-    def get_strategy_performance(self, days: int = 30) -> List[Dict]:
+    def get_strategy_performance(self, days: int = 30, trading_mode: Optional[str] = None) -> List[Dict]:
         """
         Get performance breakdown by strategy.
         
         Args:
             days: Number of days to analyze
+            trading_mode: Filter by 'PAPER' or 'LIVE' (None = all)
             
         Returns:
             List of strategy performance dictionaries
@@ -641,7 +702,7 @@ class Database:
             conn = self._get_connection()
             cursor = conn.cursor()
             
-            cursor.execute("""
+            query = """
                 SELECT 
                     strategy_type,
                     COUNT(*) as num_trades,
@@ -652,8 +713,16 @@ class Database:
                 FROM trades
                 WHERE status = 'CLOSED' 
                 AND entry_time >= datetime('now', ?)
-                GROUP BY strategy_type
-            """, (f"-{days} days",))
+            """
+            params = [f"-{days} days"]
+            
+            if trading_mode:
+                query += " AND trading_mode = ?"
+                params.append(trading_mode)
+            
+            query += " GROUP BY strategy_type"
+            
+            cursor.execute(query, params)
             
             rows = cursor.fetchall()
             conn.close()
@@ -664,9 +733,12 @@ class Database:
             logger.error(f"Failed to get strategy performance: {e}")
             return []
     
-    def get_active_trades(self) -> List[Dict]:
+    def get_active_trades(self, trading_mode: Optional[str] = None) -> List[Dict]:
         """
         Get all trades with ACTIVE status (for overnight position recovery).
+        
+        Args:
+            trading_mode: Filter by 'PAPER' or 'LIVE' (None = all)
         
         Returns:
             List of active trade dictionaries with parsed signal_data
@@ -675,9 +747,14 @@ class Database:
             conn = self._get_connection()
             cursor = conn.cursor()
             
-            cursor.execute("""
-                SELECT * FROM trades WHERE status = 'ACTIVE' ORDER BY entry_time ASC
-            """)
+            if trading_mode:
+                cursor.execute("""
+                    SELECT * FROM trades WHERE status = 'ACTIVE' AND trading_mode = ? ORDER BY entry_time ASC
+                """, (trading_mode,))
+            else:
+                cursor.execute("""
+                    SELECT * FROM trades WHERE status = 'ACTIVE' ORDER BY entry_time ASC
+                """)
             
             rows = cursor.fetchall()
             conn.close()
@@ -711,6 +788,7 @@ class Database:
         stop_loss: float,
         target: float,
         status: str = "ACTIVE",
+        trading_mode: str = "PAPER",
     ) -> bool:
         """
         Log periodic position status update.
@@ -726,6 +804,7 @@ class Database:
             stop_loss: Current stop loss
             target: Current target
             status: Trade status
+            trading_mode: 'PAPER' or 'LIVE'
             
         Returns:
             True if successful
@@ -738,8 +817,8 @@ class Database:
                 INSERT INTO position_status_log (
                     execution_id, underlying, strategy_type, current_pnl,
                     unrealized_pnl, current_prices, time_in_trade_seconds,
-                    stop_loss, target, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    stop_loss, target, status, trading_mode
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 execution_id,
                 underlying,
@@ -751,6 +830,7 @@ class Database:
                 stop_loss,
                 target,
                 status,
+                trading_mode,
             ))
             
             conn.commit()
