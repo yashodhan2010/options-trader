@@ -34,6 +34,7 @@ env/
 # Logs
 logs/*.log
 *.log
+logs/
 
 # Data files (keep folder structure but ignore temp data)
 data/*.db

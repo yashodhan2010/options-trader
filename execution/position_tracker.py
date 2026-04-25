@@ -70,6 +70,14 @@ class PositionTracker:
         self.signal_exit_thread: Optional[threading.Thread] = None
         self.signal_exit_lock: threading.Lock = threading.Lock()
         
+        # GTT trigger monitoring (detects when exchange fires a per-leg GTT SL)
+        self.gtt_monitor_interval: int = BOT_CONFIG.get("gtt_monitor_interval", 30)  # Check every 30s
+        self.gtt_monitor_thread: Optional[threading.Thread] = None
+        
+        # Exit cooldown: prevent infinite SL→close_fail→SL loop
+        self._exit_cooldowns: Dict[str, float] = {}  # execution_id -> last attempt timestamp
+        self._exit_cooldown_secs: int = 60  # Retry exit every 60s, not every 5s
+        
         # WebSocket mode
         self.use_websocket: bool = BOT_CONFIG.get("use_websocket", True)
         self.websocket_manager = None
@@ -137,6 +145,12 @@ class PositionTracker:
             self.signal_exit_thread = threading.Thread(target=self._signal_exit_loop, daemon=True)
             self.signal_exit_thread.start()
             logger.info(f"Signal exit monitoring enabled (interval: {self.signal_exit_interval}s)")
+        
+        # Start GTT trigger monitor for live trading (detects per-leg GTT fires)
+        if not self.paper_trading:
+            self.gtt_monitor_thread = threading.Thread(target=self._gtt_monitor_loop, daemon=True)
+            self.gtt_monitor_thread.start()
+            logger.info(f"GTT trigger monitoring enabled (interval: {self.gtt_monitor_interval}s)")
     
     def stop_monitoring(self) -> None:
         """Stop the position monitoring."""
@@ -156,6 +170,9 @@ class PositionTracker:
         
         if self.signal_exit_thread:
             self.signal_exit_thread.join(timeout=10)
+        
+        if self.gtt_monitor_thread:
+            self.gtt_monitor_thread.join(timeout=10)
             
         logger.info("Position tracker stopped")
     
@@ -391,6 +408,15 @@ class PositionTracker:
             "current_prices": current_prices,
         }
         
+        # Skip SL/target checks if an exit was recently attempted and failed (cooldown)
+        if execution_id in self._exit_cooldowns:
+            elapsed = time.time() - self._exit_cooldowns[execution_id]
+            if elapsed < self._exit_cooldown_secs:
+                return  # Cooldown active — don't re-trigger
+            # Cooldown expired — allow retry
+            logger.info(f"Exit cooldown expired for {execution_id}, retrying exit...")
+            del self._exit_cooldowns[execution_id]
+        
         # Check stop loss (initial hard SL)
         if total_pnl <= -signal.stop_loss:
             logger.warning(f"Stop loss hit for {execution_id}! P&L: {total_pnl:.2f}")
@@ -398,8 +424,8 @@ class PositionTracker:
             self._notify("sl_hit", execution_id, total_pnl)
             return
         
-        # Check trailing stop loss - locks in profits
-        if self.trailing_sl_enabled and execution_id in self.trailing_stop_levels:
+        # Check trailing stop loss - locks in profits (only when P&L is positive)
+        if self.trailing_sl_enabled and execution_id in self.trailing_stop_levels and total_pnl >= 0:
             trail_level = self.trailing_stop_levels[execution_id]
             if trail_level > 0 and total_pnl <= trail_level:
                 logger.info(
@@ -557,6 +583,51 @@ class PositionTracker:
                 time.sleep(5)  # Brief pause on error
         
         logger.debug("Signal exit loop stopped")
+
+    def _gtt_monitor_loop(self) -> None:
+        """
+        Monitor GTT orders for per-leg triggers on the exchange.
+        
+        When Zerodha fires a single leg's GTT stop-loss, the other leg is left
+        orphaned. This loop detects that and triggers a full position exit so
+        we don't end up with a naked directional position from a spread.
+        """
+        logger.debug("GTT monitor loop started")
+        
+        while self.is_running:
+            try:
+                time.sleep(self.gtt_monitor_interval)
+                
+                if not self.is_running:
+                    break
+                
+                # Only check during market hours
+                if not is_market_open():
+                    continue
+                
+                triggered_ids = order_manager.check_gtt_triggers()
+                
+                for exec_id in triggered_ids:
+                    execution = order_manager.active_executions.get(exec_id)
+                    if not execution:
+                        continue
+                    
+                    # Use cached P&L if available, else 0
+                    metrics = self.position_metrics.get(exec_id, {})
+                    current_pnl = metrics.get("current_pnl", 0)
+                    
+                    logger.warning(
+                        f"GTT SL triggered for {exec_id} "
+                        f"({execution.signal.underlying} {execution.signal.strategy_type.value}) — "
+                        f"exiting remaining legs"
+                    )
+                    self._trigger_exit(exec_id, "GTT_SL_TRIGGERED", current_pnl)
+                
+            except Exception as e:
+                logger.error(f"GTT monitor loop error: {e}")
+                time.sleep(5)
+        
+        logger.debug("GTT monitor loop stopped")
 
     def on_new_position(self, execution_id: str, market_data: Dict = None) -> None:
         """
@@ -835,6 +906,14 @@ class PositionTracker:
                 del self.position_metrics[execution_id]
             if execution_id in self.trailing_stop_levels:
                 del self.trailing_stop_levels[execution_id]
+            if execution_id in self._exit_cooldowns:
+                del self._exit_cooldowns[execution_id]
+        else:
+            # Exit failed — set cooldown to prevent rapid-fire retries
+            self._exit_cooldowns[execution_id] = time.time()
+            logger.warning(
+                f"Exit failed for {execution_id}, will retry in {self._exit_cooldown_secs}s"
+            )
     
     def register_callback(self, event: str, callback: Callable) -> None:
         """
@@ -1148,6 +1227,10 @@ class PositionTracker:
                         "last_update": datetime.now().isoformat(),
                         "current_prices": {},
                     }
+                    
+                    # Validate GTTs for live positions — re-place if missing/expired
+                    if not self.paper_trading:
+                        self._validate_gtts(execution_id)
                 else:
                     logger.warning(f"[FAIL] Failed to load position: {execution_id}")
             
@@ -1156,6 +1239,55 @@ class PositionTracker:
         except Exception as e:
             logger.error(f"Error loading persisted positions: {e}")
     
+    def _validate_gtts(self, execution_id: str) -> None:
+        """
+        Validate GTT orders for a restored position.
+        
+        Checks if persisted GTT IDs are still active on the exchange.
+        If any have been triggered/cancelled/expired, cancels ALL remaining
+        GTTs (they're a set) and re-places fresh ones from current state.
+        """
+        execution = order_manager.active_executions.get(execution_id)
+        if not execution:
+            return
+        
+        stored_ids = list(execution.gtt_order_ids)
+        
+        if not stored_ids:
+            # No GTTs were persisted — place fresh ones
+            logger.info(f"[GTT] No stored GTTs for {execution_id} — placing fresh")
+            order_manager._place_sl_target_orders(execution)
+            # Update DB with the new GTT IDs
+            order_manager._persist_trade_to_db(execution_id, execution.signal)
+            return
+        
+        # Check each stored GTT against the exchange
+        try:
+            gtt_list = order_manager.kite.get_gtts()
+        except Exception as e:
+            logger.error(f"[GTT] Cannot validate GTTs for {execution_id}: {e}")
+            return
+        
+        gtt_status_map = {g["id"]: g.get("status") for g in gtt_list if "id" in g}
+        
+        all_active = True
+        for gtt_id in stored_ids:
+            status = gtt_status_map.get(gtt_id)
+            if status != "active":
+                logger.warning(f"[GTT] {gtt_id} for {execution_id} is '{status}' (not active)")
+                all_active = False
+        
+        if all_active:
+            logger.info(f"[GTT] All GTTs valid for {execution_id}: {stored_ids}")
+            return
+        
+        # Some GTTs are not active — cancel remaining and re-place all
+        logger.warning(f"[GTT] Re-placing GTTs for {execution_id} (some expired/triggered)")
+        order_manager._cancel_gtt_orders(execution)
+        order_manager._place_sl_target_orders(execution)
+        # Update DB with the new GTT IDs
+        order_manager._persist_trade_to_db(execution_id, execution.signal)
+
     def get_status_update_summary(self) -> Dict:
         """
         Get a summary of current position status.

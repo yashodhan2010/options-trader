@@ -3,6 +3,7 @@ Logging utility for the Options Trading Bot
 """
 import logging
 import sys
+from logging.handlers import RotatingFileHandler
 from config.settings import LOGGING_CONFIG, LOGS_DIR
 
 
@@ -32,11 +33,12 @@ def setup_logger(name: str = "OptionsTrader") -> logging.Logger:
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
     
-    # File handler (append mode, no rotation)
+    # File handler with rotation: 5 MB per file, keep 5 backups
     LOGS_DIR.mkdir(exist_ok=True)
-    file_handler = logging.FileHandler(
+    file_handler = RotatingFileHandler(
         LOGGING_CONFIG["file_path"],
-        mode="a",
+        maxBytes=5 * 1024 * 1024,
+        backupCount=5,
         encoding="utf-8",
     )
     file_handler.setLevel(logging.DEBUG)
@@ -71,9 +73,10 @@ def setup_trade_logger(name: str = "TradeLog") -> logging.Logger:
     LOGS_DIR.mkdir(exist_ok=True)
     trade_file = LOGS_DIR / "trades.log"
     
-    file_handler = logging.FileHandler(
+    file_handler = RotatingFileHandler(
         trade_file,
-        mode="a",
+        maxBytes=5 * 1024 * 1024,
+        backupCount=5,
         encoding="utf-8",
     )
     file_handler.setLevel(logging.INFO)

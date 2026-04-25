@@ -148,7 +148,7 @@ UNDERLYING_ASSETS = {
         "symbol": "NIFTY 50",
         "exchange": "NSE",
         "options_exchange": "NFO",  # NSE F&O
-        "lot_size": 75,
+        "lot_size": 65,
         "tick_size": 0.05,
         "strike_interval": 50,
         "expiry_day": "Thursday",  # Weekly expiry

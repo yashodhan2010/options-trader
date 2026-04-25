@@ -114,6 +114,15 @@ class OrderManager:
                 self.kite = get_kite()
         return self.kite is not None
     
+    def _get_underlying_from_execution(self, execution_id: str) -> Optional[str]:
+        """Get underlying symbol from an active or exit execution."""
+        # Strip _exit suffix to find the parent execution
+        base_id = execution_id.replace("_exit", "")
+        execution = self.active_executions.get(base_id)
+        if execution:
+            return execution.signal.underlying
+        return None
+
     def set_paper_trading(self, enabled: bool) -> None:
         """Enable or disable paper trading mode."""
         self.is_paper_trading = enabled
@@ -122,7 +131,10 @@ class OrderManager:
     def _check_margin_available(self, signal: StrategySignal) -> bool:
         """
         Check if sufficient margin is available before placing live orders.
-        Estimates required margin and compares against available balance.
+        
+        Uses Kite's basket_order_margins API to get the real combined margin
+        (with spread benefit). Falls back to per-leg order_margins if the
+        basket API fails, and to a conservative estimate as last resort.
         
         Args:
             signal: The strategy signal to check
@@ -145,30 +157,67 @@ class OrderManager:
             equity_margin = margins.get("equity", {})
             available = equity_margin.get("available", {}).get("live_balance", 0)
             
-            # Estimate required margin: sum of (price * quantity) for all buy legs
-            # For sell legs, use Kite's SPAN margin (conservative estimate)
-            estimated_cost = 0
+            signal_exchange = get_options_exchange(signal.underlying)
+            
+            # Build basket order params for Kite margin API
+            basket_params = []
             for leg in signal.legs:
-                leg_cost = (leg.entry_price or 0) * leg.quantity
-                if leg.is_long:
-                    estimated_cost += leg_cost  # Premium outflow
-                # For short legs in a spread, margin is roughly the spread width * qty
-                # We don't subtract short premium here to be conservative
+                basket_params.append({
+                    "exchange": signal_exchange,
+                    "tradingsymbol": leg.symbol,
+                    "transaction_type": leg.direction.value,
+                    "quantity": leg.quantity,
+                    "product": "NRML",
+                    "order_type": "LIMIT",
+                    "price": leg.entry_price or 0,
+                })
             
-            # Add 20% buffer for margin fluctuations
-            required_with_buffer = estimated_cost * 1.2
+            # Primary: basket_order_margins — real combined margin with spread benefit
+            required_margin = None
+            try:
+                basket_result = self.kite.basket_order_margins(
+                    basket_params, consider_positions=True, mode="compact"
+                )
+                if isinstance(basket_result, dict):
+                    required_margin = (
+                        basket_result.get("final", {}).get("total", 0)
+                        or basket_result.get("initial", {}).get("total", 0)
+                    )
+                if required_margin:
+                    logger.info(f"Basket margin (combined): Rs.{required_margin:,.2f}")
+            except Exception as e:
+                logger.warning(f"Basket margin API failed: {e} — falling back to per-leg")
             
-            if available < required_with_buffer:
+            # Fallback: sum of per-leg order_margins
+            if not required_margin:
+                try:
+                    leg_margins = self.kite.order_margins(basket_params)
+                    required_margin = sum(m.get("total", 0) for m in leg_margins)
+                    logger.info(f"Per-leg margin (sum): Rs.{required_margin:,.2f}")
+                except Exception as e:
+                    logger.warning(f"Per-leg margin API also failed: {e}")
+            
+            # Last resort: conservative estimate (buy premium * 2)
+            if not required_margin:
+                required_margin = sum(
+                    (leg.entry_price or 0) * leg.quantity
+                    for leg in signal.legs if leg.is_long
+                ) * 2
+                logger.info(f"Fallback margin estimate: Rs.{required_margin:,.2f}")
+            
+            # 10% buffer for price fluctuation between check and execution
+            total_required = required_margin * 1.1
+            
+            if available < total_required:
                 logger.warning(
                     f"Insufficient margin: available Rs.{available:,.2f}, "
-                    f"estimated required Rs.{required_with_buffer:,.2f} "
-                    f"(cost Rs.{estimated_cost:,.2f} + 20% buffer)"
+                    f"required Rs.{total_required:,.2f} (margin Rs.{required_margin:,.2f} + 10% buffer)"
                 )
                 return False
             
             logger.info(
                 f"Margin check passed: available Rs.{available:,.2f}, "
-                f"estimated cost Rs.{estimated_cost:,.2f}"
+                f"required Rs.{total_required:,.2f}"
             )
             return True
             
@@ -179,8 +228,10 @@ class OrderManager:
     def has_duplicate_position(self, signal: StrategySignal) -> bool:
         """
         Check if there's already an open position with the same underlying
-        AND same strategy type. Different strategies on the same underlying
-        are allowed (different risk/reward profiles).
+        AND same strategy type in the SAME trading mode. Different strategies
+        on the same underlying are allowed (different risk/reward profiles).
+        Paper and live positions are independent — a paper trade does not
+        block a live trade.
         
         Args:
             signal: The signal to check for duplicates
@@ -192,13 +243,17 @@ class OrderManager:
             if execution.status != "ACTIVE":
                 continue
             
+            # Only check duplicates within the same trading mode
+            if execution.trading_mode != self.trading_mode:
+                continue
+            
             existing_signal = execution.signal
             
             if (existing_signal.underlying == signal.underlying and
                 existing_signal.strategy_type == signal.strategy_type):
                 logger.warning(
                     f"Duplicate position exists: {exec_id} "
-                    f"({signal.underlying} {signal.strategy_type.value})"
+                    f"({signal.underlying} {signal.strategy_type.value}) [{self.trading_mode}]"
                 )
                 return True
         
@@ -288,17 +343,30 @@ class OrderManager:
             # Determine the correct F&O exchange for this signal's underlying
             signal_exchange = get_options_exchange(signal.underlying)
             
+            # For live trading, reorder legs: place BUY (hedge) legs before
+            # SELL legs so the exchange recognises the spread and applies
+            # combined margin instead of naked-short margin.
+            ordered_legs = list(enumerate(signal.legs))
+            if not self.is_paper_trading:
+                ordered_legs.sort(key=lambda x: 0 if x[1].is_long else 1)
+            
             # Place orders for each leg
-            for i, leg in enumerate(signal.legs):
+            for i, leg in ordered_legs:
                 order = self._place_leg_order(leg, order_type, execution_id, i, exchange=signal_exchange)
                 execution.orders.append(order)
                 
-                if order.status == OrderStatus.REJECTED:
+                if order.status in (OrderStatus.REJECTED, OrderStatus.FAILED):
                     execution.status = "FAILED"
                     logger.error(f"Order rejected for {leg.symbol}: {order.message}")
                     # Cancel any already placed orders
                     self._cancel_execution(execution)
                     return execution
+                
+                # For live spreads, wait briefly for the BUY leg to be
+                # acknowledged before sending the SELL leg so the exchange
+                # has the hedge on record for margin benefit.
+                if not self.is_paper_trading and leg.is_long:
+                    time.sleep(0.5)
             
             # Wait for orders to complete
             if not self.is_paper_trading:
@@ -351,10 +419,16 @@ class OrderManager:
             else:
                 execution.status = "PARTIAL"
                 logger.warning(f"Partial execution: {execution_id}")
+                # Cancel all placed orders to avoid orphaned legs on the exchange
+                self._cancel_execution(execution)
+                logger.info(f"Cancelled orphaned orders for partial execution: {execution_id}")
             
         except Exception as e:
             logger.error(f"Error executing signal: {e}")
             execution.status = "FAILED"
+            # Cancel any orders that made it to the exchange before the error
+            if execution.orders:
+                self._cancel_execution(execution)
         
         return execution
     
@@ -401,13 +475,36 @@ class OrderManager:
         Returns:
             Order object
         """
+        # Stock options don't allow MARKET orders on Kite — convert to LIMIT
+        # with market protection (5% slippage) for non-index underlyings.
+        effective_order_type = order_type
+        effective_price = leg.entry_price if order_type == OrderType.LIMIT else 0
+
+        if order_type == OrderType.MARKET and not self.is_paper_trading:
+            # Determine underlying from execution_id or symbol
+            underlying = self._get_underlying_from_execution(execution_id)
+            if underlying and underlying not in UNDERLYING_ASSETS:
+                # Stock option — MARKET orders blocked, use LIMIT with 5% protection
+                ref_price = leg.entry_price or 0
+                if ref_price > 0:
+                    protection_pct = 0.05
+                    if leg.direction.value == "BUY":
+                        effective_price = round(ref_price * (1 + protection_pct), 2)
+                    else:
+                        effective_price = round(max(ref_price * (1 - protection_pct), 0.05), 2)
+                    effective_order_type = OrderType.LIMIT
+                    logger.info(
+                        f"Stock option: MARKET→LIMIT with protection. "
+                        f"{leg.direction.value} {leg.symbol} @ {effective_price} (ref: {ref_price})"
+                    )
+
         order = Order(
             symbol=leg.symbol,
             exchange=exchange,
             transaction_type=leg.direction.value,
             quantity=leg.quantity,
-            order_type=order_type,
-            price=leg.entry_price if order_type == OrderType.LIMIT else 0,
+            order_type=effective_order_type,
+            price=effective_price,
             parent_signal_id=execution_id,
             leg_index=leg_index,
         )
@@ -435,8 +532,8 @@ class OrderManager:
                     transaction_type=leg.direction.value,
                     quantity=leg.quantity,
                     product="NRML",
-                    order_type=order_type.value,
-                    price=leg.entry_price if order_type == OrderType.LIMIT else None,
+                    order_type=effective_order_type.value,
+                    price=effective_price if effective_order_type == OrderType.LIMIT else None,
                 )
                 
                 order.order_id = str(order_id)
@@ -666,11 +763,76 @@ class OrderManager:
             logger.error(f"Failed to update trade in database: {e}")
     
     def _cancel_execution(self, execution: TradeExecution) -> None:
-        """Cancel all orders in an execution."""
+        """Cancel placed orders and unwind any already-filled legs.
+        
+        When a spread execution goes PARTIAL (e.g. BUY filled, SELL rejected
+        for margin), we must:
+        1. Cancel any orders still sitting on the exchange (PLACED)
+        2. Re-check PLACED orders that may have filled in the meantime
+        3. Exit (reverse-trade) any legs that already filled so we don't
+           leave naked orphaned positions
+        """
+        filled_orders = []
+        
         for order in execution.orders:
             if order.status == OrderStatus.PLACED and order.order_id:
-                self._cancel_order(order.order_id)
-                order.status = OrderStatus.CANCELLED
+                # Try to cancel — may fail if it filled between check and cancel
+                cancelled = self._cancel_order(order.order_id)
+                if cancelled:
+                    order.status = OrderStatus.CANCELLED
+                else:
+                    # Failed to cancel — order may have filled, re-check status
+                    details = self._get_order_status(order.order_id)
+                    if details and details.get("status") == "COMPLETE":
+                        order.status = OrderStatus.COMPLETE
+                        order.filled_price = details.get("average_price", 0)
+                        order.filled_at = datetime.now()
+            
+            if order.status == OrderStatus.COMPLETE:
+                filled_orders.append(order)
+        
+        # Unwind filled legs by placing reverse orders
+        if filled_orders and not self.is_paper_trading:
+            signal_exchange = get_options_exchange(execution.signal.underlying)
+            is_stock_option = execution.signal.underlying not in UNDERLYING_ASSETS
+            for order in filled_orders:
+                reverse_direction = "SELL" if order.transaction_type == "BUY" else "BUY"
+                logger.warning(
+                    f"Unwinding filled orphan: {reverse_direction} {order.quantity} "
+                    f"{order.symbol} (was {order.transaction_type} @ {order.filled_price})"
+                )
+                try:
+                    # Stock options don't allow MARKET orders — use LIMIT with 5% protection
+                    if is_stock_option and order.filled_price:
+                        protection_pct = 0.05
+                        if reverse_direction == "BUY":
+                            unwind_price = round(order.filled_price * (1 + protection_pct), 2)
+                        else:
+                            unwind_price = round(max(order.filled_price * (1 - protection_pct), 0.05), 2)
+                        self.kite.place_order(
+                            variety="regular",
+                            exchange=signal_exchange,
+                            tradingsymbol=order.symbol,
+                            transaction_type=reverse_direction,
+                            quantity=order.quantity,
+                            product="NRML",
+                            order_type="LIMIT",
+                            price=unwind_price,
+                        )
+                        logger.info(f"Unwind LIMIT order placed: {reverse_direction} {order.quantity} {order.symbol} @ {unwind_price}")
+                    else:
+                        self.kite.place_order(
+                            variety="regular",
+                            exchange=signal_exchange,
+                            tradingsymbol=order.symbol,
+                            transaction_type=reverse_direction,
+                            quantity=order.quantity,
+                            product="NRML",
+                            order_type="MARKET",
+                        )
+                        logger.info(f"Unwind order placed: {reverse_direction} {order.quantity} {order.symbol}")
+                except Exception as e:
+                    logger.error(f"CRITICAL: Failed to unwind orphan {order.symbol}: {e}")
     
     def _cancel_order(self, order_id: str) -> bool:
         """Cancel a specific order."""
@@ -707,6 +869,51 @@ class OrderManager:
                 logger.warning(f"Failed to cancel GTT {gtt_id}: {e}")
         
         execution.gtt_order_ids.clear()
+    
+    def check_gtt_triggers(self) -> List[str]:
+        """
+        Check if any GTT orders have been triggered on the exchange.
+        Returns list of execution_ids whose GTTs have fired.
+        
+        This detects the case where Zerodha fires a per-leg GTT SL,
+        so the bot can exit the remaining legs of the spread.
+        """
+        if self.is_paper_trading or not self._ensure_connected():
+            return []
+        
+        triggered_executions = []
+        
+        try:
+            gtt_orders = self.kite.get_gtts()
+        except Exception as e:
+            logger.error(f"Failed to fetch GTT list: {e}")
+            return []
+        
+        # Build a lookup: gtt_id -> status
+        gtt_status_map = {}
+        for gtt in gtt_orders:
+            gtt_id = gtt.get("id")
+            status = gtt.get("status")
+            if gtt_id:
+                gtt_status_map[gtt_id] = status
+        
+        for exec_id, execution in list(self.active_executions.items()):
+            if execution.status != "ACTIVE" or not execution.gtt_order_ids:
+                continue
+            
+            for gtt_id in execution.gtt_order_ids:
+                status = gtt_status_map.get(gtt_id)
+                if status == "triggered":
+                    logger.warning(
+                        f"GTT {gtt_id} TRIGGERED for {exec_id} "
+                        f"({execution.signal.underlying} {execution.signal.strategy_type.value}) — "
+                        f"must exit remaining legs"
+                    )
+                    if exec_id not in triggered_executions:
+                        triggered_executions.append(exec_id)
+                    break  # One triggered GTT is enough to flag this execution
+        
+        return triggered_executions
     
     def close_position(
         self,
@@ -860,6 +1067,117 @@ class OrderManager:
         
         return True
     
+    def register_manual_position(
+        self,
+        underlying: str,
+        strategy_type_str: str,
+        legs_data: List[Dict],
+        stop_loss: float,
+        target: float,
+        confidence: float = 0.5,
+        rationale: str = "Manual import",
+    ) -> Optional[str]:
+        """
+        Register a position that was placed manually on Kite.
+        Creates the execution in memory and persists to DB so the
+        position tracker can monitor SL/target/signal exits.
+
+        Args:
+            underlying: e.g. "NIFTY"
+            strategy_type_str: e.g. "bear_call_spread"
+            legs_data: List of dicts with keys:
+                symbol, strike, option_type, expiry (YYYY-MM-DD),
+                direction (BUY/SELL), quantity, entry_price
+            stop_loss: Stop loss amount (positive Rs.)
+            target: Target profit amount (positive Rs.)
+            confidence: Signal confidence (0-1)
+            rationale: Text note
+
+        Returns:
+            execution_id on success, None on failure
+        """
+        from strategies.base_strategy import StrategySignal, OptionLeg, TradeDirection, StrategyType
+
+        try:
+            strat_type = StrategyType(strategy_type_str)
+        except ValueError:
+            logger.error(f"Unknown strategy type: {strategy_type_str}")
+            return None
+
+        legs = []
+        for ld in legs_data:
+            try:
+                expiry = datetime.strptime(ld["expiry"], "%Y-%m-%d") if isinstance(ld["expiry"], str) else ld["expiry"]
+            except Exception:
+                expiry = datetime.now()
+            legs.append(OptionLeg(
+                symbol=ld["symbol"],
+                strike=float(ld["strike"]),
+                option_type=ld["option_type"],
+                expiry=expiry,
+                direction=TradeDirection(ld["direction"]),
+                quantity=int(ld["quantity"]),
+                entry_price=float(ld["entry_price"]),
+            ))
+
+        # Calculate expected profit / max loss from legs
+        total_credit = sum(l.entry_price * l.quantity for l in legs if l.is_short)
+        total_debit = sum(l.entry_price * l.quantity for l in legs if l.is_long)
+        net_credit = total_credit - total_debit
+
+        signal = StrategySignal(
+            strategy_type=strat_type,
+            underlying=underlying,
+            legs=legs,
+            entry_time=datetime.now(),
+            confidence=confidence,
+            expected_profit=target,
+            max_loss=stop_loss,
+            stop_loss=stop_loss,
+            target=target,
+            rationale=rationale,
+        )
+
+        execution_id = f"{strategy_type_str}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        execution = TradeExecution(
+            signal=signal,
+            execution_id=execution_id,
+            trading_mode=self.trading_mode,
+        )
+        execution.status = "ACTIVE"
+        execution.entry_time = datetime.now()
+
+        # Create synthetic COMPLETE orders so close_position can reverse them
+        for i, leg in enumerate(legs):
+            order = Order(
+                order_id=f"MANUAL_{execution_id}_{i}",
+                symbol=leg.symbol,
+                exchange=get_options_exchange(underlying),
+                transaction_type=leg.direction.value,
+                quantity=leg.quantity,
+                order_type=OrderType.LIMIT,
+                price=leg.entry_price,
+                status=OrderStatus.COMPLETE,
+                placed_at=datetime.now(),
+                filled_at=datetime.now(),
+                filled_price=leg.entry_price,
+                parent_signal_id=execution_id,
+                leg_index=i,
+            )
+            execution.orders.append(order)
+
+        self.active_executions[execution_id] = execution
+
+        # Persist to DB
+        self._persist_trade_to_db(execution_id, signal)
+
+        # Notify position tracker for WebSocket subscription
+        from execution.position_tracker import position_tracker
+        position_tracker.on_new_position(execution_id)
+
+        logger.info(f"Manual position registered: {execution_id}")
+        return execution_id
+
     def load_persisted_position(self, execution_id: str, signal_data: Dict) -> bool:
         """
         Load a persisted position from database (for overnight recovery).
@@ -919,10 +1237,13 @@ class OrderManager:
             execution.status = "ACTIVE"
             execution.entry_time = entry_time
             
+            # Restore GTT order IDs
+            execution.gtt_order_ids = signal_data.get("gtt_order_ids", [])
+            
             # Add to active executions
             self.active_executions[execution_id] = execution
             
-            logger.info(f"Loaded persisted position: {execution_id}")
+            logger.info(f"Loaded persisted position: {execution_id} (GTTs: {execution.gtt_order_ids})")
             return True
             
         except Exception as e:
@@ -968,6 +1289,7 @@ class OrderManager:
             "target": signal.target,
             "rationale": signal.rationale,
             "entry_time": execution.entry_time.isoformat() if execution.entry_time else None,
+            "gtt_order_ids": list(execution.gtt_order_ids) if execution.gtt_order_ids else [],
         }
 
 

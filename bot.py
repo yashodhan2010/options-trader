@@ -665,7 +665,6 @@ class OptionsTradingBot:
         strategy_type = signal.strategy_type
         confidence = signal.confidence
         rr = signal.risk_reward_ratio
-        is_paper = self.paper_trading
         
         # Define criteria per strategy category
         # Directional strategies - need good RR since we're buying premium
@@ -696,34 +695,33 @@ class OptionsTradingBot:
         ]
         
         # Apply criteria based on strategy type
-        # Paper mode uses relaxed thresholds to test more signals
         if strategy_type in directional_strategies:
-            min_conf = 0.52 if is_paper else 0.70
-            min_rr = 0.5 if is_paper else 1.5
+            min_conf = 0.52
+            min_rr = 0.5
             meets_criteria = confidence >= min_conf and rr >= min_rr
             criteria_desc = f"Conf: {confidence:.0%} >= {min_conf:.0%}, RR: {rr:.2f} >= {min_rr}"
             
         elif strategy_type in credit_strategies:
-            min_conf = 0.52 if is_paper else 0.75
-            min_rr = 0.1 if is_paper else 0.3
+            min_conf = 0.52
+            min_rr = 0.1
             meets_criteria = confidence >= min_conf and rr >= min_rr
             criteria_desc = f"Conf: {confidence:.0%} >= {min_conf:.0%}, RR: {rr:.2f} >= {min_rr}"
             
         elif strategy_type in spread_strategies:
-            min_conf = 0.52 if is_paper else 0.70
-            min_rr = 0.3 if is_paper else 1.0
+            min_conf = 0.52
+            min_rr = 0.3
             meets_criteria = confidence >= min_conf and rr >= min_rr
             criteria_desc = f"Conf: {confidence:.0%} >= {min_conf:.0%}, RR: {rr:.2f} >= {min_rr}"
             
         elif strategy_type in volatility_strategies:
-            min_conf = 0.52 if is_paper else 0.70
-            min_rr = 0.3 if is_paper else 0.8
+            min_conf = 0.52
+            min_rr = 0.3
             meets_criteria = confidence >= min_conf and rr >= min_rr
             criteria_desc = f"Conf: {confidence:.0%} >= {min_conf:.0%}, RR: {rr:.2f} >= {min_rr}"
             
         else:
-            min_conf = 0.52 if is_paper else 0.70
-            min_rr = 0.5 if is_paper else 1.5
+            min_conf = 0.52
+            min_rr = 0.5
             meets_criteria = confidence >= min_conf and rr >= min_rr
             criteria_desc = f"Conf: {confidence:.0%} >= {min_conf:.0%}, RR: {rr:.2f} >= {min_rr}"
         

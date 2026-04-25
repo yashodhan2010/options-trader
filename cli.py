@@ -338,6 +338,119 @@ class TradingCLI(cmd.Cmd):
         else:
             print("Usage: close <execution_id> or close all")
     
+    def do_import(self, arg):
+        """Import a manually-placed position for bot monitoring.
+        Usage: import <UNDERLYING> <STRATEGY>
+        Example: import NIFTY bear_call_spread
+
+        The bot will ask for leg details, SL, and target, then track
+        the position for exits just like an auto-traded one.
+        """
+        from strategies.base_strategy import StrategyType, TradeDirection
+        from config.settings import UNDERLYING_ASSETS, get_lot_size
+
+        args = arg.strip().split()
+        if len(args) < 2:
+            print("Usage: import <UNDERLYING> <STRATEGY>")
+            print("Example: import NIFTY bear_call_spread")
+            print(f"Strategies: {', '.join(s.value for s in StrategyType)}")
+            return
+
+        underlying = args[0].upper()
+        strategy = args[1].lower()
+
+        try:
+            StrategyType(strategy)
+        except ValueError:
+            print(f"Unknown strategy: {strategy}")
+            print(f"Valid: {', '.join(s.value for s in StrategyType)}")
+            return
+
+        # Collect legs
+        legs = []
+        print(f"\nEnter legs for {strategy} on {underlying}")
+        print("(type 'done' when finished)\n")
+
+        lot_size = get_lot_size(underlying)
+        leg_num = 1
+        while True:
+            print(f"--- Leg {leg_num} ---")
+            symbol = input("  Trading symbol (e.g. NIFTY26APR23550CE) or 'done': ").strip()
+            if symbol.lower() == 'done':
+                break
+
+            direction = input("  Direction (BUY/SELL): ").strip().upper()
+            if direction not in ('BUY', 'SELL'):
+                print("  Invalid direction. Use BUY or SELL.")
+                continue
+
+            try:
+                strike = float(input("  Strike price: ").strip())
+                entry_price = float(input("  Entry/fill price: ").strip())
+                qty_input = input(f"  Quantity [{lot_size}]: ").strip()
+                quantity = int(qty_input) if qty_input else lot_size
+                expiry_str = input("  Expiry (YYYY-MM-DD): ").strip()
+                option_type = input("  Option type (CE/PE): ").strip().upper()
+            except ValueError:
+                print("  Invalid number. Try again.")
+                continue
+
+            if option_type not in ('CE', 'PE'):
+                print("  Invalid option type. Use CE or PE.")
+                continue
+
+            legs.append({
+                "symbol": symbol,
+                "strike": strike,
+                "option_type": option_type,
+                "expiry": expiry_str,
+                "direction": direction,
+                "quantity": quantity,
+                "entry_price": entry_price,
+            })
+            print(f"  [OK] {direction} {quantity} {symbol} @ {entry_price}")
+            leg_num += 1
+
+        if not legs:
+            print("No legs entered. Cancelled.")
+            return
+
+        # SL and target
+        try:
+            stop_loss = float(input("\nStop loss amount (Rs.): ").strip())
+            target = float(input("Target profit amount (Rs.): ").strip())
+        except ValueError:
+            print("Invalid number. Cancelled.")
+            return
+
+        # Summary
+        print(f"\n{'=' * 50}")
+        print(f"Import: {strategy} on {underlying}")
+        for lg in legs:
+            print(f"  {lg['direction']} {lg['quantity']} {lg['symbol']} @ Rs.{lg['entry_price']}")
+        print(f"  SL: Rs.{stop_loss} | Target: Rs.{target}")
+        print(f"{'=' * 50}")
+
+        confirm = input("Register this position? (y/n): ").strip().lower()
+        if confirm != 'y':
+            print("Cancelled.")
+            return
+
+        exec_id = order_manager.register_manual_position(
+            underlying=underlying,
+            strategy_type_str=strategy,
+            legs_data=legs,
+            stop_loss=stop_loss,
+            target=target,
+            rationale=f"Manual import via CLI",
+        )
+
+        if exec_id:
+            print(f"[OK] Position registered: {exec_id}")
+            print("Bot will now monitor this position for SL/target/signal exits.")
+        else:
+            print("[X] Failed to register position.")
+
     def do_paper(self, arg):
         """Toggle paper trading. Usage: paper [on|off]"""
         if arg.strip().lower() == 'on':
@@ -1135,28 +1248,81 @@ class TradingCLI(cmd.Cmd):
         
         try:
             from ml.backtester import Backtester
+            from ml import get_predictor, get_feature_engineer
+            from ml.data_collector import DataCollector
             from datetime import timedelta
             
-            bt = Backtester()
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=30)
-            
-            result = bt.run_ml_backtest(
-                underlying=underlying,
-                start_date=start_date,
-                end_date=end_date
+            # 1. Fetch historical data (60 days for sufficient lookback)
+            print(f"   Fetching historical data...")
+            hist_df = data_fetcher.get_historical_data(
+                symbol=underlying,
+                interval="day",
+                days=60,
+                exchange="NSE",
             )
+            
+            if hist_df is None or hist_df.empty:
+                print(f"[ERROR] No historical data available for {underlying}")
+                return
+            
+            # 2. Enrich with technical indicators
+            print(f"   Computing technical indicators...")
+            collector = DataCollector()
+            hist_df = collector._add_technical_indicators(hist_df)
+            hist_df.dropna(inplace=True)
+            
+            if len(hist_df) < 30:
+                print(f"[ERROR] Insufficient data after indicator computation ({len(hist_df)} bars, need 30+)")
+                return
+            
+            # 3. Load predictor and feature engineer
+            print(f"   Loading ML model...")
+            predictor = get_predictor()
+            predictor._load_symbol_model_for_underlying(underlying)
+            feature_engineer = get_feature_engineer()
+            
+            if predictor.model is None:
+                print(f"[ERROR] No ML model found for {underlying}")
+                return
+            
+            # 4. Run backtest
+            print(f"   Running simulation on {len(hist_df)} bars...")
+            bt = Backtester()
+            result = bt.run_ml_backtest(
+                data=hist_df,
+                predictor=predictor,
+                feature_engineer=feature_engineer,
+                min_confidence=0.55,
+            )
+            
+            start_date = hist_df.index[0]
+            end_date = hist_df.index[-1]
             
             print(f"\n[RESULTS] Backtest Results ({start_date.date()} to {end_date.date()}):")
             print(f"   Total Trades: {result.total_trades}")
             print(f"   Win Rate: {result.win_rate:.1%}")
             print(f"   Total P&L: Rs.{result.total_pnl:,.2f}")
             print(f"   Sharpe Ratio: {result.sharpe_ratio:.2f}")
-            print(f"   Max Drawdown: {result.max_drawdown:.1%}")
+            print(f"   Max Drawdown: {result.max_drawdown:.1f}%")
             print(f"   Profit Factor: {result.profit_factor:.2f}")
             
+            if result.total_trades > 0:
+                print(f"\n   Winning Trades: {result.winning_trades}")
+                print(f"   Losing Trades: {result.losing_trades}")
+                print(f"   Avg Win: Rs.{result.avg_win:,.2f}")
+                print(f"   Avg Loss: Rs.{result.avg_loss:,.2f}")
+                print(f"   Largest Win: Rs.{result.largest_win:,.2f}")
+                print(f"   Largest Loss: Rs.{result.largest_loss:,.2f}")
+                print(f"   Avg Duration: {result.avg_trade_duration_hours:.1f} hours")
+                if result.ml_predictions_used > 0:
+                    print(f"   ML Accuracy: {result.ml_accuracy:.1%}")
+            else:
+                print(f"\n   [WARN] No trades generated. Model may not have sufficient confidence.")
+            
         except Exception as e:
+            import traceback
             print(f"[ERROR] Backtest failed: {e}")
+            traceback.print_exc()
     
     def _ml_paper(self, action):
         """Manage ML paper trading session."""

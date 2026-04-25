@@ -60,8 +60,7 @@ class MLflowTracker:
             experiment = mlflow.get_experiment_by_name(self.experiment_name)
             if experiment is None:
                 self.experiment_id = mlflow.create_experiment(
-                    self.experiment_name,
-                    artifact_location=str(Path(self.tracking_uri) / "artifacts")
+                    self.experiment_name
                 )
             else:
                 self.experiment_id = experiment.experiment_id
