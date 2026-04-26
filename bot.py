@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 from typing import Optional, List
 import threading
+from collections import deque, Counter
 
 from auth.kite_auth import connect, get_kite, is_authenticated, get_profile, get_margins
 from data.data_fetcher import data_fetcher
@@ -52,6 +53,17 @@ class OptionsTradingBot:
         self.use_websocket = use_websocket
         self.websocket_manager: Optional[WebSocketTicker] = None
         self.start_date = datetime.now().date()  # Track start date for auto-exit
+        self.scan_count = 0
+
+        diversity_cfg = BOT_CONFIG.get("execution_diversity", {})
+        self.execution_diversity_enabled = diversity_cfg.get("enabled", True)
+        self.diversity_stale_symbol_scans = int(diversity_cfg.get("stale_symbol_scans", 6))
+        self.diversity_stale_symbol_boost = float(diversity_cfg.get("stale_symbol_boost", 0.08))
+        self.diversity_repeat_underlying_penalty = float(diversity_cfg.get("repeat_underlying_penalty", 0.06))
+        self.diversity_repeat_strategy_penalty = float(diversity_cfg.get("repeat_strategy_penalty", 0.03))
+        self._execution_history = deque(maxlen=int(diversity_cfg.get("history_size", 30)))
+        self._last_execution_scan_by_underlying = {}
+        self._last_execution_scan_by_strategy = {}
         
         # Set trading mode
         order_manager.set_paper_trading(paper_trading)
@@ -489,8 +501,21 @@ class OptionsTradingBot:
 
     def _scan_and_trade(self) -> None:
         """Scan for signals and execute trades if auto-trade is enabled."""
+        self.scan_count += 1
+
+        def _strategy_family(strategy_type: str) -> str:
+            st = (strategy_type or "").lower()
+            if any(k in st for k in ["credit", "iron_condor", "short_strangle", "short_straddle"]):
+                return "credit"
+            if any(k in st for k in ["debit", "long_call", "long_put", "call_debit", "put_debit"]):
+                return "debit"
+            if any(k in st for k in ["calendar", "diagonal", "straddle", "strangle", "vol"]):
+                return "volatility"
+            return "other"
+
         # Check if we can take more positions
-        active_positions = len(order_manager.get_active_positions())
+        active_position_records = order_manager.get_active_positions()
+        active_positions = len(active_position_records)
         live_cap = TRADING_CONFIG.get("max_positions", 5)
         paper_cap = TRADING_CONFIG.get("paper_max_positions")
         
@@ -507,7 +532,7 @@ class OptionsTradingBot:
         
         # Get underlyings that already have active positions (for deduplication)
         active_underlyings = set()
-        for pos in order_manager.get_active_positions():
+        for pos in active_position_records:
             underlying = getattr(pos, 'underlying', None) or pos.get('underlying', None) if isinstance(pos, dict) else None
             if underlying:
                 active_underlyings.add(underlying)
@@ -546,45 +571,134 @@ class OptionsTradingBot:
         # Execute best signal if auto-trade enabled
         if self.auto_trade and signals:
             executed = False
-            
-            # Check all signals and execute the first one that meets criteria
+
+            prr_cfg = BOT_CONFIG.get("portfolio_risk_router", {})
+            prr_enabled = bool(prr_cfg.get("enabled", True))
+            family_caps = prr_cfg.get(
+                "max_open_by_family",
+                {"credit": 3, "debit": 3, "volatility": 2, "other": 4},
+            )
+            family_penalties = prr_cfg.get(
+                "family_penalty",
+                {"credit": 0.08, "debit": 0.05, "volatility": 0.06, "other": 0.03},
+            )
+            repeat_penalties = prr_cfg.get(
+                "recent_family_repeat_penalty",
+                {"credit": 0.06, "debit": 0.04, "volatility": 0.05, "other": 0.02},
+            )
+            recent_window = int(prr_cfg.get("recent_window", 6))
+
+            open_family_counts: Counter = Counter()
+            if prr_enabled:
+                for pos in active_position_records:
+                    stype = getattr(pos, 'strategy', None)
+                    if stype is None and isinstance(pos, dict):
+                        stype = pos.get('strategy') or pos.get('strategy_type')
+                    open_family_counts[_strategy_family(str(stype or ""))] += 1
+
+            scored_candidates = []
             for signal in signals:
-                # Position deduplication: skip if we already have a position on this underlying
                 if signal.underlying in active_underlyings:
                     logger.info(f"   [DEDUP] Skipping {signal.strategy_type.value} on {signal.underlying} - already have active position")
                     continue
-                
-                if self._meets_auto_trade_criteria(signal):
-                    logger.info(f"   [EXECUTE] Auto-executing signal: {signal.strategy_type.value}")
-                    execution = order_manager.execute_signal(signal)
-                    
-                    if execution.status == "ACTIVE":
-                        logger.info("   [OK] Trade executed successfully!")
-                        
-                        # Log to dedicated trade log file
-                        self._log_trade_entry(signal, execution)
-                        self._log_ml_prediction(signal, execution)
-                        
-                        self._send_notification(
-                            f"New Trade Executed!\n"
-                            f"Strategy: {signal.strategy_type.value}\n"
-                            f"Underlying: {signal.underlying}\n"
-                            f"SL: Rs.{signal.stop_loss:.2f}\n"
-                            f"Target: Rs.{signal.target:.2f}"
-                        )
-                        executed = True
-                        break  # Only execute one trade per scan
-                    elif execution.status == "DUPLICATE":
-                        logger.info(f"   [SKIP] Duplicate position already open for {signal.underlying} {signal.strategy_type.value}")
-                        # Continue to check other signals
-                        continue
-                    else:
-                        logger.error(f"   [FAIL] Trade execution failed: {execution.status}")
-                        trade_logger.info(f"FAILED | {signal.strategy_type.value} | {signal.underlying} | Status: {execution.status}")
-                else:
+
+                if not self._meets_auto_trade_criteria(signal):
                     logger.info(
-                        f"   [SKIP] Signal #{signals.index(signal)+1} ({signal.strategy_type.value}) - doesn't meet criteria"
+                        f"   [SKIP] ({signal.strategy_type.value} {signal.underlying}) - doesn't meet criteria"
                     )
+                    continue
+
+                score = float(signal.confidence) + min(float(signal.risk_reward_ratio), 2.0) * 0.02
+                notes = [f"base={score:.3f}"]
+
+                if self.execution_diversity_enabled:
+                    last_underlying_scan = self._last_execution_scan_by_underlying.get(signal.underlying)
+                    scans_since_underlying = (
+                        self.scan_count - last_underlying_scan
+                        if last_underlying_scan is not None
+                        else self.diversity_stale_symbol_scans + 1
+                    )
+                    if scans_since_underlying >= self.diversity_stale_symbol_scans:
+                        score += self.diversity_stale_symbol_boost
+                        notes.append(f"stale+{self.diversity_stale_symbol_boost:.2f}")
+
+                    strategy_key = signal.strategy_type.value
+                    last_strategy_scan = self._last_execution_scan_by_strategy.get(strategy_key)
+                    if last_underlying_scan is not None and scans_since_underlying <= 1:
+                        score -= self.diversity_repeat_underlying_penalty
+                        notes.append(f"repeat_underlying-{self.diversity_repeat_underlying_penalty:.2f}")
+                    if last_strategy_scan is not None and (self.scan_count - last_strategy_scan) <= 1:
+                        score -= self.diversity_repeat_strategy_penalty
+                        notes.append(f"repeat_strategy-{self.diversity_repeat_strategy_penalty:.2f}")
+
+                if prr_enabled:
+                    family = _strategy_family(signal.strategy_type.value)
+                    open_count = int(open_family_counts.get(family, 0))
+                    fam_cap = int(family_caps.get(family, 99))
+                    if open_count >= fam_cap:
+                        logger.info(
+                            f"   [RISK] Skipping {signal.strategy_type.value} {signal.underlying} "
+                            f"- family cap reached ({family}: {open_count}/{fam_cap})"
+                        )
+                        continue
+
+                    concentration_penalty = float(family_penalties.get(family, 0.0)) * open_count
+                    recent_repeat = sum(
+                        1
+                        for h in list(self._execution_history)[-recent_window:]
+                        if _strategy_family(h.get("strategy", "")) == family
+                    )
+                    repeat_penalty = float(repeat_penalties.get(family, 0.0)) * recent_repeat
+
+                    if concentration_penalty > 0:
+                        score -= concentration_penalty
+                        notes.append(f"family_conc-{concentration_penalty:.2f}")
+                    if repeat_penalty > 0:
+                        score -= repeat_penalty
+                        notes.append(f"family_repeat-{repeat_penalty:.2f}")
+
+                scored_candidates.append((score, signal, ", ".join(notes)))
+
+            scored_candidates.sort(key=lambda x: x[0], reverse=True)
+
+            for score, signal, notes in scored_candidates:
+                logger.info(
+                    f"   [EXECUTE] Candidate {signal.strategy_type.value} {signal.underlying} "
+                    f"score={score:.3f} ({notes})"
+                )
+                execution = order_manager.execute_signal(signal)
+
+                if execution.status == "ACTIVE":
+                    logger.info("   [OK] Trade executed successfully!")
+                    self._execution_history.append(
+                        {
+                            "scan": self.scan_count,
+                            "underlying": signal.underlying,
+                            "strategy": signal.strategy_type.value,
+                        }
+                    )
+                    self._last_execution_scan_by_underlying[signal.underlying] = self.scan_count
+                    self._last_execution_scan_by_strategy[signal.strategy_type.value] = self.scan_count
+
+                    # Log to dedicated trade log file
+                    self._log_trade_entry(signal, execution)
+                    self._log_ml_prediction(signal, execution)
+
+                    self._send_notification(
+                        f"New Trade Executed!\n"
+                        f"Strategy: {signal.strategy_type.value}\n"
+                        f"Underlying: {signal.underlying}\n"
+                        f"SL: Rs.{signal.stop_loss:.2f}\n"
+                        f"Target: Rs.{signal.target:.2f}"
+                    )
+                    executed = True
+                    break
+                elif execution.status == "DUPLICATE":
+                    logger.info(f"   [SKIP] Duplicate position already open for {signal.underlying} {signal.strategy_type.value}")
+                    continue
+                else:
+                    logger.error(f"   [FAIL] Trade execution failed: {execution.status}")
+                    trade_logger.info(f"FAILED | {signal.strategy_type.value} | {signal.underlying} | Status: {execution.status}")
             
             if not executed:
                 logger.warning("   [!] None of the signals were executed (criteria not met or duplicates)")

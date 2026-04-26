@@ -78,6 +78,7 @@ class MLPredictor:
         self._class_labels: Optional[np.ndarray] = None
         self._symbol_model_cache: Dict[str, Dict[str, Any]] = {}
         self._active_symbol: Optional[str] = None
+        self._global_model_bundle: Optional[Dict[str, Any]] = None
         
         # Feedback-based adjustments
         self.confidence_adjustment: float = 1.0  # Multiplier from feedback
@@ -96,6 +97,29 @@ class MLPredictor:
         self.enabled = ML_CONFIG.get("enabled", True)
         self.confidence_weight = ML_CONFIG.get("confidence_weight", 0.5)
         self.prefer_symbol_models = ML_CONFIG.get("prefer_symbol_models", True)
+        hybrid_cfg = ML_CONFIG.get("hybrid_routing", {})
+        self.hybrid_enabled = hybrid_cfg.get("enabled", False)
+        self.local_symbol_allowlist = {
+            str(s).upper() for s in hybrid_cfg.get("local_symbol_allowlist", [])
+        }
+        self.force_global_symbols = {
+            str(s).upper() for s in hybrid_cfg.get("force_global_symbols", [])
+        }
+        self.event_override_cfg = hybrid_cfg.get("event_override", {})
+        self.event_override_enabled = bool(self.event_override_cfg.get("enabled", False))
+        self.event_override_symbols = {
+            str(s).upper() for s in self.event_override_cfg.get("symbols", [])
+        }
+        self.event_override_min_score = float(self.event_override_cfg.get("min_score", 2.0))
+        self.event_override_min_local_confidence = float(
+            self.event_override_cfg.get("min_local_confidence", 0.56)
+        )
+        self.event_override_confidence_penalty = float(
+            self.event_override_cfg.get("confidence_penalty", 0.05)
+        )
+        self.event_thresholds = self.event_override_cfg.get("thresholds", {})
+        self.event_weights = self.event_override_cfg.get("weights", {})
+
         abstain_band = ML_CONFIG.get("abstain_band", {})
         self.default_abstain_margin = abstain_band.get("default_margin", 0.08)
         self.min_top_probability = abstain_band.get("min_top_probability", 0.45)
@@ -158,6 +182,16 @@ class MLPredictor:
             class_labels = metadata.get("class_labels") if isinstance(metadata, dict) else None
             self._class_labels = np.array(class_labels) if class_labels else None
             self._active_symbol = None
+
+            self._global_model_bundle = {
+                "model": self.model,
+                "scaler": self.scaler,
+                "feature_names": list(self.feature_names),
+                "model_version": self.model_version,
+                "model_type": self.model_type,
+                "model_timestamp": self.model_timestamp,
+                "class_labels": self._class_labels,
+            }
             
             # Load feedback config if available
             self._load_feedback_config(model_version)
@@ -187,6 +221,154 @@ class MLPredictor:
         except Exception as e:
             logger.error(f"Failed to activate symbol model for {underlying}: {e}")
             return False
+
+    def _activate_global_model(self) -> bool:
+        """Switch active model bundle to global model."""
+        try:
+            if not self._global_model_bundle:
+                if not self.load_model():
+                    return False
+
+            bundle = self._global_model_bundle or {}
+            self.model = bundle.get("model")
+            self.scaler = bundle.get("scaler")
+            self.feature_names = bundle.get("feature_names", [])
+            self.model_version = bundle.get("model_version")
+            self.model_type = bundle.get("model_type")
+            self.model_timestamp = bundle.get("model_timestamp")
+            self._class_labels = bundle.get("class_labels")
+            self._active_symbol = None
+            self._prediction_cache.clear()
+            return self.model is not None
+        except Exception as e:
+            logger.error(f"Failed to activate global model: {e}")
+            return False
+
+    def _safe_float(self, value: Any, default: float = 0.0) -> float:
+        try:
+            parsed = float(value)
+            if not np.isfinite(parsed):
+                return default
+            return parsed
+        except Exception:
+            return default
+
+    def _event_movement_score(self, features: Dict[str, float]) -> Tuple[float, List[str]]:
+        """Compute event movement score from feature proxies."""
+        score = 0.0
+        reasons: List[str] = []
+
+        thresholds = self.event_thresholds
+        weights = self.event_weights
+
+        gap = abs(self._safe_float(features.get("gap_percent", 0.0)))
+        if gap >= float(thresholds.get("abs_gap_percent", 1.0)):
+            score += float(weights.get("abs_gap_percent", 1.0))
+            reasons.append(f"gap={gap:.2f}")
+
+        atr_pct = abs(self._safe_float(features.get("atr_percent", 0.0)))
+        if atr_pct >= float(thresholds.get("atr_percent", 2.5)):
+            score += float(weights.get("atr_percent", 1.0))
+            reasons.append(f"atr%={atr_pct:.2f}")
+
+        intraday_range = abs(self._safe_float(features.get("intraday_range_percent", 0.0)))
+        if intraday_range >= float(thresholds.get("intraday_range_percent", 1.8)):
+            score += float(weights.get("intraday_range_percent", 1.0))
+            reasons.append(f"range%={intraday_range:.2f}")
+
+        ret1d = abs(self._safe_float(features.get("return_1d", 0.0)))
+        if ret1d >= float(thresholds.get("abs_return_1d", 1.5)):
+            score += float(weights.get("abs_return_1d", 1.0))
+            reasons.append(f"ret1d={ret1d:.2f}")
+
+        pcr = self._safe_float(features.get("pcr", 1.0), default=1.0)
+        if pcr >= float(thresholds.get("pcr_spike", 1.35)):
+            score += float(weights.get("pcr_spike", 1.0))
+            reasons.append(f"pcr={pcr:.2f}")
+
+        return score, reasons
+
+    def _should_use_local_default(self, symbol: str) -> bool:
+        if not self.prefer_symbol_models:
+            return False
+        if not symbol:
+            return False
+        symbol = symbol.upper()
+
+        if self.hybrid_enabled:
+            if symbol in self.force_global_symbols:
+                return False
+            if self.local_symbol_allowlist:
+                return symbol in self.local_symbol_allowlist
+
+        return True
+
+    def _route_model_for_prediction(
+        self,
+        underlying: Optional[str],
+        features: Dict[str, float],
+    ) -> Dict[str, Any]:
+        """Choose between local/global model and optional event override."""
+        route = {
+            "source": "global",
+            "event_override": False,
+            "event_score": 0.0,
+            "event_reasons": [],
+            "fallback_to_global": False,
+        }
+
+        symbol = (underlying or "").upper()
+
+        # Ensure global is ready for fallback paths.
+        if self.model is None and not self.load_model():
+            return route
+        if self._global_model_bundle is None:
+            self._global_model_bundle = {
+                "model": self.model,
+                "scaler": self.scaler,
+                "feature_names": list(self.feature_names),
+                "model_version": self.model_version,
+                "model_type": self.model_type,
+                "model_timestamp": self.model_timestamp,
+                "class_labels": self._class_labels,
+            }
+
+        if not symbol:
+            self._activate_global_model()
+            return route
+
+        if self._should_use_local_default(symbol):
+            if self._load_symbol_model_for_underlying(symbol):
+                route["source"] = "local"
+                return route
+            self._activate_global_model()
+            return route
+
+        # Default global path for force-global / non-allowlist symbols.
+        self._activate_global_model()
+
+        if not self.hybrid_enabled or not self.event_override_enabled:
+            return route
+
+        if self.event_override_symbols and symbol not in self.event_override_symbols:
+            return route
+
+        score, reasons = self._event_movement_score(features)
+        route["event_score"] = score
+        route["event_reasons"] = reasons
+
+        if score < self.event_override_min_score:
+            return route
+
+        if self._load_symbol_model_for_underlying(symbol):
+            route["source"] = "local"
+            route["event_override"] = True
+            route["fallback_to_global"] = True
+            logger.info(
+                f"Hybrid route event override for {symbol}: score={score:.2f}, reasons={reasons}"
+            )
+
+        return route
 
     def _load_symbol_model_for_underlying(self, underlying: str) -> bool:
         if not underlying:
@@ -302,22 +484,23 @@ class MLPredictor:
         if not self.enabled:
             return None
 
-        if self.prefer_symbol_models and underlying:
-            self._load_symbol_model_for_underlying(underlying)
-        
         # Check if model is loaded
-        if self.model is None:
-            if not self.load_model() and not self._load_symbol_model_for_underlying(underlying):
-                return None
+        if self.model is None and not self.load_model():
+            return None
         
         # Convert FeatureSet to dict if needed
         if hasattr(features, 'to_dict'):
             features = features.to_dict()
         elif hasattr(features, 'features'):
             features = features.features
+
+        route_info = self._route_model_for_prediction(underlying, features)
         
         # Check cache
-        cache_key = f"{self.model_version}_{underlying}_{hash(frozenset(features.items()))}"
+        cache_key = (
+            f"{self.model_version}_{underlying}_{route_info.get('source')}_"
+            f"{int(route_info.get('event_override', False))}_{hash(frozenset(features.items()))}"
+        )
         if use_cache and cache_key in self._prediction_cache:
             cached_pred, cached_time = self._prediction_cache[cache_key]
             if (datetime.now() - cached_time).total_seconds() < self.cache_ttl:
@@ -338,6 +521,42 @@ class MLPredictor:
                 prediction = self._ensemble_predict(X, underlying)
             else:
                 prediction = self._single_model_predict(X, underlying)
+
+            # Optional confidence floor for event-override local model.
+            if (
+                route_info.get("event_override")
+                and route_info.get("fallback_to_global")
+                and prediction.confidence < self.event_override_min_local_confidence
+            ):
+                if self._activate_global_model():
+                    X_global = self._features_to_array(features)
+                    if self.scaler is not None:
+                        X_global = self.scaler.transform(X_global.reshape(1, -1))
+                    else:
+                        X_global = X_global.reshape(1, -1)
+
+                    if isinstance(self.model, dict):
+                        prediction = self._ensemble_predict(X_global, underlying)
+                    else:
+                        prediction = self._single_model_predict(X_global, underlying)
+
+                    route_info["source"] = "global"
+                    route_info["event_override"] = False
+                    logger.info(
+                        f"Hybrid route fallback to global for {underlying}: "
+                        f"local_conf={prediction.confidence:.2f}"
+                    )
+
+            if route_info.get("event_override"):
+                prediction.confidence = max(
+                    0.1,
+                    prediction.confidence - self.event_override_confidence_penalty,
+                )
+
+            prediction.route_source = route_info.get("source")
+            prediction.event_override = bool(route_info.get("event_override"))
+            prediction.event_score = float(route_info.get("event_score", 0.0))
+            prediction.event_reasons = list(route_info.get("event_reasons", []))
             
             # Cache prediction
             if use_cache:

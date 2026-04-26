@@ -54,6 +54,7 @@ Thumbs.db
 
 # Jupyter
 .ipynb_checkpoints/
+experiments
 
 # MLflow tracking data
 mlruns/

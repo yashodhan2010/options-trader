@@ -8,6 +8,8 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 from collections import deque, Counter
 import math
+import csv
+from datetime import timedelta
 import pandas as pd
 
 from data.data_fetcher import data_fetcher
@@ -15,7 +17,7 @@ from strategies.catalogue import StrategyCatalogue
 from strategies.base_strategy import StrategySignal, StrategyType, TradeDirection, OptionLeg
 from config.settings import (
     UNDERLYING_ASSETS, STRATEGY_CONFIG, ML_CONFIG, EVENT_REGIME_CONFIG,
-    WATCHLIST, WATCHLIST_SYMBOLS, is_in_watchlist, get_watchlist_assets
+    WATCHLIST, WATCHLIST_SYMBOLS, LOGS_DIR, is_in_watchlist, get_watchlist_assets
 )
 from core.logger import logger
 from core.utils import is_trading_allowed
@@ -106,6 +108,49 @@ class MLSignalGenerator:
         # Configuration
         self.min_confidence = ML_CONFIG.get("min_confidence_for_trade", 0.55)
         self.model_loaded = False
+        trend_cfg = ML_CONFIG.get("trend_confirmation", {})
+        self.trend_confirmation_enabled = trend_cfg.get("enabled", True)
+        self.trend_lookback_days = int(trend_cfg.get("lookback_days", 10))
+        self.trend_window_size = int(trend_cfg.get("window_size", 5))
+        self.trend_min_samples = int(trend_cfg.get("min_samples", 3))
+        self.trend_alignment_threshold = float(trend_cfg.get("alignment_threshold", 0.60))
+        self.trend_index_alignment_threshold = float(trend_cfg.get("index_alignment_threshold", 0.40))
+        self.trend_index_contrarian_enabled = bool(trend_cfg.get("allow_index_contrarian_override", True))
+        self.trend_index_contrarian_min_opposite = float(
+            trend_cfg.get("index_contrarian_min_opposite_alignment", 0.80)
+        )
+        self.trend_index_contrarian_min_conf = float(
+            trend_cfg.get("index_contrarian_min_confidence", 0.53)
+        )
+
+        telemetry_cfg = ML_CONFIG.get("routing_telemetry", {})
+        self.route_telemetry_enabled = telemetry_cfg.get("enabled", True)
+        self.route_telemetry_path = LOGS_DIR / telemetry_cfg.get("file_name", "ml_route_telemetry.csv")
+
+        # Adaptive confidence threshold controls.
+        adaptive_conf = ML_CONFIG.get("adaptive_confidence", {})
+        self.adaptive_conf_enabled = adaptive_conf.get("enabled", True)
+        self.adaptive_conf_floor = float(adaptive_conf.get("min_floor", 0.48))
+        self.adaptive_conf_ceiling = float(adaptive_conf.get("max_ceiling", 0.72))
+        self.adaptive_conf_symbol = adaptive_conf.get("by_symbol", {})
+        self.adaptive_conf_vol = adaptive_conf.get("by_vol_regime", {})
+        self.adaptive_conf_intraday = adaptive_conf.get("by_intraday_bias", {})
+        self.adaptive_conf_index_adj = float(adaptive_conf.get("index_adjustment", 0.01))
+
+        # Strategy scorecard controls (lightweight routing adaptation).
+        score_cfg = ML_CONFIG.get("strategy_scorecard", {})
+        self.scorecard_enabled = score_cfg.get("enabled", True)
+        self.scorecard_lookback_days = int(score_cfg.get("lookback_days", 45))
+        self.scorecard_min_closed = int(score_cfg.get("min_closed_trades", 8))
+        self.scorecard_refresh_seconds = int(score_cfg.get("refresh_seconds", 900))
+        self.scorecard_fallback = float(score_cfg.get("fallback_score", 0.0))
+        self.scorecard_weights = score_cfg.get(
+            "weights",
+            {"win_rate": 0.45, "avg_pnl": 0.35, "profit_factor": 0.20},
+        )
+        self.scorecard_avg_pnl_scale = float(score_cfg.get("avg_pnl_scale", 1500.0))
+        self._strategy_scorecard: Dict[str, float] = {}
+        self._strategy_scorecard_last_refresh: Optional[datetime] = None
 
         entropy_cfg = ML_CONFIG.get("direction_entropy_guard", {})
         self.entropy_guard_enabled = entropy_cfg.get("enabled", True)
@@ -133,6 +178,176 @@ class MLSignalGenerator:
         
         logger.info("ML-Only Signal Generator initialized")
         logger.info(f"Trading symbols: {self.underlyings}")
+
+    def _normalize_vol_regime(self, iv_regime: str) -> str:
+        """Normalize volatility regime string to LOW_IV/NORMAL/HIGH_IV."""
+        r = (iv_regime or "NORMAL").upper()
+        if "LOW" in r or "DEPRESS" in r:
+            return "LOW_IV"
+        if "HIGH" in r or "ELEVAT" in r:
+            return "HIGH_IV"
+        return "NORMAL"
+
+    def _effective_min_confidence(
+        self,
+        underlying: str,
+        iv_regime: str,
+        intraday_bias: str,
+    ) -> float:
+        """Compute adaptive confidence threshold by symbol and context."""
+        threshold = float(self.min_confidence)
+        if not self.adaptive_conf_enabled:
+            return threshold
+
+        vol_key = self._normalize_vol_regime(iv_regime)
+        threshold += float(self.adaptive_conf_symbol.get(underlying, 0.0))
+        threshold += float(self.adaptive_conf_vol.get(vol_key, 0.0))
+        threshold += float(self.adaptive_conf_intraday.get((intraday_bias or "NEUTRAL").upper(), 0.0))
+
+        if underlying in UNDERLYING_ASSETS:
+            threshold += self.adaptive_conf_index_adj
+
+        return float(min(self.adaptive_conf_ceiling, max(self.adaptive_conf_floor, threshold)))
+
+    def _refresh_strategy_scorecard(self) -> None:
+        """Refresh trailing strategy scorecard from closed-trade outcomes."""
+        if not self.scorecard_enabled:
+            return
+
+        now = datetime.now()
+        if self._strategy_scorecard_last_refresh:
+            elapsed = (now - self._strategy_scorecard_last_refresh).total_seconds()
+            if elapsed < self.scorecard_refresh_seconds:
+                return
+
+        try:
+            from core.database import database
+
+            start_date = now - timedelta(days=self.scorecard_lookback_days)
+            closed = database.get_trades(status="CLOSED", start_date=start_date)
+            if not closed:
+                self._strategy_scorecard = {}
+                self._strategy_scorecard_last_refresh = now
+                return
+
+            df = pd.DataFrame(closed)
+            if len(df) == 0 or "strategy_type" not in df.columns:
+                self._strategy_scorecard = {}
+                self._strategy_scorecard_last_refresh = now
+                return
+
+            df["realized_pnl"] = pd.to_numeric(df.get("realized_pnl"), errors="coerce").fillna(0.0)
+            grouped = df.groupby(["underlying", "strategy_type"], dropna=True)
+
+            scores: Dict[str, float] = {}
+            for (symbol, strategy), g in grouped:
+                n = len(g)
+                if n < self.scorecard_min_closed:
+                    continue
+
+                pnls = g["realized_pnl"].values.astype(float)
+                wins = float((pnls > 0).sum()) / max(n, 1)
+                avg_pnl = float(np.mean(pnls)) if n > 0 else 0.0
+                gross_pos = float(np.sum(pnls[pnls > 0]))
+                gross_neg = float(np.abs(np.sum(pnls[pnls < 0])))
+                if gross_neg <= 0:
+                    profit_factor = 2.0 if gross_pos > 0 else 1.0
+                else:
+                    profit_factor = float(gross_pos / gross_neg)
+
+                # Stable bounded transforms for ranking.
+                win_term = (wins - 0.5) * 2.0
+                pnl_term = float(np.tanh(avg_pnl / max(self.scorecard_avg_pnl_scale, 1.0)))
+                pf_term = float(np.clip((profit_factor - 1.0) / 2.0, -1.0, 1.0))
+
+                score = (
+                    float(self.scorecard_weights.get("win_rate", 0.45)) * win_term
+                    + float(self.scorecard_weights.get("avg_pnl", 0.35)) * pnl_term
+                    + float(self.scorecard_weights.get("profit_factor", 0.20)) * pf_term
+                )
+
+                key = f"{str(symbol).upper()}::{str(strategy)}"
+                scores[key] = float(score)
+
+            self._strategy_scorecard = scores
+            self._strategy_scorecard_last_refresh = now
+
+        except Exception as e:
+            logger.debug(f"Strategy scorecard refresh failed: {e}")
+
+    def _get_strategy_score(self, underlying: str, strategy_type: StrategyType) -> float:
+        """Get strategy score for symbol-strategy pair with fallback."""
+        self._refresh_strategy_scorecard()
+        key = f"{underlying.upper()}::{strategy_type.value}"
+        return float(self._strategy_scorecard.get(key, self.scorecard_fallback))
+
+    def _rank_strategy_types(self, underlying: str, strategy_types: List[StrategyType]) -> List[StrategyType]:
+        """Sort candidate strategies using trailing scorecard performance."""
+        if not strategy_types:
+            return strategy_types
+        if not self.scorecard_enabled:
+            return strategy_types
+
+        scored = [(st, self._get_strategy_score(underlying, st)) for st in strategy_types]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        ranked = [s for s, _ in scored]
+        score_str = ", ".join([f"{s.value}:{v:+.3f}" for s, v in scored])
+        logger.info(f"Strategy ranking for {underlying}: {score_str}")
+        return ranked
+
+    def _write_route_telemetry(
+        self,
+        *,
+        underlying: str,
+        decision: str,
+        reason: str,
+        prediction: Optional[Any] = None,
+        signals_generated: int = 0,
+    ) -> None:
+        """Persist one route/decision row per symbol scan for auditability."""
+        if not self.route_telemetry_enabled:
+            return
+
+        try:
+            LOGS_DIR.mkdir(exist_ok=True)
+            file_exists = self.route_telemetry_path.exists()
+
+            route_source = getattr(prediction, "route_source", "na") if prediction else "na"
+            event_override = bool(getattr(prediction, "event_override", False)) if prediction else False
+            event_score = float(getattr(prediction, "event_score", 0.0)) if prediction else 0.0
+            direction = getattr(prediction, "direction", "na") if prediction else "na"
+            confidence = float(getattr(prediction, "confidence", 0.0)) if prediction else 0.0
+
+            with open(self.route_telemetry_path, "a", newline="", encoding="utf-8") as fp:
+                writer = csv.writer(fp)
+                if not file_exists:
+                    writer.writerow([
+                        "timestamp",
+                        "underlying",
+                        "decision",
+                        "reason",
+                        "route_source",
+                        "event_override",
+                        "event_score",
+                        "direction",
+                        "confidence",
+                        "signals_generated",
+                    ])
+
+                writer.writerow([
+                    datetime.now().isoformat(),
+                    underlying,
+                    decision,
+                    reason,
+                    route_source,
+                    int(event_override),
+                    round(event_score, 4),
+                    direction,
+                    round(confidence, 6),
+                    int(signals_generated),
+                ])
+        except Exception as e:
+            logger.debug(f"Failed writing route telemetry for {underlying}: {e}")
     
     def _init_ml(self) -> bool:
         """
@@ -279,6 +494,11 @@ class MLSignalGenerator:
         
         if not features:
             logger.warning(f"Could not extract features for {underlying}")
+            self._write_route_telemetry(
+                underlying=underlying,
+                decision="skip",
+                reason="feature_extraction_failed",
+            )
             return []
         
         prediction, blended_confidence, should_trade = self._predictor.predict_with_guardrails(
@@ -291,16 +511,38 @@ class MLSignalGenerator:
         
         if prediction is None:
             logger.warning(f"ML prediction failed for {underlying}")
+            self._write_route_telemetry(
+                underlying=underlying,
+                decision="skip",
+                reason="prediction_failed",
+            )
             return []
 
         if getattr(prediction, "abstained", False):
             logger.info(f"Abstain band triggered for {underlying} - skipping trade")
+            self._write_route_telemetry(
+                underlying=underlying,
+                decision="skip",
+                reason="abstain_band",
+                prediction=prediction,
+            )
             return []
 
         prediction.raw_ml_confidence = prediction.confidence
         prediction.rule_confidence = self.min_confidence
         prediction.blended_confidence = blended_confidence
         prediction.confidence = blended_confidence
+
+        route_source = getattr(prediction, "route_source", "unknown")
+        route_event_override = bool(getattr(prediction, "event_override", False))
+        if route_event_override:
+            logger.info(
+                f"Hybrid route for {underlying}: source={route_source}, "
+                f"event_score={getattr(prediction, 'event_score', 0.0):.2f}, "
+                f"event_reasons={getattr(prediction, 'event_reasons', [])}"
+            )
+        else:
+            logger.debug(f"Hybrid route for {underlying}: source={route_source}")
         
         logger.info(
             f"ML Prediction for {underlying}: {prediction.direction} "
@@ -312,19 +554,36 @@ class MLSignalGenerator:
                 f"Guardrails blocked trade for {underlying} "
                 f"(ML: {prediction.raw_ml_confidence:.1%}, blended: {prediction.confidence:.1%})"
             )
-            return []
-
-        # Check confidence threshold
-        if prediction.confidence < self.min_confidence:
-            logger.info(
-                f"ML confidence {prediction.confidence:.1%} below threshold "
-                f"{self.min_confidence:.1%} - skipping {underlying}"
+            self._write_route_telemetry(
+                underlying=underlying,
+                decision="skip",
+                reason="guardrails_blocked",
+                prediction=prediction,
             )
             return []
 
-        # Intraday context is used both for timing and event-regime flip detection
+        # Intraday context is used both for timing and adaptive confidence context.
         intraday = data_fetcher.get_intraday_analysis(underlying)
         intraday_bias = intraday.get("intraday_bias", "NEUTRAL") if intraday else "NEUTRAL"
+
+        # Check confidence threshold
+        effective_min_conf = self._effective_min_confidence(
+            underlying=underlying,
+            iv_regime=volatility.get("volatility_regime", "NORMAL") if isinstance(volatility, dict) else "NORMAL",
+            intraday_bias=intraday_bias,
+        )
+        if prediction.confidence < effective_min_conf:
+            logger.info(
+                f"ML confidence {prediction.confidence:.1%} below threshold "
+                f"{effective_min_conf:.1%} - skipping {underlying}"
+            )
+            self._write_route_telemetry(
+                underlying=underlying,
+                decision="skip",
+                reason="below_min_confidence",
+                prediction=prediction,
+            )
+            return []
 
         # Event-regime overlay (proxy + flow based)
         event_outcome = self._apply_event_regime_overlay(
@@ -339,17 +598,35 @@ class MLSignalGenerator:
                 f"Event regime blocked {underlying}: direction={prediction.direction}, "
                 f"reasons={event_outcome.get('reasons', [])}"
             )
+            self._write_route_telemetry(
+                underlying=underlying,
+                decision="skip",
+                reason="event_blocked",
+                prediction=prediction,
+            )
             return []
 
         self._record_prediction_direction(underlying, prediction.direction)
         if not self._passes_direction_entropy_guard(underlying):
             logger.info(f"Direction entropy guard blocked trade for {underlying}")
+            self._write_route_telemetry(
+                underlying=underlying,
+                decision="skip",
+                reason="direction_entropy_guard",
+                prediction=prediction,
+            )
             return []
         
         # Trend confirmation: validate ML direction against recent prediction history
-        if not self._confirm_trend(underlying, prediction.direction):
+        if not self._confirm_trend(underlying, prediction.direction, prediction.confidence):
             logger.info(
                 f"Trend confirmation failed for {underlying} ({prediction.direction}) - skipping"
+            )
+            self._write_route_telemetry(
+                underlying=underlying,
+                decision="skip",
+                reason="trend_confirmation_failed",
+                prediction=prediction,
             )
             return []
         
@@ -364,6 +641,12 @@ class MLSignalGenerator:
                 f"micro={intraday.get('micro_trend')}, RSI5m={intraday.get('rsi_5m', '?')}) "
                 f"- waiting for better entry"
             )
+            self._write_route_telemetry(
+                underlying=underlying,
+                decision="skip",
+                reason="intraday_mismatch",
+                prediction=prediction,
+            )
             return []
         elif prediction.direction == "BEARISH" and intraday_bias == "BULLISH":
             logger.info(
@@ -371,6 +654,12 @@ class MLSignalGenerator:
                 f"(VWAP={'above' if intraday.get('above_vwap') else 'below'}, "
                 f"micro={intraday.get('micro_trend')}, RSI5m={intraday.get('rsi_5m', '?')}) "
                 f"- waiting for better entry"
+            )
+            self._write_route_telemetry(
+                underlying=underlying,
+                decision="skip",
+                reason="intraday_mismatch",
+                prediction=prediction,
             )
             return []
         else:
@@ -399,6 +688,7 @@ class MLSignalGenerator:
                 rsi=rsi,
                 is_index=is_index,
             )
+            strategy_types = self._rank_strategy_types(underlying, strategy_types)
         
         # Generate signals for selected strategies across ALL expiry chains
         signals = []
@@ -421,11 +711,17 @@ class MLSignalGenerator:
                     strategy.ml_override = False
                     
                     if signal:
-                        ml_signal = self._create_ml_signal(signal, prediction)
+                        strategy_score = self._get_strategy_score(underlying, strategy_type)
+                        ml_signal = self._create_ml_signal(
+                            signal,
+                            prediction,
+                            effective_min_conf=effective_min_conf,
+                            strategy_score=strategy_score,
+                        )
                         signals.append(ml_signal)
                         logger.info(
                             f"  Signal generated: {strategy_type.value} for {underlying}{dte_label} "
-                            f"(ML confidence: {prediction.confidence:.1%})"
+                            f"(ML confidence: {prediction.confidence:.1%}, score: {strategy_score:+.3f})"
                         )
                     
                 except Exception as e:
@@ -433,6 +729,14 @@ class MLSignalGenerator:
                     import traceback
                     traceback.print_exc()
                     strategy.ml_override = False
+
+        self._write_route_telemetry(
+            underlying=underlying,
+            decision="signal_generated" if signals else "skip",
+            reason="signals_ready" if signals else "no_strategy_signal",
+            prediction=prediction,
+            signals_generated=len(signals),
+        )
         
         return signals
 
@@ -564,7 +868,7 @@ class MLSignalGenerator:
 
         return {"active": True, "blocked": False, "reasons": reasons, "score": score}
     
-    def _confirm_trend(self, underlying: str, ml_direction: str) -> bool:
+    def _confirm_trend(self, underlying: str, ml_direction: str, ml_confidence: float = 0.0) -> bool:
         """
         Validate ML prediction against recent feature snapshot labels from the database.
         Requires 60%+ of recent labels to align with the ML direction.
@@ -576,6 +880,9 @@ class MLSignalGenerator:
         Returns:
             True if trend is confirmed or no history available
         """
+        if not self.trend_confirmation_enabled:
+            return True
+
         if ml_direction == "NEUTRAL":
             return True  # Neutral doesn't need trend confirmation
         
@@ -595,19 +902,25 @@ class MLSignalGenerator:
             if not cursor.fetchone():
                 conn.close()
                 return True
-            
-            # Get recent labels for this underlying (last 5 trading days, max 10 days old)
-            cursor.execute("""
-                SELECT label_direction FROM ml_feature_snapshots 
-                WHERE underlying = ? AND label_direction IS NOT NULL AND label_direction != 'NEUTRAL'
-                  AND snapshot_time >= datetime('now', '-10 days')
-                ORDER BY snapshot_time DESC LIMIT 5
-            """, (underlying,))
+
+            # Get recent non-neutral labels for this underlying.
+            lookback_modifier = f"-{self.trend_lookback_days} days"
+            cursor.execute(
+                """
+                SELECT label_direction FROM ml_feature_snapshots
+                WHERE underlying = ?
+                  AND label_direction IS NOT NULL
+                  AND label_direction != 'NEUTRAL'
+                  AND snapshot_time >= datetime('now', ?)
+                ORDER BY snapshot_time DESC LIMIT ?
+                """,
+                (underlying, lookback_modifier, self.trend_window_size),
+            )
             
             rows = cursor.fetchall()
             conn.close()
             
-            if len(rows) < 3:
+            if len(rows) < self.trend_min_samples:
                 return True  # Not enough recent history, allow the trade
             
             labels = [r[0] for r in rows]
@@ -618,13 +931,34 @@ class MLSignalGenerator:
             # Count alignment
             aligned = sum(1 for l in labels if l == expected_label)
             alignment_pct = aligned / len(labels)
+            opposite_pct = 1.0 - alignment_pct
+
+            is_index = underlying in UNDERLYING_ASSETS
+            min_alignment = (
+                self.trend_index_alignment_threshold if is_index else self.trend_alignment_threshold
+            )
             
             logger.info(
                 f"Trend confirmation for {underlying}: {aligned}/{len(labels)} recent labels = "
                 f"{expected_label} ({alignment_pct:.0%}), ML says {ml_direction}"
             )
-            
-            return alignment_pct >= 0.6  # Require 60%+ alignment
+
+            if alignment_pct >= min_alignment:
+                return True
+
+            if (
+                is_index
+                and self.trend_index_contrarian_enabled
+                and opposite_pct >= self.trend_index_contrarian_min_opposite
+                and ml_confidence >= self.trend_index_contrarian_min_conf
+            ):
+                logger.info(
+                    f"Trend override for {underlying}: opposite alignment={opposite_pct:.0%}, "
+                    f"ML confidence={ml_confidence:.1%}"
+                )
+                return True
+
+            return False
             
         except Exception as e:
             logger.warning(f"Trend confirmation check failed: {e}")
@@ -770,6 +1104,8 @@ class MLSignalGenerator:
         self,
         base_signal: StrategySignal,
         prediction,
+        effective_min_conf: Optional[float] = None,
+        strategy_score: Optional[float] = None,
     ) -> StrategySignal:
         """
         Create a signal with ML prediction as the source of truth.
@@ -805,6 +1141,12 @@ class MLSignalGenerator:
         ml_signal.metrics["ml_model_version"] = prediction.model_version
         ml_signal.metrics["ml_model_type"] = prediction.model_type
         ml_signal.metrics["signal_source"] = "ML"
+        ml_signal.metrics["effective_min_confidence"] = float(
+            effective_min_conf if effective_min_conf is not None else self.min_confidence
+        )
+        ml_signal.metrics["strategy_scorecard_score"] = float(
+            strategy_score if strategy_score is not None else self.scorecard_fallback
+        )
         
         return ml_signal
     

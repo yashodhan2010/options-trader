@@ -111,6 +111,33 @@ BOT_CONFIG = {
     "signal_exit_enabled": True,        # Enable reversal/thesis-based exits
     "signal_exit_interval": 60,         # Seconds between signal exit checks (less frequent, more expensive)
     "signal_exit_min_confidence": 0.70, # Minimum confidence to trigger exit
+    "execution_diversity": {
+        "enabled": True,
+        "history_size": 30,
+        "stale_symbol_scans": 6,
+        "stale_symbol_boost": 0.08,
+        "repeat_underlying_penalty": 0.06,
+        "repeat_strategy_penalty": 0.03,
+    },
+    "portfolio_risk_router": {
+        "enabled": True,
+        # Hard caps by strategy family across open positions.
+        "family_caps": {
+            "credit": 2,
+            "debit": 2,
+            "volatility": 1,
+            "other": 1,
+        },
+        # Soft penalties applied to candidate score for concentration.
+        "family_penalties": {
+            "credit": 0.05,
+            "debit": 0.03,
+            "volatility": 0.04,
+            "other": 0.02,
+        },
+        "recent_family_penalty": 0.02,
+        "recent_window": 8,
+    },
 }
 
 # Greeks-Based Exit Configuration (NEW)
@@ -278,6 +305,51 @@ ML_CONFIG = {
     # Model paths
     "model_path": ML_MODELS_DIR,
     "prefer_symbol_models": True,      # Prefer per-symbol *_model_*.joblib artifacts when available
+    "hybrid_routing": {
+        "enabled": True,
+        # Symbols where local models are preferred in normal conditions.
+        # Update monthly after re-evaluation.
+        "local_symbol_allowlist": [
+            "BANKNIFTY",
+            "HDFCBANK",
+            "IDFCFIRSTB",
+            "RELIANCE",
+            "SBIN",
+        ],
+        # Symbols where global model is default (local underperformed).
+        "force_global_symbols": [
+            "AXISBANK",
+            "NIFTY",
+            "SENSEX",
+        ],
+        "event_override": {
+            "enabled": True,
+            # During strong event moves, temporarily try symbol-local model
+            # even for force-global symbols.
+            "symbols": [
+                "AXISBANK",
+                "NIFTY",
+                "SENSEX",
+            ],
+            "min_score": 2.0,
+            "min_local_confidence": 0.56,
+            "confidence_penalty": 0.05,
+            "thresholds": {
+                "abs_gap_percent": 1.0,
+                "atr_percent": 2.5,
+                "intraday_range_percent": 1.8,
+                "abs_return_1d": 1.5,
+                "pcr_spike": 1.35,
+            },
+            "weights": {
+                "abs_gap_percent": 1.0,
+                "atr_percent": 1.0,
+                "intraday_range_percent": 1.0,
+                "abs_return_1d": 1.0,
+                "pcr_spike": 1.0,
+            },
+        },
+    },
     "mlflow_tracking_uri": str(BASE_DIR / "mlruns"),
     "mlflow_enabled": os.getenv("MLFLOW_ENABLED", "true").lower() == "true",
     
@@ -327,6 +399,57 @@ ML_CONFIG = {
         "window_size": 40,
         "min_samples": 20,
         "min_entropy": 0.35,            # Block if direction distribution collapses
+    },
+    "trend_confirmation": {
+        "enabled": True,
+        "lookback_days": 10,
+        "window_size": 5,
+        "min_samples": 3,
+        "alignment_threshold": 0.60,
+        "index_alignment_threshold": 0.40,
+        # For indices, allow a controlled contrarian pass when labels strongly
+        # disagree with ML direction but confidence is not weak.
+        "allow_index_contrarian_override": True,
+        "index_contrarian_min_opposite_alignment": 0.80,
+        "index_contrarian_min_confidence": 0.53,
+    },
+    "routing_telemetry": {
+        "enabled": True,
+        "file_name": "ml_route_telemetry.csv",
+    },
+    "adaptive_confidence": {
+        "enabled": True,
+        "min_floor": 0.48,
+        "max_ceiling": 0.72,
+        "by_symbol": {
+            "NIFTY": 0.01,
+            "SENSEX": 0.02,
+            "AXISBANK": 0.02,
+        },
+        "by_vol_regime": {
+            "LOW_IV": -0.01,
+            "NORMAL": 0.0,
+            "HIGH_IV": 0.02,
+        },
+        "by_intraday_bias": {
+            "NEUTRAL": 0.0,
+            "BULLISH": 0.0,
+            "BEARISH": 0.0,
+        },
+        "index_adjustment": 0.01,
+    },
+    "strategy_scorecard": {
+        "enabled": True,
+        "lookback_days": 45,
+        "min_closed_trades": 8,
+        "refresh_seconds": 900,
+        "fallback_score": 0.0,
+        "weights": {
+            "win_rate": 0.45,
+            "avg_pnl": 0.35,
+            "profit_factor": 0.20,
+        },
+        "avg_pnl_scale": 1500.0,
     },
     "training_class_guard": {
         "enabled": True,
